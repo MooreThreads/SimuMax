@@ -1,0 +1,10 @@
+{
+    "hidden_size": 16384,
+    "head_num": 128,
+    "kv_head_num": 8,
+    "head_size": 128,
+    "intermediate_size": 53248,
+    "layer_num": 126,
+    "vocab_size": 128256,
+    "use_swiglu": true
+}
