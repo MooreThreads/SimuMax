@@ -175,7 +175,7 @@ class StrategySearcher:
 
                 cur_candidate_strategy.micro_batch_size = max_micro_batch_size
                 # when we don't consider batch size constraint,
-                # we set micro_batch_num to a large number to avoid the overhead of recompute
+                # we set micro_batch_num to a large number to avoid the overhead of bubble
                 # but it is not reasonable, need to consider the global batch size constraint here
                 if cur_candidate_strategy.pp_size > 1:
                     cur_candidate_strategy.micro_batch_num = 128
