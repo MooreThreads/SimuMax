@@ -286,27 +286,6 @@ class Permutation(MetaModule):
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
             )
-        elif self.moe_dispatcher_policy == "all2all" and (
-            self.strategy.etp_size > 1 or self.strategy.ep_size > 1
-        ):
-            # gather the global distribution of tokens across all experts
-            comm_size = (
-                self.input_act_size * self.dtype_to_element_size[self.strategy.dtype]
-            )
-            # fwd
-            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-            )
-            # bwd
-            self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-            )
         if self.strategy.ep_size > 1:
             comm_size = (
                 self.permuted_act_size * self.dtype_to_element_size[self.strategy.dtype]

@@ -199,7 +199,7 @@ class PerfLLM(PerfBase):
         bucket_size = (
             max(40000000, 1000000 * self.strategy.dp_size) * 4
         )  # consider bucket size
-        num_bucket = (comm_size - 1) / bucket_size + 1
+        num_bucket = (comm_size - 1) // bucket_size + 1
         if self.strategy.zero_state >= 1:
             dp_comm_time += num_bucket * self.system.compute_net_op_time(
                 "all_gather", bucket_size, comm_num=self.strategy.dp_size, net=dp_net

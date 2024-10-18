@@ -14,7 +14,7 @@ We have taken into account the current real-world implementations of distributed
 It's appropriate to address various use-cases:
 1. For user who wants to find an optimal strategy to maximize the training efficiency.
 2. For the framework/large model algorithm engineer, it provides optimization directions and debugging analysis.
-3. For the chip manufacturer, it provides a tool that can predict performance levels is required as a reference to assist in the design of various specifications.
+3. For the chip manufacturer, it provides a tool that can predict performance is required as a reference to assist in the design of various specifications.
 
 
 
