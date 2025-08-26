@@ -1,3 +1,3 @@
 """Module for SimuMax."""
 
-from .perf_llm import PerfBase, PerfLLM
+from simumax.core.perf_llm import PerfBase, PerfLLM

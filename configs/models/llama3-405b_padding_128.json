@@ -1,7 +1,9 @@
 {
+    "model_type":"dense",
+    "model_name":"llama3_405b",
     "hidden_size": 16384,
     "head_num": 128,
-    "kv_head_num": 8,
+    "kv_head_num": 16,
     "head_size": 128,
     "intermediate_size": 53248,
     "layer_num": 128,

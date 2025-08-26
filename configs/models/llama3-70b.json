@@ -1,12 +1,12 @@
 {
     "model_type":"dense",
-    "model_name":"llama2_70b",
+    "model_name":"llama3_70b",
     "hidden_size": 8192,
     "head_num": 64,
     "kv_head_num": 8,
     "head_size": 128,
     "intermediate_size": 28672,
     "layer_num": 80,
-    "vocab_size": 32000,
+    "vocab_size": 128256,
     "use_swiglu": true
 }
