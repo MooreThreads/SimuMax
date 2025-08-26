@@ -1,10 +1,11 @@
 # SimuMax: a static analytical model for LLM distributed training
 
 * [Introduction](#introduction)
-* [Installation](#installation)
-* [Usage](#usage)
+* [Getting Started](#Installation)
+* [Unitest](#Unitest)
 * [TODO](#todo)
 * [Acknowledgements](#acknowledgements)
+* [Community](#Community)
 
 ## Introduction
 SimuMax is a distributed training simulator designed for large-scale language model (LLM) workloads. It leverages a static analytical model to simulate and analyze both performance and memory usage, providing detailed insights into training efficiency without running the actual training process. Based on these analyses, SimuMax helps users explore potential ways to maximize computational efficiency.
@@ -26,10 +27,29 @@ It's appropriate to address various use-cases:
 - [x] Expert Parallel
 - [x] Zero1
 - [x] MoE (only balanced workload)
-- [x] Recompute
+- [x] Full Recompute
+- [x] Selective Recompute
+- [x] MLA
+- [x] Layer Specification for first/last-stage layer
+- [x] Customizable dense layers for MoE
+- [x] Megatron Compatibility: Simplified model migration pipeline
+- [x] Finer-grained selective recompute
+- [x] Efficiency measurement across shapes/layouts
 
+
+### Benchmarks
+Performance of some models on a single node. Llama3-70B was trimmed to 12 layers and DeepSeek-236B was trimmed to 4 layers.
+Details can be found in  [FULL_RESULTS](docs/FULL_RESULTS.md) 
+
+
+
+#### A100-Pcie
+![alt text](assets/A100-Pcie.png)
+
+
+# Getting Started
 ## Installation
-#### Build from source
+### Build from source
 Users can clone source code and build SimuMax from source:
 
 1. Clone the repository.
@@ -45,77 +65,59 @@ pip install -v -e .
 ```
 
 
-## Usage
-
-### Example
-```python
-# Define the system、strategy、model config
-system_config_file = ...
-strategy_config_file = ...
-model_config_file = ...
-# Setup perf model and config
-perf_model = PerfLLM()
-perf_model.configure(
-    strategy_config=strategy_config_file, 
-    model_config=model_config_file, 
-    system_config=system_config_file
-)
-
-# Run simulate
-perf_model.run_estimate()
-
-# Based simulate result, run memory analysis
-mem_result = perf_model.analysis_mem()
-
-# Based simulate result, run cost analysis
-cost_result = perf_model.analysis_cost()
-```
-In the above example, `system_config_file`, `strategy_config_file`, and `model_config_file` are paths to your configuration files.
-
-The run_estimate method simulates the training process and estimates the performance.
-
-The analysis_mem method analyzes the memory usage during the training process and returns a mem_result object. This object contains information about the memory usage of different parts of the model, such as the weight memory usage, gradient memory usage, and state memory usage.
-
-The analysis_cost method analyzes the cost of the training process and returns a cost_result object. This object contains information about the compute usage of the model, such as the forward pass flops, backward pass flops, and memory accessed during each pass.
-
-We also provide some examples of models. You can try the scripts in the examples directory. 
-Note that performance analysis depends heavily on the system config, so an accurate config is important. We only provide a demo, not an accurate config.
+## Example
+Please refer to the [tutorial](./docs/tutorial.md) for more details.
 
 ```bash
 cd ./examples
-python perf_llama2-7b_4node.py
-# The results are stored in the tmp directory
+python perf_llama3_8b_tp1_pp2.py
+# The results are stored in the llama3_8b_a100_pcie_bf16 directory
+```
+The output is as follows:
+```
+-------------SIMUMAX SUMMARY TP=1,EP=1,PP=2 -------------
+- parallelism = seq4096.mbs1.mbc8.gbs32 tp1.ep1.pp2.dp4.etp1.edp4, world_size:8
+- recompute = No Recompute
+- dtype = bf16, grad_reduce = fp32
+- system = a100_pcie_bf16
+- model = dense
+- mfu = 0.49
+- TFLOPS = 151.59 (tflops=843.3426 T, duration=5.5632 s)
+- TGS_per_gpu = 2945.052828675417
+- peak_alloc_mem = {'first_stage': '50.7760 GB', 'last_stage': '45.1637 GB'}
 ```
 
+# Unitest
+after clone the repo, plz use "git config core.hooksPath git_hooks" to set commit hook, which will check the perf result in some config is still the same before commit automatically.
 
-### Result Field Explanations
-Here are explanations for each field in the `cost_result`:
-- `comm_result`: each batch's communication cost. Currently, we assume that the communication cost of each batch is the same, and we will adjust it later.
-- `compute_details`: each batch's compute cost details and whole training process's statistics.
-- `breakdown_result`:  a dictionary that contains the breakdown of the cost of the training process.
-- `chunk_time`: the time taken for each micro batch forward and backward pass.
-- `all_tokens_per_iter`: the number of tokens processed per iteration.
-- `duration_time_per_iter`: the time taken for each iteration.
-- `mfu`:  simulated flops are used to calculate the MFU.
-- `mfu_6nd_with_attn`: the 6ND MFU formula with attention which typically doesn't differ too much from `mfu`.
-- `mfu_6nd`: the 6ND MFU formula without attention.
-- `throughput_per_accelerator`: the throughput of each accelerator during the training process.
-
-And here are explanations for each field in the `mem_result`(if pp_size is 1, the result is the memory analysis result of the first stage, otherwise, it will return the memory analysis result of the first stage and the last stage respectively.):
-- `model_mem`: the memory usage of the model. including the weight memory usage, gradient memory usage, and state memory usage.
-- `fwd_peak_allocated_mem`: the peak memory usage during the forward pass.
-- `bwd_peak_allocated_mem`: the peak memory usage during the backward pass.
-- `peak_cached_mem`: the peak memory usage of the cache.
-
-## TODO
+# TODO
 SimuMax is in active development, may contain bugs or incomplete features. Contributions are welcome!
 There are features to be added. Several significants are:
 - Support context parallel
 - More pipeline scheduler
 - Overlap between computation and communication
 - Offloading
-- FP8 training
-- More accurate calculation/communication operator simulation
+- Strategy search
+- More accurate memory-bound operator simulation
 
-## Acknowledgements
+
+# Acknowledgements
 Some aspects of the design and interfaces were inspired by [Calculon](https://github.com/calculon-ai/calculon). We appreciate the work done by the authors of that repository, which provided helpful references during development.
+
+
+# Community
+
+### Issue Reporting
+If you find any problems for SimuMax, please open an issue.
+
+### Contributions
+Welcome any form of contribution of code, model implementation and document!
+
+
+### Join Our Team
+If you're passionate about:
+
+Large-scale models for MoE, Reinforcement Learning, Multi-Modal
+GPU/GPU-Cluster Training/Inference performance optimization
+
+Feel free to reach out to xuerong.huang@mthreads.com.

@@ -1,0 +1,23 @@
+{
+    "model_type":"moe",
+    "model_name":"deepseek_v3",
+    "attention_type": "mla",
+    "hidden_size": 7168,
+    "head_num": 128,
+    "kv_head_num": 128,
+    "head_size": 128,
+    "intermediate_size": 18432,
+    "moe_ffn_hidden_size": 2048,
+    "moe_shared_expert_intermediate_size": 2048,
+    "layer_num": 61,
+    "dense_layers": 3,
+    "expert_num": 256,
+    "v_head_dim": 128,
+    "qk_head_dim": 128,
+    "qk_pos_emb_head_dim": 64,
+    "q_lora_rank": 1536,
+    "kv_lora_rank": 512,
+    "topk":8,
+    "vocab_size": 129280,
+    "use_swiglu": true
+}

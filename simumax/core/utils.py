@@ -1,7 +1,7 @@
 """Various utilities"""
 
 import json
-
+import os, subprocess
 
 class HumanReadableSize:
     """Convert a size in bytes to a human-readable format."""
@@ -148,3 +148,43 @@ def path_convert_to_str(path: list) -> str:
     elif len(path) > 1:
         path_name = " -> ".join(path)
     return path_name
+
+def get_rank_group(global_rank, strategy):
+    ## world_size = tp*pp*dp
+
+    tp_rank = global_rank % strategy.tp_size
+    pp_rank = (global_rank // strategy.tp_size) % strategy.pp_size
+    dp_rank = (global_rank // (strategy.tp_size * strategy.pp_size))
+    ep_rank = dp_rank % strategy.ep_size
+    edp_rank = dp_rank // strategy.ep_size
+    tp_group_id = f"pp:{pp_rank}-dp:{dp_rank}"
+    pp_group_id = f"tp:{tp_rank}-dp:{dp_rank}"
+    dp_group_id = f"tp:{tp_rank}-pp:{pp_rank}"
+    ep_group_id = f"tp:{tp_rank}-pp:{pp_rank}-edp:{edp_rank}"
+    edp_group_id = f"tp:{tp_rank}-pp:{pp_rank}-ep:{ep_rank}"
+    dic = {
+        "tp_group_id": tp_group_id,
+        "tp_rank": tp_rank,
+        "pp_group_id": pp_group_id,
+        "pp_rank": pp_rank,
+        "dp_group_id": dp_group_id,
+        "dp_rank": dp_rank,
+        "ep_group_id": ep_group_id,
+        "ep_rank": ep_rank,
+        "edp_group_id": edp_group_id,
+        "edp_rank": edp_rank,
+    }
+    return dic
+
+def merge_dict(cur_data, merges_data):
+    if len(merges_data) == 0:
+        for key, value in cur_data.items():
+            merges_data[key] = [value]
+    else:
+        for key, value in cur_data.items():
+            merges_data[key].append(value)  
+    return merges_data
+
+def rm_tmp():
+    if os.path.exists("./tmp"):
+        subprocess.run(["rm", "-rf", "./tmp"])
