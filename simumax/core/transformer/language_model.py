@@ -524,7 +524,7 @@ class LLMModel(MetaModule):
 
     def analysis_op_info(self, return_details=False):
         assert self.init_ready and self.input_info and self.status_ready, "Please initialize the model first!"
-        leaf_moduls = self.get_all_leaf_modules()
+        leaf_modules = self.get_all_leaf_modules()
         op_infos = {
             "op":[],
             "input_shapes":[],
@@ -540,7 +540,7 @@ class LLMModel(MetaModule):
             op_infos['compute_only_details'] = []
             op_infos['IO_details'] = []
 
-        for m in leaf_moduls:
+        for m in leaf_modules:
             # forward
             output_shape = m.output_info.shapes if isinstance(m.output_info, InputOutputInfo) else [m.output_info.shape]
             op_infos["op"].append(m.__class__.__name__)
