@@ -121,3 +121,8 @@ Large-scale models for MoE, Reinforcement Learning, Multi-Modal
 GPU/GPU-Cluster Training/Inference performance optimization
 
 Feel free to reach out to xuerong.huang@mthreads.com.
+
+## Star History
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=MooreThreads/SimuMax&type=date&legend=top-left)](https://www.star-history.com/#MooreThreads/SimuMax&type=date&legend=top-left)  
