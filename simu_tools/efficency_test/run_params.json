@@ -1,0 +1,16 @@
+{
+    "model_list":["deepseekv2",
+                  "deepseekv3",
+                  "deepseek-32b",
+                  "deepseek-16b",
+                  "deepseek-1b",
+                  "llama3-8b",
+                  "llama3-70b",
+                  "qwen3-32b",
+                  "kimi-1T",
+                  "mixtral-8x7b"],
+    "mbs_list": [1, 2, 4],
+    "seq_len_list":[4096],
+    "tp_list": [1, 2, 4, 8],
+    "ep_list": [1, 2, 4, 8, 16, 64]
+}

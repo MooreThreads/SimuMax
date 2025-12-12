@@ -11,16 +11,27 @@ BPE = dict(
     int32 = 4,
     int64 = 8
 )
-@dataclass
 class TensorSize:
+    _id_counter = 0
     """record the shape of the tensor"""
-
-    shape: Tuple[int, ...]
-    dtype: str = "bf16"
+    def __init__(self, shape: Tuple[int, ...], dtype: str = "bf16", grad_fn=None):
+        # self.shape = shape
+        self.shape = [int(i) for i in shape]
+        self.dtype = dtype
+        self.id = TensorSize._id_counter
+        TensorSize._id_counter += 1
+        self._prev = set()
+        if grad_fn is not None and hasattr(grad_fn, 'inputs'):
+            for i in grad_fn.inputs:
+                self._prev.add(i)
 
     @property
     def ndim(self):
         return len(self.shape)
+    
+    @property
+    def tensors(self):
+        return [self]
     
     def size(self, index: int=None) -> int:
         """
@@ -65,10 +76,14 @@ class TensorSize:
     def __getitem__(self, index: int) -> int:
         return self.shape[index]
 
-    def new(self, dim, new_size):
+    def new_with_dim(self, dim, new_size):
         new_shape = list(deepcopy(self.shape))
         new_shape[dim] = new_size
         return TensorSize(new_shape)
+    
+    def new(self):
+        shape = deepcopy(self.shape)
+        return TensorSize(shape)
     
     def unsqeeze(self, dim):
         # inplace
@@ -121,6 +136,7 @@ class TensorSize:
         # return f"TensorSize(shape={self.shape}, dtype={self.dtype}, mem_size={self.mem_size/1024/1024:.4f} MB)"
         return f"TensorSize(shape={self.shape}, dtype={self.dtype})"
 
+FakeTensor = TensorSize
 class Float8Tensor(TensorSize):
     def __init__(self, shape):
         super().__init__(shape)

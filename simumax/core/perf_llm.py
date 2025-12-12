@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 import os
+import math
 import json
 from copy import deepcopy
 from typing import List, Union, Dict
@@ -9,9 +10,10 @@ from sympy import divisors
 import matplotlib.pyplot as plt
 import pandas as pd
 from simumax.core.base_struct import PathDebugContext
-from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, TMP_PATH, SIMU_CHECK, SIMU_DEBUG
+from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, set_capture_graph_only, TMP_PATH, SIMU_CHECK, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.base_struct import InputOutputInfo, TensorSize, Result
 from simumax.core.transformer.language_model import LLMModel, PeakPoint
+from simumax.core.graph import SimuONNXGraphBuilder, visualize_with_graphviz
 from simumax.core.utils import (
     HumanReadableSize,
     human_readable_bytes,
@@ -20,6 +22,9 @@ from simumax.core.utils import (
     rm_tmp
 )
 
+FIRST_CHUNK = "first_stage_chunk"
+MIDDLE_CHUNK = "middle_stage_chunk"
+LAST_CHUNK = "last_stage_chunk"
 
 class PerfBase(ABC):
     """
@@ -33,6 +38,7 @@ class PerfBase(ABC):
         self.strategy = None
         self.model_config = None
         self.system = None
+        self.graph = None
 
         self.debug_points = []
         self.debug_points_last_stage = []
@@ -110,6 +116,7 @@ class PerfBase(ABC):
         world_size = self.strategy.world_size
         tp_size = self.strategy.tp_size
         etp_size = self.strategy.etp_size
+        edp_size = self.strategy.edp_size
         ep_size = self.strategy.ep_size
         pp_size = self.strategy.pp_size
         dp_size = self.strategy.dp_size
@@ -134,6 +141,10 @@ class PerfBase(ABC):
         if self.strategy.dp_net == "auto" or re_analysis:
             self.strategy.dp_net = pcie_decision_helper(tp_size*dp_size)
 
+        # 6. analysis edp_net
+        if self.strategy.edp_net == "auto" or re_analysis:
+            self.strategy.edp_net = pcie_decision_helper(etp_size * ep_size * edp_size)
+
     def analysis_high_link_net(self, re_analysis):
         world_size = self.strategy.world_size
         tp_size = self.strategy.tp_size
@@ -153,7 +164,7 @@ class PerfBase(ABC):
         
         # 2. analysis ep_net 
         if self.strategy.ep_net == "auto" or re_analysis:
-            condition = (ep_size*tp_size <= num_gpu_per_nodes) # When tp *ep exceeds the number of nodes, the communication bandwidth will be reduced, and the default communication between machines will be carried out.
+            condition = (ep_size*etp_size <= num_gpu_per_nodes) # When etp *ep exceeds the number of nodes, the communication bandwidth will be reduced, and the default communication between machines will be carried out.
             self.strategy.ep_net = "high_intra_node" if condition else "inter_node"
 
         # 3. analysis tp_net
@@ -170,21 +181,39 @@ class PerfBase(ABC):
             condition = (tp_size * dp_size <= num_gpu_per_nodes)
             self.strategy.dp_net = "high_intra_node" if condition else "inter_node"
 
+        # 6. analysis edp_net
+        if self.strategy.edp_net == "auto" or re_analysis:
+            condition = etp_size * ep_size * edp_size <= num_gpu_per_nodes
+            self.strategy.edp_net = "high_intra_node" if condition else "inter_node"
+        
     def analysis_net(self, re_analysis = False):
         if self.system.intra_with_pcie:
             self.analysis_pcie_net(re_analysis)
         else:
             self.analysis_high_link_net(re_analysis)
-
-    def run_estimate(self):
+    
+    def capture(self, save_path):
+        os.makedirs(save_path, exist_ok=True)
+        print("Capture graph...")
+        builder = SimuONNXGraphBuilder()
+        builder.reset()
+        set_capture_graph_only(True)
+        self._run()
+        set_capture_graph_only(False)
+        graph = builder.graph
+        graph.export_json(os.path.join(save_path, 'model_graph.json'))
+        print("Capture graph done.")
+        return graph
+    
+    def run_estimate(self, capture_graph = False, save_path='./'):
         assert self.is_configured, "should call configure() first"
         self.model_config.maybe_pad_vocab_size(self.strategy.tp_size)
         self.analysis_net(re_analysis = True)
-
         self.build()
+        if capture_graph:
+            self.graph = self.capture(save_path)
 
         self._run()
-
 class PerfLLM(PerfBase):
 
     """Performance model for LLM"""
@@ -324,6 +353,7 @@ class PerfLLM(PerfBase):
         """
         build first stage model chunk and last stage model chunk
         """
+        self.strategy.sanity_check()
         self.model_chunk_dict:Dict[str, LLMModel] = {}
 
         # Build First Stage Model Chunk
@@ -420,39 +450,6 @@ class PerfLLM(PerfBase):
         # TODO: support uneven divide && interleaving
         bubble_time = fwd_bwd_time * (self.strategy.pp_size - 1)
         return bubble_time
-
-    def _compute_chunk_time(self, model_name='first_stage_chunk'):
-        batch_stat_with_recomp = ( 
-            self._analysis_single_batch_cost_impl(
-                enable_recompute=True, model_name=model_name
-            )
-        )
-        batch_stat_no_recomp = self._analysis_single_batch_cost_impl(
-            enable_recompute=False, model_name=model_name
-        )
-        comm_result = self._analysis_comm_time(
-            batch_stat_with_recomp, batch_stat_no_recomp, model_name=model_name
-        )
-        compute_result = self._analysis_compute_time(
-            batch_stat_with_recomp, batch_stat_no_recomp, model_name=model_name
-        )
-        batch_compute_stat = compute_result[
-            "batch_compute_stat"
-        ]
-        chunk_time = (
-            batch_compute_stat["cost_info"]["fwd_compute_time"]
-            + batch_compute_stat["cost_info"]["bwd_compute_time"]
-            + batch_compute_stat["cost_info"]["recompute_compute_time"]
-            + comm_result["intra_comm_time"][
-                "intra_exposed_time_per_batch"
-            ]
-            + comm_result["inter_comm_time"][
-                "inter_exposed_time_per_batch"
-            ]
-            * 2
-        )
-        return batch_stat_with_recomp, batch_stat_no_recomp, comm_result, compute_result, batch_compute_stat, chunk_time
-        
     def _compute_optim_time(self, model_name):
         # we use the chunk weight accessed time as the optim time
         result = {"optim_time": 0, "optim_exposed_time": 0}
@@ -500,7 +497,7 @@ class PerfLLM(PerfBase):
         # TODO: support overlap
         use_megatron = True
     
-        def compute_dp_helper(rs_comm_size, gather_comm_size, dp_net, dp_size):
+        def compute_dp_helper(rs_comm_size, gather_comm_size, dp_net, dp_size, dp_group):
             result = {"dp_comm_time": 0, "dp_comm_exposed_time": 0}
             dp_comm_time = 0
             bucket_size = (
@@ -518,17 +515,28 @@ class PerfLLM(PerfBase):
                     bucket_size,
                     comm_num=dp_size,
                     net=dp_net,
-                    comm_stage="dp"
+                    comm_stage=dp_group, 
+                    strategy=self.strategy
                 )
                 all_gather_time = num_gather_bucket * self.system.compute_net_op_time(
-                    "all_gather", bucket_size, comm_num=dp_size, net=dp_net,comm_stage="dp"
+                    "all_gather", 
+                    bucket_size, 
+                    comm_num=dp_size, 
+                    net=dp_net,
+                    comm_stage=dp_group,
+                    strategy=self.strategy
                 )
                 dp_comm_time += all_gather_time + reduce_scatter_time
                 details['reduce_scatter_time'] = reduce_scatter_time
                 details['all_gather_time'] = all_gather_time
             else:
                 dp_comm_time += num_reduce_bucket * self.system.compute_net_op_time(
-                    "all_reduce", bucket_size, comm_num=dp_size, net=dp_net, comm_stage="dp"
+                    "all_reduce", 
+                    bucket_size, 
+                    comm_num=dp_size, 
+                    net=dp_net,
+                    comm_stage=dp_group,
+                    strategy=self.strategy
                 )
 
             dp_comm_exposed_time = dp_comm_time  # no overlap for now
@@ -543,14 +551,16 @@ class PerfLLM(PerfBase):
         
         model_info = self.model_chunk_dict[model_name].get_model_info()
 
-        rs_comm_size = model_info.grad_bytes/2  if self.strategy.grad_reduce_in_bf16 else model_info.grad_bytes 
-        gather_comm_size = model_info.grad_bytes / 4 * self.dtype_to_element_size[self.strategy.dtype] 
-
+        # dense
+        rs_comm_size = model_info.dense_grad_bytes/2  if self.strategy.grad_reduce_in_bf16 else model_info.dense_grad_bytes 
+        gather_comm_size = model_info.dense_grad_bytes / 4 * self.dtype_to_element_size[self.strategy.dtype] 
+        
+        # moe
         moe_rs_comm_size = model_info.moe_grad_bytes / 2 if self.strategy.grad_reduce_in_bf16 else model_info.moe_grad_bytes
         moe_gather_comm_size = model_info.moe_grad_bytes / 4 * self.dtype_to_element_size[self.strategy.dtype]
 
-        dense_dp_result = compute_dp_helper(rs_comm_size, gather_comm_size, self.strategy.dp_net, self.strategy.dp_size)
-        moe_dp_result = compute_dp_helper(moe_rs_comm_size, moe_gather_comm_size, self.strategy.dp_net, self.strategy.edp_size) # FIXME: support edp_net decision
+        dense_dp_result = compute_dp_helper(rs_comm_size, gather_comm_size, self.strategy.dp_net, self.strategy.dp_size, dp_group="dp")
+        moe_dp_result = compute_dp_helper(moe_rs_comm_size, moe_gather_comm_size, self.strategy.edp_net, self.strategy.edp_size, dp_group="edp")
         all_result = {
             'dp_comm_exposed_time': dense_dp_result['dp_comm_exposed_time'] + moe_dp_result['dp_comm_exposed_time'],
             'dense': dense_dp_result,
@@ -561,37 +571,15 @@ class PerfLLM(PerfBase):
     def _analysis_mem_impl(
         self,
         micro_batch_num,
-        skip_ckpt_micro_batch_num=None,
-        model_name="first_stage_chunk",
+        model_name=FIRST_CHUNK,
     ):
-        assert (
-            skip_ckpt_micro_batch_num is None
-            or skip_ckpt_micro_batch_num <= micro_batch_num
-        )
         result = {}
         model_info = self.model_chunk_dict[model_name].get_model_info()
-        # act_info = self.model_chunk_dict[model_name].get_act_info()
-        # act_info_with_recomp = self.model_chunk_dict[
-        #     model_name
-        # ].get_act_info_with_recomp()
-        if self.strategy.enable_recompute and skip_ckpt_micro_batch_num is None:
-            skip_ckpt_micro_batch_num = 0
-        elif not self.strategy.enable_recompute:
-            skip_ckpt_micro_batch_num = micro_batch_num
 
-        cur_mb_with_recomp = micro_batch_num > skip_ckpt_micro_batch_num
-        skip_ckpt_micro_batch_num_prev = (
-            skip_ckpt_micro_batch_num
-            if cur_mb_with_recomp
-            else skip_ckpt_micro_batch_num - 1
-        )
-        with_recomp_micro_batch_num_prev = (  # pylint: disable=invalid-name
-            (micro_batch_num - 1 - skip_ckpt_micro_batch_num)
-            if cur_mb_with_recomp
-            else 0
-        )
+        #-------------------------- 0. set base info --------------------------
         result["micro_batch_num"] = self.strategy.micro_batch_num
         result["micro_batch_size"] = self.strategy.micro_batch_size
+        result["cached_micro_batch_num"] = micro_batch_num -1
         result['parallel_config'] = {
             'parallelism': self.strategy.parallelism,
             'fp8': self.strategy.fp8,
@@ -600,163 +588,54 @@ class PerfLLM(PerfBase):
                 'actual_layer_num': self.model_chunk_dict['first_stage_chunk'].layer_num,
                 'recompute_layer': self.strategy.recompute_layer_num,
                 'recompute_recompute_granularity': self.strategy.recompute_granularity,
-                # 'mlp_recompute_detail':self.strategy.parse_mlp_recompute(0).__dict__(),
-                # 'attention_recompute_detail':self.strategy.parse_mlp_recompute(0).__dict__(),
             }
         }
         if self.strategy.grad_reduce_in_bf16:
-                model_info.grad_bytes = model_info.grad_bytes/2 # TODO(sherry): this is a hack to make it work, need to fix
+                model_info.dense_grad_bytes = model_info.dense_grad_bytes/2 # TODO(sherry): this is a hack to make it work, need to fix
+                model_info.moe_grad_bytes = model_info.moe_grad_bytes/2
 
+        #-------------------------- 1. compute model mem --------------------------
         dense_model_mem = dict(
-            model_mem = model_info.weight_bytes + model_info.grad_bytes + model_info.state_bytes,
-            weight_bytes = model_info.weight_bytes,
-            grad_bytes = model_info.grad_bytes,
-            state_bytes = model_info.state_bytes
+            all_mem = model_info.dense_weight_bytes + model_info.dense_grad_bytes + model_info.dense_state_bytes,
+            detail = dict(
+                weight_bytes = model_info.dense_weight_bytes,
+                grad_bytes = model_info.dense_grad_bytes,
+                state_bytes = model_info.dense_state_bytes
+            )
         )
         moe_model_mem = dict(
-            model_mem = model_info.moe_weight_bytes + model_info.moe_grad_bytes + model_info.moe_state_bytes,
-            weight_bytes = model_info.moe_weight_bytes,
-            grad_bytes = model_info.moe_grad_bytes,
-            state_bytes = model_info.moe_state_bytes
+            all_mem = model_info.moe_weight_bytes + model_info.moe_grad_bytes + model_info.moe_state_bytes,
+            detail = dict(
+                weight_bytes = model_info.moe_weight_bytes,
+                grad_bytes = model_info.moe_grad_bytes,
+                state_bytes = model_info.moe_state_bytes
+            )
         )
-        result["model_mem"] = dense_model_mem["model_mem"] + moe_model_mem["model_mem"]
-
-
+        result["model_mem"] = dense_model_mem['all_mem'] + moe_model_mem['all_mem']
         result["model_mem_detail"] = dict(
             dense = dense_model_mem,
             moe = moe_model_mem
         )
-        # skip gradient ckpt micro batch
-        # result["act_mem_detail"] = repr(act_info)
-        result["skip_ckpt_micro_batch_num_prev"] = skip_ckpt_micro_batch_num_prev
-        result["with_recomp_micro_batch_num_prev"] = with_recomp_micro_batch_num_prev # micro_batch_num - 1
-        result["cur_mb_with_recomp"] = cur_mb_with_recomp
-
-
-        #-------------------------- 0. get with/no recompute details --------------------------
-
-        cur_no_recompute_act_info:PeakPoint = self.pp_state_peak_point[model_name]["no_recompute_peak_point"]
-        cur_with_recompute_act_info:PeakPoint = self.pp_state_peak_point[model_name]["with_recompute_peak_point"]
-        cur_act_info:PeakPoint = cur_with_recompute_act_info if cur_mb_with_recomp else cur_no_recompute_act_info
-
-        # result["cur_mbs_no_recompute_act_mem_detail"] = deepcopy(cur_no_recompute_act_info.to_dict())
-        # result["cur_mbs_with_recompute_act_mem_detail"] = deepcopy(cur_with_recompute_act_info.to_dict())
-        #-------------------------- get with/no recompute details --------------------------
-
-
-        # result["act_cached_mem_prev_mbs"] = (
-        #     skip_ckpt_micro_batch_num_prev * act_info.activation_mem_cache
-        #     + with_recomp_micro_batch_num_prev
-        #     * act_info_with_recomp.activation_mem_cache
-        # ) 
+        # result["with_recompute"] = self.strategy.enable_recompute
         
-        #-------------------------- 1. compute act_cached_mem_prev_mbs --------------------------
-        result["fwd_activation_cache_per_micro_batch"] = f"{cur_with_recompute_act_info.activation_mem_cache/1024/1024/1024:.4f} GB"
-        result["peak_activation_mem_in_1F1B"] = cur_with_recompute_act_info.peak_mem
-        
-
-        result["act_cached_mem_prev_mbs"] = (
-            skip_ckpt_micro_batch_num_prev * cur_no_recompute_act_info.activation_mem_cache 
-            + with_recomp_micro_batch_num_prev
-            * cur_with_recompute_act_info.activation_mem_cache
-        ) 
-
-        #-------------------------- compute act_cached_mem_prev_mbs --------------------------
-
-
-        # cur_act_info = act_info_with_recomp if cur_mb_with_recomp else act_info
-
-        # result["cur_mbs_act_mem_detail"] = deepcopy(act_info.to_dict())
-        
-        peak_model_mem = result["model_mem"]
-
-
-        # result["fwd_peak_allocated_mem"] = (
-        #     peak_model_mem
-        #     + result["act_cached_mem_prev_mbs"]
-        #     + cur_act_info.fwd_peak_mem
-        # )
-        # result["bwd_peak_allocated_mem"] = (
-        #     peak_model_mem
-        #     + result["act_cached_mem_prev_mbs"]
-        #     + cur_act_info.bwd_peak_mem
-        # )
-        
-        #-------------------------- 2. compute fwd/bwd peak mem --------------------------
-
-        result["fwd_peak_allocated_mem"] = (
-            peak_model_mem
-            + result["act_cached_mem_prev_mbs"]
-            + cur_act_info.fwd_peak_mem
-        )
-
-        result["bwd_peak_allocated_mem"] = (
-            peak_model_mem
-            + result["act_cached_mem_prev_mbs"]
-            + max(cur_act_info.bwd_peak_mem, cur_act_info.recomp_fwd_peak_mem, cur_act_info.recomp_bwd_peak_mem)
-        )
-        #-------------------------- compute fwd/bwd peak mem --------------------------
-
-        # result["peak_cached_mem"] = (
-        #     max(result["bwd_peak_allocated_mem"], result["fwd_peak_allocated_mem"])
-        #     / self.strategy.mem_factor
-        # )
+        #-------------------------- 2. compute peak activation in 1F1B--------------------------
+        cur_act_info:PeakPoint = self.pp_state_peak_point[model_name]
+        result["fwd_activation_cache_per_micro_batch"] = f"{cur_act_info.activation_mem_cache/1024/1024/1024:.4f} GB"
+        result["peak_activation_mem_in_1F1B"] = cur_act_info.peak_mem
+        model_mem = result["model_mem"]
 
         #-------------------------- 3. compute total peak peak mem --------------------------
+        # result["fwd_peak_allocated_mem"] = cur_act_info.fwd_peak_mem
+        # result["bwd_peak_allocated_mem"] = max(cur_act_info.bwd_peak_mem, cur_act_info.recomp_fwd_peak_mem, cur_act_info.recomp_bwd_peak_mem)
         result["peak_mem"] = (
-            max(result["bwd_peak_allocated_mem"], result["fwd_peak_allocated_mem"])
+            model_mem + 
+            (micro_batch_num-1) * cur_act_info.activation_mem_cache +
+            result["peak_activation_mem_in_1F1B"]
         )
-        result["peak_mem_with_reserved"] = (
-            max(result["bwd_peak_allocated_mem"], result["fwd_peak_allocated_mem"])
-            / self.strategy.mem_factor
-        )
+        result["peak_mem_with_reserved"] = result["peak_mem"]/self.strategy.mem_factor
+        
         result["memory_reserved_ratio"] = str(self.strategy.mem_factor)
-        result["peak_path"] = f"{cur_with_recompute_act_info.peak_path}, stage=[{cur_with_recompute_act_info.peak_stage}]"
-        #-------------------------- compute total peak peak mem --------------------------
-
-        is_first_stage = model_name == "first_stage_chunk"
-        debug_points = (
-            self.debug_points if is_first_stage else self.debug_points_last_stage
-        )
-        path_debug_context = (
-            self.path_debug_context
-            if is_first_stage
-            else self.path_debug_context_last_stage
-        )
-
-        if debug_points:
-            debug_res_info = {}
-            for point in debug_points:
-                data = path_debug_context.get_point_datas(
-                    enable_recompute=cur_mb_with_recomp
-                )
-                if point not in data:
-                    continue
-                point_data = data[point]
-                point_data.valid_debug_info()
-                debug_res_info[point_data.point] = {
-                    "prev_cache_mem": human_readable_bytes(point_data.prev_cache_mem),
-                    "fwd_peak_no_cache_mem": human_readable_bytes(
-                        point_data.fwd_peak_no_cache_mem
-                    ),
-                    "bwd_peak_no_cache_mem": human_readable_bytes(
-                        point_data.bwd_peak_no_cache_mem
-                    ),
-                    "fwd_peak_allocated_mem": human_readable_bytes(
-                        peak_model_mem
-                        + result["act_cached_mem_prev_mbs"]
-                        + point_data.prev_cache_mem
-                        + point_data.fwd_peak_no_cache_mem
-                    ),
-                    "bwd_peak_allocated_mem": human_readable_bytes(
-                        peak_model_mem
-                        + result["act_cached_mem_prev_mbs"]
-                        + point_data.prev_cache_mem
-                        + point_data.bwd_peak_no_cache_mem
-                    ),
-                }
-            result["debug_res_info"] = debug_res_info
-
+        result["peak_path"] = f"{cur_act_info.peak_path}, stage=[{cur_act_info.peak_stage}]"
         # Convert to human format
         convert_final_result_to_human_format(result)
         return result
@@ -765,20 +644,28 @@ class PerfLLM(PerfBase):
         """Based the simulation result, analyze the memory usage"""
         if self.strategy.pp_size == 1:
             result = self._analysis_mem_impl(
-                micro_batch_num=1, model_name="first_stage_chunk"
+                micro_batch_num=1, model_name=FIRST_CHUNK
             )
-        else:
+        elif self.strategy.pp_size == 2:
+            # add more condition here to ensure the correctness the order of pp stage in result
             result = {"first_stage": {}, "last_stage": {}}
             result["first_stage"] = self._analysis_mem_impl(
-                micro_batch_num=self.strategy.pp_size, model_name="first_stage_chunk"
-            ) # 这里应该是对应的1F1B, stage1的ac需要hold pp_size份mbs（micro batch size）
+                micro_batch_num=self.strategy.pp_size, model_name=FIRST_CHUNK
+            ) # The 0th stage, here should be the corresponding 1F1B, the ac of stage1 needs to hold pp_size mbs (micro batch size)
             result["last_stage"] = self._analysis_mem_impl(
-                micro_batch_num=1, model_name="last_stage_chunk"
+                micro_batch_num=1, model_name=LAST_CHUNK
             )
-        if self.strategy.pp_size>2:
+        elif self.strategy.pp_size>2: 
+            result = {"first_stage": {}, "middle_stage": {},"last_stage": {}}
+            result["first_stage"] = self._analysis_mem_impl(
+                micro_batch_num=self.strategy.pp_size, model_name=FIRST_CHUNK
+            ) # The 0th stage, here should be the corresponding 1F1B, the ac of stage1 needs to hold pp_size mbs (micro batch size)
             result["middle_stage"] = self._analysis_mem_impl(
-                micro_batch_num=self.strategy.pp_size-1, model_name="middle_stage_chunk"
-            )# 这里应该是对应的1F1B, stage2的ac需要hold pp_size-1份mbs（micro batch size）
+                micro_batch_num=self.strategy.pp_size-1, model_name=MIDDLE_CHUNK
+            ) # The first stage, here should be the corresponding 1F1B, the ac of stage2 needs to hold pp_size-1 mbs (micro batch size)
+            result["last_stage"] = self._analysis_mem_impl(
+                micro_batch_num=1, model_name=LAST_CHUNK
+            )
         return Result(result)
 
     def _analysis_single_batch_cost_impl(  # pylint: disable=invalid-name
@@ -818,7 +705,6 @@ class PerfLLM(PerfBase):
         cost_batch_stat["recompute_time"] = (
             cost_info.recompute_time if enable_recompute else 0
         )
-
         cost_batch_stat["fwd_compute_time"] = cost_info.fwd_compute_time
         cost_batch_stat["bwd_compute_time"] = cost_info.bwd_compute_time
         cost_batch_stat["recompute_compute_time"] = cost_info.recompute_compute_time
@@ -847,14 +733,10 @@ class PerfLLM(PerfBase):
         result["compute_info"] = compute_batch_stat
         return result
 
-    def _analysis_compute_time(self, batch_stat_with_recomp, batch_stat_no_recomp, model_name):
+    def _analysis_gbs_compute_time(self, batch_stat, model_name):
         result = {}
         micro_batch_num = self.strategy.micro_batch_num
         # skip_ckpt_micro_batch_num = self.strategy.skip_ckpt_micro_batch_num
-        if self.strategy.enable_recompute:
-            batch_stat = batch_stat_with_recomp
-        else:
-            batch_stat = batch_stat_no_recomp
         result["batch_compute_stat"] = batch_stat
 
         result["fwd_compute_time"] = (
@@ -876,17 +758,13 @@ class PerfLLM(PerfBase):
         result["model_flops"] = result["fwd_flops"] + result["bwd_flops"]
         return result
 
-    def _analysis_comm_time(self, batch_stat_with_recomp, batch_stat_no_recomp, model_name):
+    def _analysis_gbs_comm_time(self, batch_stat, model_name):
         result = {}
         micro_batch_num = self.strategy.micro_batch_num
         dp_comm_result = self._compute_dp_time(model_name)
         # TODO: add ckpt bubble and add strategy extra comm time, # e.g sp grad reduce
-        intra_exposed_time_with_recomp_per_batch = sum(  # pylint: disable=invalid-name
-            batch_stat_with_recomp["cost_info"][k]
-            for k in ["fwd_net_time", "bwd_net_time", "recompute_net_time"]
-        )
-        intra_exposed_time_no_recomp_per_batch = sum(  # pylint: disable=invalid-name
-            batch_stat_no_recomp["cost_info"][k]
+        intra_exposed_time = sum(  # pylint: disable=invalid-name
+            batch_stat["cost_info"][k]
             for k in ["fwd_net_time", "bwd_net_time", "recompute_net_time"]
         )
         if self.strategy.pp_size > 1:
@@ -899,29 +777,18 @@ class PerfLLM(PerfBase):
                 if self.strategy.enable_sequence_parallel
                 else pp_comm_size
             )
-            inter_exposed_time_per_batch = 2 * self.system.compute_net_op_time(
+            inter_exposed_time_per_batch = 2 * 2 * self.system.compute_net_op_time(
                 "p2p", pp_comm_size, 2, net=self.strategy.pp_net, comm_stage="pp"
-            )  # 2 p2p
-
+            )  # 2 p2p, 2 to fwd and bwd
         else:
             inter_exposed_time_per_batch = 0
-        # intra_exposed_time_with_recomp = intra_exposed_time_with_recomp_per_batch
-        # intra_exposed_time_with_recomp = intra_exposed_time_with_recomp_per_batch * \
-        #                                  micro_batch_num
-        # intra_exposed_time_no_recomp = intra_exposed_time_no_recomp_per_batch * micro_batch_num
+
         inter_exposed_time = inter_exposed_time_per_batch * micro_batch_num
         result["dp_comm_time"] = dp_comm_result
         # Now we don't consider the mix of recompute and non-recompute
-        if self.strategy.enable_recompute:
-            intra_exposed_time_per_batch = intra_exposed_time_with_recomp_per_batch
-            intra_exposed_time = (
-                intra_exposed_time_with_recomp_per_batch * micro_batch_num
-            )
-        else:
-            intra_exposed_time_per_batch = intra_exposed_time_no_recomp_per_batch
-            intra_exposed_time = (
-                intra_exposed_time_no_recomp_per_batch * micro_batch_num
-            )
+        intra_exposed_time_per_batch = intra_exposed_time
+        intra_exposed_time = intra_exposed_time_per_batch * micro_batch_num
+        
         result["intra_comm_time"] = {
             "intra_exposed_time_per_batch": intra_exposed_time_per_batch,
             "intra_exposed_time": intra_exposed_time,
@@ -982,7 +849,6 @@ class PerfLLM(PerfBase):
         # idx = np.argmax(f_b_time)
         # bubble = sum(f_b_time)+sum(forward_times[idx+1:])+sum(backward_times[idx+1:]) - (pp-idx)*(f_b_time[idx])
         # all_time = bubble + mbc*f_b_time[idx]
-
         if draw:
             # 可视化调度图
             fig, ax = plt.subplots(figsize=(12, 5))
@@ -1005,224 +871,53 @@ class PerfLLM(PerfBase):
             plt.savefig("corrected_1F1B_pipeline.png")
 
         return max_time
-
-    def _analysis_single_iter_cost_impl2(self):
-        FIRST_CHUNK = "first_stage_chunk"
-        MIDDLE_CHUNK = "middle_stage_chunk"
-        LAST_CHUNK = "last_stage_chunk"
-
-        def compute_single_iter_cost_helper(model_name = "first_stage_chunk"):
-            assert model_name in ["first_stage_chunk", "middle_stage_chunk", 'last_stage_chunk'], f"model_name {model_name} not supported"
-            batch_stat_with_recomp = self._analysis_single_batch_cost_impl(
-                enable_recompute=True, model_name=model_name
-            )
-            batch_stat_no_recomp = self._analysis_single_batch_cost_impl(
-                enable_recompute=False, model_name=model_name
-            )
-            # 1.comm_result： dp_time + fwd/bwd/recompute net time + pp_time
-            comm_cost_result = self._analysis_comm_time(
-                batch_stat_with_recomp, batch_stat_no_recomp, model_name
-            )
-             # 2.compute result: 
-            # - fwd/bwd/recompute compute time, stored in compute_result['cost_info'], summarized in compute_result['fwd/bwd/recompute_compute_time']. compute_result['cost_info']['dp_comm_time] is computed by model.grad_bytes.
-            # - optim update time, stored in compute_result['optim_time'], computed by model.state_bytes.
-            # - fwd/bwd/recompute fwd/bwd/recompute net time is ignored in compute time, but included in comm_result['intra_comm_time']
-            compute_cost_result = self._analysis_compute_time(
-                batch_stat_with_recomp, batch_stat_no_recomp
-            )
-          
-            breakdown_result = {}
-            breakdown_result["fwd_compute_time"] = compute_cost_result["fwd_compute_time"]
-            breakdown_result["recompute_time"] = compute_cost_result["recompute_time"]
-            breakdown_result["bwd_compute_time"] = compute_cost_result["bwd_compute_time"]
-            breakdown_result["optim_time"] = compute_cost_result["optim_time"][
-                "optim_exposed_time"
-            ]
-            # breakdown_result['grad_accumulation'] = self.strategy.micro_batch_num * self.system.compute_mem_access_time(self.model_chunk_dict[model_name]._model_info.grad_bytes)
-            breakdown_result["intra_exposed_time"] = comm_cost_result["intra_comm_time"][
-                "intra_exposed_time"
-            ]
-            breakdown_result["inter_exposed_time"] = comm_cost_result["inter_comm_time"][
-                "inter_exposed_time"
-            ]
-            breakdown_result["dp_exposed_time"] = comm_cost_result["dp_comm_time"][
-                "dp_comm_exposed_time"
-            ]
-            breakdown_result['flexible_time'] = 20 # traning log/h2d
-
-            cost_info = self.model_chunk_dict[model_name]._cost_info
-            chunk_time = (
-                cost_info.fwd_compute_time
-                + cost_info.bwd_compute_time
-                + cost_info.recompute_compute_time
-                + comm_cost_result["intra_comm_time"]["intra_exposed_time_per_batch"]
-                + comm_cost_result["inter_comm_time"]["inter_exposed_time_per_batch"] * 2
-            )
-            breakdown_result['bubble_time'] = self._compute_bubble_time(chunk_time)
-
-            all_tokens_per_iter = self.strategy.seq_len * self.strategy.global_batch_size
-
-            all_result = {}
-            all_result["comm_cost_details"] = comm_cost_result
-            all_result["compute_cost_details"] = compute_cost_result
-            all_result["breakdown_result"] = breakdown_result
-            all_result['micro_batch_num']  = self.strategy.micro_batch_num
-            # all_result["1F1B_time(=breakdown_result_time remove dp/optim/bubble time)"] = chunk_time
-            all_result["all_tokens_per_iter"] = all_tokens_per_iter
-
-            return  all_result
-        
-        # def compute_pp_total_time_helper():
-            # def compute_fwd_bwd_time(model_name):
-            #     # if len(compute_result) == 0:
-            #     #     return -1, -1
-            #     # chunk_time = (
-            #     #     batch_compute_stat["cost_info"]["fwd_compute_time"]
-            #     #     + batch_compute_stat["cost_info"]["bwd_compute_time"]
-            #     #     + batch_compute_stat["cost_info"]["recompute_compute_time"]
-            #     #     + comm_result["intra_comm_time"]["intra_exposed_time_per_batch"]
-            #     #     + comm_result["inter_comm_time"]["inter_exposed_time_per_batch"] * 2
-            #     # )
-            #     if self.strategy.pp_size > 1:
-            #         pp_comm_size = (
-            #             self.micro_hidden_states_size
-            #             * self.dtype_to_element_size[self.strategy.dtype]
-            #         )
-            #         pp_comm_size = (
-            #             pp_comm_size / self.strategy.tp_size
-            #             if self.strategy.enable_sequence_parallel
-            #             else pp_comm_size
-            #         )
-            #         pp_time = 2 * self.system.compute_net_op_time(
-            #             "p2p", pp_comm_size, 2, net=self.strategy.pp_net
-            #         )  # 2 p2p
-
-            #     else:
-            #         pp_time = 0
-        
-            #     cost_info = self.model_chunk_dict[model_name].get_cost_info()
-                
-            #     fwd_chunk_time = (cost_info.fwd_compute_time + 
-            #                       cost_info.fwd_net_time + 
-            #                       pp_time)
-
-            #     bwd_chunk_time = (cost_info.bwd_compute_time + 
-            #                       cost_info.bwd_net_time + 
-            #                       cost_info.recompute_compute_time + 
-            #                       cost_info.recompute_net_time + 
-            #                       pp_time)
     
-            #     # fwd_time = (cost_info['fwd_compute_time'] + 
-            #     #                 cost_info['fwd_net_exposed_time']
-            #     #              )
-            #     # bwd_time = (cost_info['bwd_compute_time'] + 
-            #     #             cost_info['bwd_net_exposed_time'] + 
-            #     #             cost_info['recompute_compute_time'] +
-            #     #             cost_info['recompute_net_exposed_time']
-            #     #             )
-            #     return fwd_chunk_time, bwd_chunk_time
-            # fwd_chunk_time, bwd_chunk_time = compute_fwd_bwd_time(FIRST_CHUNK)
-            # forward_times = [fwd_chunk_time]
-            # backward_times = [bwd_chunk_time]
-            # has_middle_chunks = self.strategy.pp_size > 2
-            # has_last_chunk = self.strategy.pp_size > 1
-            # if has_middle_chunks:
-            #     fwd_chunk_time, bwd_chunk_time = compute_fwd_bwd_time(MIDDLE_CHUNK)
-            #     forward_times.extend([fwd_chunk_time]*(self.strategy.pp_size - 2))
-            #     backward_times.extend([bwd_chunk_time]*(self.strategy.pp_size - 2))
-            # if has_last_chunk:
-            #     fwd_chunk_time, bwd_chunk_time = compute_fwd_bwd_time(LAST_CHUNK)
-            #     forward_times.append(fwd_chunk_time)
-            #     backward_times.append(bwd_chunk_time)
-   
-            # single_iter_time = self.calculate_1f1b_bubble(self.strategy.pp_size, self.strategy.micro_batch_num, forward_times, backward_times)
-            # single_iter_time +=  self._compute_dp_time()['dp_comm_exposed_time']
-            # single_iter_time += self._compute_optim_time()['optim_exposed_time']
-            # return single_iter_time
+    def _compute_single_batch_fwd_bwd_time(self, model_name, chunk = False):
+            if self.strategy.pp_size > 1:
+                pp_comm_size = (
+                    self.micro_hidden_states_size
+                    * self.dtype_to_element_size[self.strategy.dtype]
+                )
+                pp_comm_size = (
+                    pp_comm_size / self.strategy.tp_size
+                    if self.strategy.enable_sequence_parallel
+                    else pp_comm_size
+                )
+                pp_time = 2 * self.system.compute_net_op_time(
+                    "p2p", pp_comm_size, 2, net=self.strategy.pp_net
+                )  # 2 p2p, fwd/bwd each
+            else:
+                pp_time = 0
+    
+            cost_info = self.model_chunk_dict[model_name].get_cost_info()
             
-        def compute_mfu_helper(all_result, duration_time_per_iter):
-            # breakdown_result = all_result['breakdown_result']
-            # breakdown_result['bubble_time'] = bubble_time
-            # breakdown_result['uneven_bubble_time'] = uneven_bubble_time
-            duration_time_per_iter = duration_time_per_iter
-            # all_result['bubble_time'] = bubble_time 
-            # all_result['uneven_bubble_time'] = uneven_bubble_time
-            all_result['duration_time_per_iter'] = duration_time_per_iter
-            # TODO(sherry): add bubble time 
+            fwd_chunk_time = (cost_info.fwd_compute_time + 
+                                cost_info.fwd_net_time + 
+                                pp_time)
+            bwd_chunk_time = (cost_info.bwd_compute_time + 
+                                cost_info.bwd_net_time + 
+                                cost_info.recompute_compute_time + 
+                                cost_info.recompute_net_time + 
+                                pp_time)
+            return (fwd_chunk_time, bwd_chunk_time) if not chunk else fwd_chunk_time + bwd_chunk_time
+    
+    def _compute_pp_total_time(self):
+        fwd_chunk_time, bwd_chunk_time = self._compute_single_batch_fwd_bwd_time(FIRST_CHUNK)
+        forward_times = [fwd_chunk_time]
+        backward_times = [bwd_chunk_time]
+        has_middle_chunks = self.strategy.pp_size > 2
+        has_last_chunk = self.strategy.pp_size > 1
+        if has_middle_chunks:
+            fwd_chunk_time, bwd_chunk_time = self._compute_single_batch_fwd_bwd_time(MIDDLE_CHUNK)
+            forward_times.extend([fwd_chunk_time]*(self.strategy.pp_size - 2))
+            backward_times.extend([bwd_chunk_time]*(self.strategy.pp_size - 2))
+        if has_last_chunk:
+            fwd_chunk_time, bwd_chunk_time = self._compute_single_batch_fwd_bwd_time(LAST_CHUNK)
+            forward_times.append(fwd_chunk_time)
+            backward_times.append(bwd_chunk_time)
 
-            chunk_time = sum(all_result['breakdown_result'].values()) 
-            all_result['breakdown_result']['bubble_time'] = duration_time_per_iter - chunk_time
-
-            throughput_per_accelerator = (
-                all_result["all_tokens_per_iter"]
-                / (duration_time_per_iter / 1000)
-                / self.strategy.world_size
-            )
-            all_result["throughput_per_accelerator"] = throughput_per_accelerator
-            all_result["mfu_6nd_with_attn"] = (
-                self.model_config.flops_per_token(
-                    context_seq_len=self.strategy.seq_len, with_attn=True
-                )
-                * throughput_per_accelerator
-                / self.system.accelerator.op["default"].tflops
-                / 1e12 # convert byte-flops to tflops
-            )
-
-            compute_cost_result = all_result['compute_cost_details']
-            mfu = (
-                compute_cost_result["model_flops"]
-                / (duration_time_per_iter / 1000) # convert ms to s
-                / self.system.accelerator.op["default"].tflops
-                / 1e12 # convert byte-flops to tflops
-            )
-            TFLOPs = (compute_cost_result["model_flops"]
-                / (duration_time_per_iter / 1000) # convert ms to s
-                / 1e12
-                )
-
-            all_result["mfu"] = mfu
-            all_result['model_flops'] = compute_cost_result["model_flops"]
-            all_result["TFLOPs"] = TFLOPs 
-            return mfu
-        
-        res = {
-            FIRST_CHUNK: {},
-            MIDDLE_CHUNK: {},
-            LAST_CHUNK: {},
-        }
-        
-
-        res[FIRST_CHUNK] = compute_single_iter_cost_helper(model_name=FIRST_CHUNK)
-        if self.strategy.pp_size > 2:
-            res[MIDDLE_CHUNK] = compute_single_iter_cost_helper(model_name=MIDDLE_CHUNK)
-
-        if self.strategy.pp_size > 1:
-            res[LAST_CHUNK] = compute_single_iter_cost_helper(model_name=LAST_CHUNK)
-        
-        single_iter_time = sum(v for _, v in res[FIRST_CHUNK]['breakdown_result'].items())
-
-        mfu = 0
-        TFLOPs = 0
-        mfu += compute_mfu_helper(res[FIRST_CHUNK], single_iter_time)
-        TFLOPs += res[FIRST_CHUNK]["TFLOPs"]
-        if self.strategy.pp_size > 1:
-            mfu += compute_mfu_helper(res[LAST_CHUNK], single_iter_time)
-            TFLOPs += res[LAST_CHUNK]["TFLOPs"]
-        if self.strategy.pp_size > 2:
-            mfu += compute_mfu_helper(res[MIDDLE_CHUNK], single_iter_time) * (self.strategy.pp_size -2)
-            TFLOPs += res[MIDDLE_CHUNK]["TFLOPs"] * (self.strategy.pp_size -2)
-
-        
-        mfu /= self.strategy.pp_size
-        TFLOPs /= self.strategy.pp_size
-
-        res['mfu'] = mfu
-        res['mfu_6nd_with_attn'] = res[FIRST_CHUNK]['mfu_6nd_with_attn']
-        res['TFLOPs'] = TFLOPs
-        res['duration_time_per_iter'] = single_iter_time
-        
-        convert_final_result_to_human_format(res)
-        return res 
+        single_iter_time = self.calculate_1f1b_bubble(self.strategy.pp_size, self.strategy.micro_batch_num, forward_times, backward_times, draw = False)
+        return single_iter_time
     
     def _analysis_single_iter_cost_impl(self):
         # we construct the result in the following hierarchy:
@@ -1231,213 +926,156 @@ class PerfLLM(PerfBase):
         # third level-0:  compute time = fwd time + recom_time + bwd_time + optim update time
         # third level-1:  comm_time_: tp_time(tp_time、tp_time_can_overlap) + pp_time
         all_result = {}
-        batch_stat_with_recomp = self._analysis_single_batch_cost_impl(
-            enable_recompute=True, model_name = "first_stage_chunk"
-        )
-        batch_stat_no_recomp = self._analysis_single_batch_cost_impl(
-            enable_recompute=False, model_name = "first_stage_chunk"
+        single_batch_cost = self._analysis_single_batch_cost_impl(
+            enable_recompute=self.strategy.enable_recompute, model_name = FIRST_CHUNK
         )
         # 1.comm_result： dp_time + fwd/bwd/recompute net time + pp_time
-        comm_result = self._analysis_comm_time(
-            batch_stat_with_recomp, batch_stat_no_recomp, model_name = "first_stage_chunk"
-        )
+        gbs_comm_in_first_stage = self._analysis_gbs_comm_time(single_batch_cost, model_name = FIRST_CHUNK)
         # 2.compute result: 
-        # - fwd/bwd/recompute compute time, stored in compute_result['cost_info'], summarized in compute_result['fwd/bwd/recompute_compute_time']. compute_result['cost_info']['dp_comm_time] is computed by model.grad_bytes.
-        # - optim update time, stored in compute_result['optim_time'], computed by model.state_bytes.
-        # - fwd/bwd/recompute fwd/bwd/recompute net time is ignored in compute time, but included in comm_result['intra_comm_time']
-        compute_result_first_stage = self._analysis_compute_time(
-            batch_stat_with_recomp, batch_stat_no_recomp, model_name = "first_stage_chunk"
+        gbs_compute_cost_in_first_stage = self._analysis_gbs_compute_time(
+            single_batch_cost, model_name = FIRST_CHUNK
         )
         # 3. all time
-        batch_compute_stat = compute_result_first_stage["batch_compute_stat"]
-        bubble_uneven_time = 0
-
         # can't be overlap for now
-        # first_stage chunk time
-        chunk_time = (
-            batch_compute_stat["cost_info"]["fwd_compute_time"]
-            + batch_compute_stat["cost_info"]["bwd_compute_time"]
-            + batch_compute_stat["cost_info"]["recompute_compute_time"]
-            + comm_result["intra_comm_time"]["intra_exposed_time_per_batch"]
-            + comm_result["inter_comm_time"]["inter_exposed_time_per_batch"] * 2
-        )
+        chunk_time = self._compute_single_batch_fwd_bwd_time(FIRST_CHUNK, chunk=True)
         if self.strategy.pp_size > 1:
-            batch_stat_with_recomp_last_stage = (  # pylint: disable=invalid-name
-                self._analysis_single_batch_cost_impl(
-                    enable_recompute=True, model_name="last_stage_chunk"
+            single_batch_cost = self._analysis_single_batch_cost_impl(
+                    enable_recompute=self.strategy.enable_recompute, model_name=LAST_CHUNK
                 )
+            gbs_comm_result_in_last_stage = self._analysis_gbs_comm_time(
+                single_batch_cost, model_name=LAST_CHUNK
             )
-            batch_stat_no_recomp_last_stage = self._analysis_single_batch_cost_impl(
-                enable_recompute=False, model_name="last_stage_chunk"
+            gbs_compute_result_in_last_stage = self._analysis_gbs_compute_time(
+                single_batch_cost, model_name=LAST_CHUNK
             )
-            comm_result_last_stage = self._analysis_comm_time(
-                batch_stat_with_recomp_last_stage, batch_stat_no_recomp_last_stage, model_name="last_stage_chunk"
-            )
-            compute_result_last_stage = self._analysis_compute_time(
-                batch_stat_with_recomp_last_stage, batch_stat_no_recomp_last_stage, model_name="last_stage_chunk"
-            )
-            batch_compute_stat_last_stage = compute_result_last_stage[
-                "batch_compute_stat"
-            ]
-            chunk_time_last_stage = (
-                batch_compute_stat_last_stage["cost_info"]["fwd_compute_time"]
-                + batch_compute_stat_last_stage["cost_info"]["bwd_compute_time"]
-                + batch_compute_stat_last_stage["cost_info"]["recompute_compute_time"]
-                + comm_result_last_stage["intra_comm_time"][
-                    "intra_exposed_time_per_batch"
-                ]
-                + comm_result_last_stage["inter_comm_time"][
-                    "inter_exposed_time_per_batch"
-                ]
-                * 2
-            )
-            bubble_uneven_time = (
-                abs((chunk_time_last_stage - chunk_time))
-                * self.strategy.micro_batch_num
-            )
-
-        bubble_time = self._compute_bubble_time(chunk_time) # bubble_time = chunk_time * (self.strategy.pp_size - 1)
+            chunk_time_lstage = self._compute_single_batch_fwd_bwd_time(LAST_CHUNK, chunk=True)
         
         breakdown_result = {}
-        breakdown_result["fwd_compute_time"] = compute_result_first_stage["fwd_compute_time"]
-        breakdown_result["recompute_time"] = compute_result_first_stage["recompute_time"]
-        breakdown_result["bwd_compute_time"] = compute_result_first_stage["bwd_compute_time"]
-        breakdown_result["optim_time"] = compute_result_first_stage["optim_time"][
+        breakdown_result["fwd_compute_time"] = gbs_compute_cost_in_first_stage["fwd_compute_time"]
+        breakdown_result["recompute_time"] = gbs_compute_cost_in_first_stage["recompute_time"]
+        breakdown_result["bwd_compute_time"] = gbs_compute_cost_in_first_stage["bwd_compute_time"]
+        breakdown_result["optim_time"] = gbs_compute_cost_in_first_stage["optim_time"][
             "optim_exposed_time"
         ]
-        breakdown_result["intra_exposed_time"] = comm_result["intra_comm_time"][
+        breakdown_result["intra_exposed_time"] = gbs_comm_in_first_stage["intra_comm_time"][
             "intra_exposed_time"
         ]
-        breakdown_result["inter_exposed_time"] = comm_result["inter_comm_time"][
+        breakdown_result["inter_exposed_time"] = gbs_comm_in_first_stage["inter_comm_time"][
             "inter_exposed_time"
         ]
-        breakdown_result["dp_exposed_time"] = comm_result["dp_comm_time"][
+        breakdown_result["dp_exposed_time"] = gbs_comm_in_first_stage["dp_comm_time"][
             "dp_comm_exposed_time"
         ]
-        breakdown_result["bubble_time"] = bubble_time
-        breakdown_result["bubble_uneven_time"] = bubble_uneven_time
-        all_time = sum(v for _, v in breakdown_result.items())
+
         if self.strategy.pp_size > 1:
             breakdown_result_last_stage = {}
-            breakdown_result_last_stage["fwd_compute_time"] = compute_result_last_stage["fwd_compute_time"]
-            breakdown_result_last_stage["recompute_time"] = compute_result_last_stage["recompute_time"]
-            breakdown_result_last_stage["bwd_compute_time"] = compute_result_last_stage["bwd_compute_time"]
-            breakdown_result_last_stage["optim_time"] = compute_result_last_stage["optim_time"][
+            breakdown_result_last_stage["fwd_compute_time"] = gbs_compute_result_in_last_stage["fwd_compute_time"]
+            breakdown_result_last_stage["recompute_time"] = gbs_compute_result_in_last_stage["recompute_time"]
+            breakdown_result_last_stage["bwd_compute_time"] = gbs_compute_result_in_last_stage["bwd_compute_time"]
+            breakdown_result_last_stage["optim_time"] = gbs_compute_result_in_last_stage["optim_time"][
                 "optim_exposed_time"
             ]
-            breakdown_result_last_stage["intra_exposed_time"] = comm_result_last_stage["intra_comm_time"][
+            breakdown_result_last_stage["intra_exposed_time"] = gbs_comm_result_in_last_stage["intra_comm_time"][
                 "intra_exposed_time"
             ]
-            breakdown_result_last_stage["inter_exposed_time"] = comm_result_last_stage["inter_comm_time"][
+            breakdown_result_last_stage["inter_exposed_time"] = gbs_comm_result_in_last_stage["inter_comm_time"][
                 "inter_exposed_time"
             ]
-            breakdown_result_last_stage["dp_exposed_time"] = comm_result_last_stage["dp_comm_time"][
+            breakdown_result_last_stage["dp_exposed_time"] = gbs_comm_result_in_last_stage["dp_comm_time"][
                 "dp_comm_exposed_time"
             ]
             
             if self.strategy.pp_size > 2:
-                chunk_time_middle_stage = self._compute_chunk_time(model_name='middle_stage_chunk')[-1]
+                chunk_time_middle_stage = self._compute_single_batch_fwd_bwd_time(MIDDLE_CHUNK, chunk=True)
             else:
                 chunk_time_middle_stage = 0
             
-            
-            bubble_time_last_stage = chunk_time + chunk_time_middle_stage*(self.strategy.pp_size-2)
-            breakdown_result_last_stage["bubble_time"] = bubble_time_last_stage
-            all_time_last_stage = sum(v for _, v in breakdown_result_last_stage.items())
-            breakdown_result_last_stage['all_time'] = all_time_last_stage
             all_result["breakdown_result_last_stage"] = breakdown_result_last_stage
-            # all_time = all_time_last_stage # FIXME(sherry)：使用last stage的all_time
+
         # 4.compute first level
+        model_flops = gbs_compute_cost_in_first_stage["model_flops"]
+
+        # ------------------------- SUMMRY -------------------------
+        pp_size = self.strategy.pp_size
+        dense_param_numel = self.model_chunk_dict[FIRST_CHUNK]._model_info.weight_numel + (
+                            self.model_chunk_dict[MIDDLE_CHUNK]._model_info.weight_numel if pp_size > 2 else 0
+                        ) * (pp_size - 2) + (
+                            self.model_chunk_dict[LAST_CHUNK]._model_info.weight_numel if pp_size > 1 else 0
+                        )
+        moe_param_numel = self.model_chunk_dict[FIRST_CHUNK]._model_info.moe_weight_numel + (
+                            self.model_chunk_dict[MIDDLE_CHUNK]._model_info.moe_weight_numel if pp_size > 2 else 0
+                        ) * (pp_size - 2) + (
+                            self.model_chunk_dict[LAST_CHUNK]._model_info.moe_weight_numel if pp_size > 1 else 0
+                        )
+        
+        def get_dp_and_optim(model_chunk):
+            t = self._compute_dp_time(model_chunk)['dp_comm_exposed_time']
+            t += self._compute_optim_time(model_chunk)['optim_exposed_time']
+            return t
+        single_iter_time_no_dp_opim = self._compute_pp_total_time()
+        duration_times = [single_iter_time_no_dp_opim + get_dp_and_optim(FIRST_CHUNK)]
+        duration_times.append(single_iter_time_no_dp_opim + get_dp_and_optim(MIDDLE_CHUNK)) if self.strategy.pp_size > 2 else 0
+        duration_times.append(single_iter_time_no_dp_opim + get_dp_and_optim(LAST_CHUNK)) if self.strategy.pp_size > 1 else 0
+
+        final_duration_time_per_iter = max(duration_times)
         all_tokens_per_iter = self.strategy.seq_len * self.strategy.global_batch_size
-        duration_time_per_iter = all_time # TODO(sherry)：使用all time进行后续所有stage的mfu计算
-        model_flops = compute_result_first_stage["model_flops"]
-        throughput_per_accelerator = (
-            all_tokens_per_iter
-            / (duration_time_per_iter / 1000)
-            / self.strategy.world_size
-        )
-        mfu = (
-            model_flops
-            / (duration_time_per_iter / 1000) # convert ms to s
-            / self.system.accelerator.op["default"].tflops
-            / 1e12 # convert byte-flops to tflops
-        )
-        TFLOPS = (model_flops
-            / (duration_time_per_iter / 1000) # convert ms to s
-            / 1e12
-            )
-
+        
+        theory_flops_per_token = self.model_config.flops_per_token(context_seq_len=self.strategy.seq_len, with_attn=True)
         theory_flops = self.model_config.flops_per_token(context_seq_len=self.strategy.seq_len, with_attn=True) * all_tokens_per_iter //  self.strategy.world_size
-        all_result["comm_details"] = comm_result
-        all_result["compute_details"] = compute_result_first_stage
+        TGS = all_tokens_per_iter/(final_duration_time_per_iter/1000)/self.strategy.world_size
+        TFLOPS = theory_flops / (final_duration_time_per_iter/1000)/1e12
+        TFLOPS_PER_TOKEN = theory_flops_per_token / (final_duration_time_per_iter/1000)/1e12
+        new_mfu_6nd_with_attn = TFLOPS / self.system.accelerator.op["default"].tflops
+        
+        mbc = self.strategy.micro_batch_num
+        all_result["comm_details"] = gbs_comm_in_first_stage
+        all_result["compute_details"] = gbs_compute_cost_in_first_stage
         all_result["breakdown_result"] = breakdown_result
-        all_result["chunk_time"] = chunk_time
         all_result["all_tokens_per_iter"] = all_tokens_per_iter
-        all_result["duration_time_per_iter"] = duration_time_per_iter
-        all_result["mfu_6nd_with_attn"] = (
-            self.model_config.flops_per_token(
-                context_seq_len=self.strategy.seq_len, with_attn=True
-            )
-            * throughput_per_accelerator
-            / self.system.accelerator.op["default"].tflops
-            / 1e12 # convert byte-flops to tflops
-        )
-        if self.strategy.pp_size > 1:
-            mfu_last_stage = (
-                compute_result_last_stage["model_flops"]
-                / (duration_time_per_iter / 1000)
-                / self.system.accelerator.op["default"].tflops
-                / 1e12
-            )
-            mfu += mfu_last_stage
-            tflops_last_stage =(
-                compute_result_last_stage["model_flops"]
-                / (duration_time_per_iter / 1000)
-                / 1e12
-            )
-            TFLOPS += tflops_last_stage
-        if self.strategy.pp_size > 2:
-            batch_stat_with_recomp_middle_stage = (  
-                self._analysis_single_batch_cost_impl(
-                    enable_recompute=True, model_name="middle_stage_chunk"
-                )
-            )
-            batch_stat_no_recomp_middle_stage = self._analysis_single_batch_cost_impl(
-                enable_recompute=False, model_name="middle_stage_chunk"
-            )
-            compute_result_middle_stage = self._analysis_compute_time(
-                batch_stat_with_recomp_middle_stage, batch_stat_no_recomp_middle_stage, model_name="middle_stage_chunk"
-            )
-            mfu_middle_stage = (
-                compute_result_middle_stage["model_flops"]
-                / (duration_time_per_iter / 1000)
-                / self.system.accelerator.op["default"].tflops
-                / 1e12
-            )
-            mfu += mfu_middle_stage*(self.strategy.pp_size-2)
-            tflops_middle_stage = (
-                compute_result_middle_stage["model_flops"]
-                / (duration_time_per_iter / 1000)
-                / 1e12
-            )
-            TFLOPS += tflops_middle_stage * (self.strategy.pp_size - 2)
-        mfu /= self.strategy.pp_size
-        TFLOPS /= self.strategy.pp_size
-        # mfu_6nd_with_attn: The MFU is calculated based on the FLOPS of standard attention
-        # mfu: The MFU is calculated based on the actual FLOPS of attention. If it is flashattention, it will have one more base flops than standard attention
-        all_result["mfu"] = mfu
 
-        all_result["throughput_per_accelerator"] = throughput_per_accelerator
-        all_result["throughput per GPU (TFLOP/s/GPU)"] = theory_flops / (duration_time_per_iter/1000)/1e12
+        def format_chunk_time(model_chunk, chunk_time, duration_time):
+            return {
+                model_chunk:{
+                    'duration_time(chunk_timexmbc+dp_optim+bubble)': duration_time,
+                    'chunk_time(fwd+bwd)':chunk_time,
+                    'dp_and_optim_time': get_dp_and_optim(model_chunk),
+                    'bubble_time': single_iter_time_no_dp_opim - mbc*(chunk_time)
+                }
+            }
+        all_result['all_chunk_times'] = format_chunk_time(FIRST_CHUNK, chunk_time, duration_times[0])
+        all_result['all_chunk_times'].update(format_chunk_time(MIDDLE_CHUNK, chunk_time_middle_stage, duration_times[1]) if pp_size > 2 else {})
+        all_result['all_chunk_times'].update(format_chunk_time(LAST_CHUNK, chunk_time_lstage, duration_times[-1]) if pp_size > 1 else {})
+
+        all_result.update({
+            'duration_time_per_iter': final_duration_time_per_iter,
+            'throughput_per_accelerator': TGS,
+            'throughput per GPU (TFLOP/s/GPU)': TFLOPS,
+            'throughput per GPU per token (TFLOP/s/GPU/token)': TFLOPS_PER_TOKEN,
+            'mfu_6nd_with_attn': new_mfu_6nd_with_attn,
+            'mfu':new_mfu_6nd_with_attn,
+            'moe_param_numel': f'{moe_param_numel/1e9:.2f}B',
+        })
         all_result['flops_info'] = {
             'theory_flops': theory_flops,
+            # 'theory_flops_per_token': theory_flops_per_token,
             'model_flops': model_flops,
         }
-        
-        # new_result = self._analysis_single_iter_cost_impl2()
-        # all_result['new_duration_time_per_iter'] = new_result['duration_time_per_iter']
-        # all_result['sherry'] = new_result
 
+        all_result['param_numel_info'] = {
+            "dense" : f'{dense_param_numel/1e9:.2f}B',
+            "moe"    : f'{moe_param_numel/1e9:.2f}B',
+            "all"    : f'{(dense_param_numel+moe_param_numel)/1e9:.2f}B',
+        }
+
+        if self.model_config.model_type == 'moe':
+            activaton_params_numel = dense_param_numel + moe_param_numel * (self.model_config.topk / self.model_config.expert_num)
+            activaton_ratio = activaton_params_numel/(dense_param_numel+moe_param_numel)
+            all_result['param_numel_info'].update({
+                    "activations" : f'{activaton_params_numel/1e9:.2f}B',
+                    "activations_ratio" : f'{activaton_ratio*100:.2f}%',
+                }
+            )
+        
         # convert to format
         convert_final_result_to_human_format(all_result)
         return all_result
@@ -1486,10 +1124,10 @@ class PerfLLM(PerfBase):
             target_point=self.debug_points,
             path_list=[],
         )
-        _ = self.model_chunk_dict["first_stage_chunk"](
+        _ = self.model_chunk_dict[FIRST_CHUNK](
             input_info_first_stage, self.path_debug_context
         )
-        self.pp_state_peak_point["first_stage_chunk"] = self.model_chunk_dict["first_stage_chunk"].compute_activations()
+        self.pp_state_peak_point[FIRST_CHUNK] = self.model_chunk_dict[FIRST_CHUNK].compute_activations()
         if self.strategy.pp_size > 2:
             seq_len = (
                 self.strategy.seq_len // self.strategy.tp_size
@@ -1513,10 +1151,10 @@ class PerfLLM(PerfBase):
                 # target_point=self.debug_points_last_stage,
                 path_list=[],
             )
-            _ = self.model_chunk_dict["middle_stage_chunk"](
+            _ = self.model_chunk_dict[MIDDLE_CHUNK](
                 input_info_last_stage, self.path_debug_context_last_stage
             )    
-            self.pp_state_peak_point["middle_stage_chunk"] = self.model_chunk_dict["middle_stage_chunk"].compute_activations()
+            self.pp_state_peak_point[MIDDLE_CHUNK] = self.model_chunk_dict[MIDDLE_CHUNK].compute_activations()
         if self.strategy.pp_size > 1:
             seq_len = (
                 self.strategy.seq_len // self.strategy.tp_size
@@ -1540,10 +1178,10 @@ class PerfLLM(PerfBase):
                 target_point=self.debug_points_last_stage,
                 path_list=[],
             )
-            _ = self.model_chunk_dict["last_stage_chunk"](
+            _ = self.model_chunk_dict[LAST_CHUNK](
                 input_info_last_stage, self.path_debug_context_last_stage
             )    
-            self.pp_state_peak_point["last_stage_chunk"] = self.model_chunk_dict["last_stage_chunk"].compute_activations()
+            self.pp_state_peak_point[LAST_CHUNK] = self.model_chunk_dict[LAST_CHUNK].compute_activations()
 
     def get_pp_stage_peak_mem(self, mem_result, peak_mem_key, toG:bool = False):
         assert peak_mem_key in ["peak_mem_with_reserved", "peak_mem"], f"peak_mem_key should be in ['peak_mem_with_reserved', 'peak_mem'] but got {peak_mem_key}"
@@ -1666,7 +1304,7 @@ class PerfLLM(PerfBase):
             if global_batch_size % micro_batch_size != 0 or micro_batch_num < pp_size:
                 continue
            
-            self.strategy.micro_batch_num = micro_batch_num # TODO(sherry): 固定global_batch_size  
+            self.strategy.micro_batch_num = micro_batch_num 
             self.strategy.micro_batch_size = micro_batch_size
 
             # run
@@ -1718,137 +1356,129 @@ class PerfLLM(PerfBase):
         
         return all_search_micro_batch_size, all_search_micro_batch_num, all_peak_cached_mem_list, all_cost_list
 
-    def search_selective_recompute(self, global_batch_size,  use_reserved_memory):
-        # self.search_selective_recompute(global_batch_size=global_batch_size, use_reserved_memory=True, search_best = True, best_mfu=cur_best_mfu, all_search_result=all_search_result)
-        """
-        Fixed global_batch_size and search for all (selective recompute, micro_batch_size, micro_batch_count) combinations of MFU under the current parallel strategy. 
 
-        :param global_batch_size: global batch size
-        :param use_reserved_memory: whether to use reserved memory to avoid OOM
-        """
+    def log_available_strategy(self, mfu, peak_mem):
+        print(f"Find result  parallelism={self.strategy.parallelism}, pp_num_layers={self.get_pp_num_layers()}, recompute={self.strategy.recompute_status},mfu={mfu} gbs={self.strategy.global_batch_size} peak_cached_mem_bytes={peak_mem}GB", flush=True)
 
-        self.strategy.recompute_granularity = "selective_recompute"
-        PEAK_MEM_KEY = "peak_mem_with_reserved" if use_reserved_memory else "peak_mem"
-        from itertools import product
-        all_search_strategy = {}
-        params = ['attn_recompute', 'mla_rms_recompute', 'mlp_recompute', 'mlp_rms_recompute']
-        combinations = [dict(zip(params, combo)) for combo in product([False, True], repeat=4)]
-        for pp_size in [1, 2]:
-            for recompute_params in combinations:
-                if  recompute_params['mla_rms_recompute'] and not recompute_params['attn_recompute']:
-                    continue
-                if  recompute_params['mlp_rms_recompute'] and not recompute_params['mlp_recompute']:
-                    continue
-                self.strategy.pp_size = pp_size
-                self.strategy.attn_recompute = recompute_params['attn_recompute']
-                self.strategy.mla_rms_recompute = recompute_params['mla_rms_recompute']
-                self.strategy.mlp_recompute = recompute_params['mlp_recompute']
-                self.strategy.mlp_rms_recompute = recompute_params['mlp_rms_recompute']
-                rm_tmp()
-                all_search_micro_batch_size, all_search_micro_batch_num, all_peak_cached_mem_list, all_cost_list = self.search_max_micro_batch_size_fixed_gbs(pp_size, self.strategy.dp_size, global_batch_size, use_reserved_memory=True, save_all=True)
-                
-                if len(all_search_micro_batch_size) > 0:
-                    for search_micro_batch_size, search_micro_batch_num, peak_mem_list, cost_result  in zip(all_search_micro_batch_size, all_search_micro_batch_num, all_peak_cached_mem_list, all_cost_list):
-                        print("find!", peak_mem_list)
-                        best_strategy = {}
-                        best_strategy['tp_size'] = self.strategy.tp_size
-                        best_strategy['ep_size'] = self.strategy.ep_size
-                        best_strategy['pp_size'] = self.strategy.pp_size
-                        best_strategy['dp_size'] = self.strategy.dp_size
-                        best_strategy['micro_batch_size'] = search_micro_batch_size
-                        best_strategy['micro_batch_num'] = search_micro_batch_num
-                        best_strategy.update(recompute_params)
-                        best_strategy['best_mfu'] = cost_result.data['mfu']
-                        best_strategy['best_TFLOPs'] = cost_result.data['throughput per GPU (TFLOP/s/GPU)']
-                        best_strategy[PEAK_MEM_KEY] = deepcopy(peak_mem_list)
-                        best_strategy['bw'] = deepcopy(self.system.real_comm_bw)
-                        merge_dict(best_strategy, all_search_strategy)
-        return all_search_strategy
+    def get_pp_num_layers(self):
+        num_layers_per_pp = math.ceil(self.model_config.layer_num/self.strategy.pp_size)
+        pp_num_layers = f'[{num_layers_per_pp}]x{self.strategy.pp_size-1} + [{self.strategy.num_layers_in_last_pipeline_stage}]' if self.strategy.pp_size > 1 else [self.model_config.layer_num]
+        return pp_num_layers
 
     def dump_paralism_and_recompute_perf(self, mem_result, cost_result):
         # from pprint import pprint
         # pprint(mem_result.data)
+        dtype = 'fp8' if self.strategy.fp8 else 'bf16'
         perf = {
             'model_name': self.model_config.model_name,
             'system': self.system.sys_name,
-            'parallelism': self.strategy.parallelism,
+            'parallelism': f'{dtype}.dense{self.model_config.dense_layers}.{self.strategy.parallelism}',
             'recompute_status': self.strategy.recompute_status,
-            'TGS_per_gpu' : cost_result.data['throughput_per_accelerator'],
+            'mfu': cost_result.data["mfu_6nd_with_attn"],
             'TFLOPS': cost_result.data['throughput per GPU (TFLOP/s/GPU)'],
-            'mfu': cost_result.data["mfu"],
+            'TGS_per_gpu' : cost_result.data['throughput_per_accelerator'],
             'iter_time':  cost_result.data["duration_time_per_iter"],
-            'peak_mem':  mem_result.data["peak_mem"] if "peak_mem" in mem_result.data else {s:v['peak_mem'] for s,v in mem_result.data.items()}
-        }
-        return perf
-
-    def dump_best_strategy(self, best_strategy):
-        # pprint(best_strategy)
-        perf = {
+            'peak_mem':  mem_result.data["peak_mem"] if "peak_mem" in mem_result.data else {s:v['peak_mem'] for s,v in mem_result.data.items()},
+            'peak_mem_with_reserved':  mem_result.data["peak_mem_with_reserved"] if "peak_mem_with_reserved" in mem_result.data else {s:v['peak_mem_with_reserved'] for s,v in mem_result.data.items()}
         }
         return perf
     
-    def search_best_selective_recompute(self, use_reserved_memory, gmi_error, best_mfu=None, all_search_result = None):
+    def dump_paralism_and_recompute_bw_perf(self, mem_result, cost_result):
+        perf = self.dump_paralism_and_recompute_perf(mem_result, cost_result)
+        perf['comm_bw_info'] = str(deepcopy(self.system.real_comm_bw))
+        # perf['estimate_details'] = {
+        #                 'mem_result': str(mem_result),
+        #                 'compute_result': str(cost_result),
+        #                 'model_arch':str(self.model_chunk_dict),
+        #                 'strategy_config': str(self.strategy),
+        #                 'system_config': str(self.system),
+        #                 'model_config': str(self.model_config)
+        #             }
+        return perf
+    
+    def search_best_selective_recompute(self, use_reserved_memory, gmi_error, best_mfu=None, all_search_result = None, save_path = None):
         self.strategy.recompute_granularity = "selective_recompute"
+        accelerator_mem_gbytes = self.system.accelerator.mem_gbs  - gmi_error # gmi has 6 GB error
+
         PEAK_MEM_KEY = "peak_mem_with_reserved" if use_reserved_memory else "peak_mem"
         from itertools import product
         best_strategy = {}
         params = ['attn_recompute', 'mla_rms_recompute', 'mlp_recompute', 'mlp_rms_recompute']
         combinations = [dict(zip(params, combo)) for combo in product([False, True], repeat=4)]
+        combinations = [
+            {
+                'mla_rms_recompute': True,
+                'attn_recompute': True,
+                'mlp_rms_recompute': True,
+                'mlp_recompute': True,
+            },
+            {
+                'mla_rms_recompute': True,
+                'attn_recompute': True,
+                'mlp_rms_recompute': False,
+                'mlp_recompute': False,
+            },
+            {
+                'mla_rms_recompute': False,
+                'attn_recompute': False,
+                'mlp_rms_recompute': True,
+                'mlp_recompute': True,
+            },
+        ]
         for recompute_params in combinations:
-                if  recompute_params['mla_rms_recompute'] and not recompute_params['attn_recompute']:
-                    continue
-                if  recompute_params['mlp_rms_recompute'] and not recompute_params['mlp_recompute']:
-                    continue
-                self.strategy.attn_recompute = recompute_params['attn_recompute']
-                self.strategy.mla_rms_recompute = recompute_params['mla_rms_recompute']
-                self.strategy.mlp_recompute = recompute_params['mlp_recompute']
-                self.strategy.mlp_rms_recompute = recompute_params['mlp_rms_recompute']
-                self.run_estimate()
-                mem_result = self.analysis_mem()
-                cost_result = self.analysis_cost()
-                peak_mem = self.get_pp_stage_peak_mem(mem_result, PEAK_MEM_KEY, True)
-                peak_mem = max(peak_mem.values())
-                if peak_mem + gmi_error <= self.system.accelerator.mem_gbs:
-                    cur_perf = self.dump_paralism_and_recompute_perf(mem_result, cost_result)
-                    if cur_perf['mfu'] > best_mfu:
-                        best_mfu = cur_perf['mfu']
-                        best_strategy = cur_perf
-                    if all_search_result is not None:
-                        merge_dict(cur_perf, all_search_result)
+            self.strategy.attn_recompute = recompute_params['attn_recompute']
+            self.strategy.mla_rms_recompute = recompute_params['mla_rms_recompute']
+            self.strategy.mlp_recompute = recompute_params['mlp_recompute']
+            self.strategy.mlp_rms_recompute = recompute_params['mlp_rms_recompute']
+
+            self.run_estimate()
+            mem_result = self.analysis_mem()
+            cost_result = self.analysis_cost()
+            peak_mem_list = self.get_pp_stage_peak_mem(mem_result, PEAK_MEM_KEY, toG=True)
+            peak_cached_mem_gbytes = max(peak_mem_list.values())
+            if peak_cached_mem_gbytes <= accelerator_mem_gbytes:
+                cur_perf = self.dump_paralism_and_recompute_bw_perf(mem_result, cost_result)
+                if cur_perf['mfu'] > best_mfu:
+                    best_mfu = cur_perf['mfu']
+                    best_strategy = cur_perf
+                    self.log_available_strategy(cost_result.data['mfu'], peak_cached_mem_gbytes)
+                    if save_path is not None:
+                        self._dump_memory_and_cost(mem_result, cost_result, save_path)
+                if all_search_result is not None:
+                    merge_dict(cur_perf, all_search_result)
         return best_strategy
 
-    def search_best_full_recompute_layer_num(self, 
+    def search_best_recompute_layer_num(self, 
                                         layer_num, 
                                         use_reserved_memory: bool, 
                                         gmi_error:int,
                                         best_mfu,
-                                        all_search_result:dict):
+                                        all_search_result:dict,
+                                        save_path = None):
         """
          Searches for the number of full recompute layers of the highest MFU that can be placed in memory under the current micro_batch_size, micro_batch_count, and parallel policies. 
 
         Args:
             layer_num (int): layer number
             use_reserved_memory (bool): whether to use reserved memory
-            gmi_error (int): The error between gmi and the actual allocated storage, the current s5000 is 6GB.
+            gmi_error (int): The error between gmi and the actual allocated storage
             best_mfu (float): best mfu
             all_search_result (dict): all search result
         Returns:
             dict: search result
         """
-        
-        accelerator_mem_gbytes = self.system.accelerator.mem_gbs  - gmi_error
-          # gmi has 6 GB error
-
-        self.strategy.recompute_granularity = "full_block"
+        accelerator_mem_gbytes = self.system.accelerator.mem_gbs  - gmi_error # gmi has 6 GB error
         PEAK_MEM_KEY = "peak_mem_with_reserved" if use_reserved_memory else "peak_mem"
         best_strategy = dict()
-        left, right = 0, layer_num // self.strategy.pp_size -1
+        left, right = 0, math.ceil(layer_num/self.strategy.pp_size)
         # right = min(right, layer_num-1)
         ori_recompute_layer_num = self.strategy.recompute_layer_num 
 
         while left <= right:
             recompute_layer_num = (left + right) // 2  
-            assert recompute_layer_num < (layer_num // self.strategy.pp_size), f'recompute_layer_num: {recompute_layer_num}, layer_num: {layer_num}, pp_size: {self.strategy.pp_size}'
+
+            max_recompute_layer_num = math.ceil(layer_num / self.strategy.pp_size)
+            assert recompute_layer_num <= max_recompute_layer_num, f'recompute_layer_num: {recompute_layer_num}, max_recompute_layer_num={max_recompute_layer_num}, layer_num: {layer_num}, pp_size: {self.strategy.pp_size}'
             self.strategy.recompute_layer_num = recompute_layer_num
 
             rm_tmp()
@@ -1857,82 +1487,52 @@ class PerfLLM(PerfBase):
             cost_result = self.analysis_cost()
             peak_mem_list = self.get_pp_stage_peak_mem(mem_result, PEAK_MEM_KEY, toG=True)
             peak_cached_mem_gbytes = max(peak_mem_list.values())
-            
             if peak_cached_mem_gbytes > accelerator_mem_gbytes:
                 left = recompute_layer_num + 1
             else:
-                right = recompute_layer_num -1
-                
+                right = recompute_layer_num - 1
                 # Save best search results
                 if cost_result.data['mfu'] >= best_mfu:
                     best_mfu = cost_result.data['mfu']
-                    best_strategy['model_name'] = self.model_config.model_name
-                    best_strategy['system'] = self.system.sys_name
-                    best_strategy["num_gpus_per_node"] = self.system.num_per_node
-                    best_strategy["memory_capacity"] = f"{self.system.accelerator.mem_gbs} GB"
-                    best_strategy["intra_comm_bw"] = f"{self.system.networks['high_intra_node'].bandwidth.gbps} GB/s"
-                    best_strategy["inter_comm_bw"] = f"{self.system.networks['inter_node'].bandwidth.gbps} GB/s"
-                    best_strategy["world_size"] = self.strategy.world_size
-                    best_strategy['tp_size'] = self.strategy.tp_size
-                    best_strategy['ep_size'] = self.strategy.ep_size
-                    best_strategy['pp_size'] = self.strategy.pp_size
-                    best_strategy['dp_size'] = self.strategy.dp_size
-                    best_strategy['edp_size'] = self.strategy.edp_size
-                    best_strategy['etp_size'] = self.strategy.etp_size
-                    best_strategy['micro_batch_size'] = self.strategy.micro_batch_size
-                    best_strategy['micro_batch_num'] = self.strategy.micro_batch_num
-                    best_strategy['recompute_layer_num'] = recompute_layer_num
-
-                    best_strategy['best_mfu'] = cost_result.data['mfu']
-                    best_strategy['best_TFLOPs'] = cost_result.data['throughput per GPU (TFLOP/s/GPU)']
-                    best_strategy['TGS_per_gpu'] = cost_result.data['throughput_per_accelerator']
-                    best_strategy[PEAK_MEM_KEY] = str(deepcopy(peak_mem_list))
-                    best_strategy['comm_bw_info'] = str(deepcopy(self.system.real_comm_bw))
-                    best_strategy['estimate_details'] = {
-                        'mem_result': str(mem_result),
-                        'compute_result': str(cost_result),
-                        'model_arch':str(self.model_chunk_dict),
-                        'strategy_config': str(self.strategy),
-                        'system_config': str(self.system),
-                        'model_config': str(self.model_config)
-                    }
-                    print(f"Find result  parallelism={self.strategy.parallelism}, recompute={self.strategy.recompute_status},mfu={cost_result.data['mfu']} gbs={self.strategy.global_batch_size} peak_cached_mem_bytes={peak_cached_mem_gbytes}GB")
+                    best_strategy = self.dump_paralism_and_recompute_bw_perf(mem_result, cost_result)
+                    self.log_available_strategy(cost_result.data['mfu'], peak_cached_mem_gbytes)
+                    if save_path is not None:
+                        self._dump_memory_and_cost(mem_result, cost_result, save_path)
 
                 if all_search_result is not None:
-                    """
-                    cur_serach_result = dict()
-                    cur_serach_result["model_name"] = model_name    
-                    cur_serach_result["arch"] = arch_name
-                    cur_serach_result["num_gpus_per_node"] = self.system.num_per_node
-                    cur_serach_result["memory_capacity"] = f"{self.system.accelerator.mem_gbs} GB"
-                    cur_serach_result["intra_comm_bw"] = f"{self.system.networks['high_intra_node'].bandwidth.gbps} GB/s"
-                    cur_serach_result["inter_comm_bw"] = f"{self.system.networks['inter_node'].bandwidth.gbps} GB/s"
-                    cur_serach_result["world_size"] = self.strategy.world_size
-                    cur_serach_result["data_type"] = "fp8" if self.strategy.fp8 else "bf16"
-                    cur_serach_result["tp_size"] = self.strategy.tp_size
-                    cur_serach_result["ep_size"] = self.strategy.ep_size
-                    cur_serach_result["pp_size"] = self.strategy.pp_size
-                    cur_serach_result["dp_size"] = self.strategy.dp_size
-                    cur_serach_result['edp_size'] = self.strategy.edp_size
-                    cur_serach_result['etp_size'] = self.strategy.etp_size
-                    cur_serach_result["micro_batch_size"] = self.strategy.micro_batch_size
-                    cur_serach_result["micro_batch_num"] = self.strategy.micro_batch_num
-                    cur_serach_result["gbs"] = self.strategy.dp_size * self.strategy.micro_batch_size * self.strategy.micro_batch_num
-                    cur_serach_result["recompute_layer_num"] = recompute_layer_num
-                    cur_serach_result["layer_num"] = layer_num
-                    cur_serach_result["mfu"] = cost_result.data['mfu']
-                    cur_serach_result['TFLOPs'] = cost_result.data['throughput per GPU (TFLOP/s/GPU)']
-                    cur_serach_result['comm_bw_info'] = deepcopy(self.system.real_comm_bw)
-                    cur_serach_result[PEAK_MEM_KEY] = peak_mem_list
-                    """
-                    perf = self.dump_paralism_and_recompute_perf(mem_result, cost_result)
+                    perf = self.dump_paralism_and_recompute_bw_perf(mem_result, cost_result)
                     merge_dict(perf, all_search_result)
 
         self.strategy.recompute_layer_num = ori_recompute_layer_num # recompute_layer_num
 
         return best_strategy
     
-    def search_best_strategy_with_full_recompute(self,
+    def search_best_strategy_no_recompute(self, gmi_error, use_reserved_memory, best_mfu, all_search_result, save_path = None):
+        self.strategy.recompute_granularity = None
+        self.strategy.recompute_layer_num = 0
+        accelerator_mem_gbytes = self.system.accelerator.mem_gbs  - gmi_error
+          # gmi has 6 GB error
+        PEAK_MEM_KEY = "peak_mem_with_reserved" if use_reserved_memory else "peak_mem"
+        best_strategy = dict()
+        self.run_estimate()
+        mem_result = self.analysis_mem()
+        cost_result = self.analysis_cost()
+        peak_mem_list = self.get_pp_stage_peak_mem(mem_result, PEAK_MEM_KEY, toG=True)
+        peak_cached_mem_gbytes = max(peak_mem_list.values())
+        if peak_cached_mem_gbytes <= accelerator_mem_gbytes:
+            cur_strategy = self.dump_paralism_and_recompute_bw_perf(mem_result, cost_result)
+            merge_dict(cur_strategy, all_search_result)
+
+            if cost_result.data['mfu'] >  best_mfu:
+                best_mfu = cost_result.data['mfu']
+                best_strategy = cur_strategy
+                self.log_available_strategy(cost_result.data['mfu'], peak_cached_mem_gbytes)
+                if save_path is not None:
+                    self._dump_memory_and_cost(mem_result, cost_result, save_path)
+
+        return best_strategy
+
+    def search_best_parallel_strategy_with_recompute(self,
                                                  world_size:int,  
                                                  gmi_error:int,
                                                  micro_batch_size:int,
@@ -1942,15 +1542,15 @@ class PerfLLM(PerfBase):
                                                  ep_search_list:List = None,
                                                  pp_search_list:List = None,
                                                  use_etp:bool = False,
-                                                 recompute:str = 'full_block',
-                                                 dump_path:str=None,
-                                                 dump_best_strategy_details:bool=False):
+                                                 recompute_search_type:str = ['no_recompute', 'full_block', 'selective_recompute'],
+                                                 use_reserved_memory: bool = True,
+                                                 dump_path:str=None):
         """
         Searches for the optimal combination of parallel strategies (tp/ep/pp) and full recompute layer configuration that maximizes performance under fixed global batch size constraints.
 
         Args:
             world_size (int): world size
-            gmi_error (int): The error between gmi and the actual allocated storage, the current s5000 is 6GB.
+            gmi_error (int): The error between gmi and the actual allocated storage
             micro_batch_size (int):  fixed micro batch size
             global_batch_size (int): fixed global batch size
             all_search_result (dict): all search result of this model, include (tp, ep, pp, recompute_layer_num) combination.
@@ -1962,6 +1562,9 @@ class PerfLLM(PerfBase):
         # tp: 1 2 4 8
         # ep: 1 2 4 8
         # 且 layer num整除
+        if not isinstance(recompute_search_type, list):
+            recompute_search_type = [recompute_search_type]
+
         layer_num = self.model_config.layer_num
         if tp_search_list is None:
             tp_search_list = [1, 2, 4, 8]  if self.model_config.model_type == "dense" else [1]
@@ -1971,6 +1574,7 @@ class PerfLLM(PerfBase):
             pp_search_list = list(range(1, layer_num+1))    
 
         global_best_strategy = {}
+        best_strategy_cost_path = f"{dump_path}/best_strategy_costs"
 
         print(f"Start search strategy for world_size={world_size}, model_type={self.model_config.model_type}, model_name={self.model_config.model_name}, system={self.system.sys_name}")
         print(f"- tp_search_list={tp_search_list}, ep_search_list={ep_search_list}, pp_search_list={pp_search_list}")
@@ -1978,22 +1582,6 @@ class PerfLLM(PerfBase):
         print(f"- moe_pad_expert_input_to_capacity={self.model_config.moe_pad_expert_input_to_capacity}")
         print(f"- capacity={self.model_config.capacity}")
 
-        def distribute(layer_num, pp_size):
-            if pp_size > layer_num:
-                return []
-            quotient = layer_num // pp_size
-            remainder = layer_num % pp_size
-            if remainder == 0:
-                return [[quotient] * pp_size]
-            else:
-                first = [quotient + remainder] + [quotient] * (pp_size - 1)
-                last = [quotient] * (pp_size - 1) + [quotient + remainder]
-                if remainder % 2 == 0:
-                    split = [quotient + remainder // 2] + [quotient] * (pp_size - 2) + [quotient + remainder // 2]
-                else:
-                    split = [quotient + remainder // 2 + 1] + [quotient] * (pp_size - 2) + [quotient + remainder // 2]
-                return [first, last, split]
-        
         global_best_mfu = -1
         for tp_size in tp_search_list:
             for ep_size in ep_search_list:
@@ -2003,22 +1591,26 @@ class PerfLLM(PerfBase):
                     dp_size = world_size // (pp_size * tp_size)
                     is_ep_valid = dp_size % ep_size == 0
                     etp_size = tp_size if use_etp else 1
-                    is_etp_valid = (world_size %(ep_size* etp_size) == 0) and (etp_size*ep_size < self.system.num_per_node) # TODO(sherry): 临时限定etp_size*ep_size < self.system.num_per_node
+                    is_etp_valid = (world_size %(ep_size* etp_size) == 0) and (etp_size*ep_size < self.system.num_per_node) 
                     is_etp_valid = (world_size %(ep_size* etp_size) == 0) # TODO(sherry): 临时限定etp_size*ep_size < self.system.num_per_node
 
-                    if is_dp_valid and is_tp_valid and is_ep_valid and is_etp_valid:
-                        layer_distributes = distribute(layer_num, pp_size)
-                        for layer_distribute in layer_distributes: 
-                            num_layers_in_first_pipeline_stage = layer_distribute[0] if len(layer_distribute) > 1 else None
-                            num_layers_in_last_pipeline_stage = layer_distribute[-1] if len(layer_distribute) > 2 else None
-                            # middle_pp_stage_layer_num = layer_distribute[1:-1]  if len(layer_distribute) > 2 else None
+                    if pp_size > 1:
+                        num_layers_per_pp = math.ceil(layer_num/pp_size)
+                        is_pp_valid = num_layers_per_pp > 0
+                        num_layers_in_last_pipeline_stage = layer_num - (num_layers_per_pp * (pp_size - 1))
+                        is_pp_valid = is_pp_valid and num_layers_in_last_pipeline_stage > 0
+                    else:
+                        num_layers_in_last_pipeline_stage = None
+                        is_pp_valid = True
+                    
+                    if is_dp_valid and is_tp_valid and is_ep_valid and is_etp_valid and is_pp_valid:
                         # set strategy  
                         self.strategy.world_size = world_size
                         self.strategy.tp_size = tp_size
                         self.strategy.ep_size = ep_size
                         self.strategy.pp_size = pp_size
                         self.strategy.etp_size = etp_size
-                        self.strategy.num_layers_in_first_pipeline_stage = num_layers_in_first_pipeline_stage
+                        self.strategy.num_layers_in_first_pipeline_stage = None
                         self.strategy.num_layers_in_last_pipeline_stage = num_layers_in_last_pipeline_stage
 
                 
@@ -2030,27 +1622,50 @@ class PerfLLM(PerfBase):
                         self.strategy.micro_batch_size = micro_batch_size
 
                         if micro_batch_size != 0 and search_micro_batch_num != 0:
-                            if recompute == 'full_block':
-                                search_best_strategy = self.search_best_full_recompute_layer_num(
-                                                                        layer_num=self.model_config.layer_num, 
-                                                                        use_reserved_memory = True,
-                                                                        gmi_error=gmi_error,
-                                                                        best_mfu=global_best_mfu,
-                                                                        all_search_result=all_search_result)
-                            elif recompute == 'selective':
-                                self.strategy.recompute_layer_num = max(self.model_config.layer_num//pp_size, num_layers_in_first_pipeline_stage if num_layers_in_first_pipeline_stage else 0, num_layers_in_last_pipeline_stage if num_layers_in_last_pipeline_stage else 0)
-                                search_best_strategy = self.search_best_selective_recompute(
-                                    use_reserved_memory=True,
-                                    gmi_error=gmi_error,
-                                    best_mfu=global_best_mfu,
-                                    all_search_result=all_search_result
-                                )
-                            else:
-                                raise NotImplementedError(f'recompute strategy {recompute} not implemented')
-                            
-                            if search_best_strategy and 'mfu' in search_best_strategy:
-                                global_best_strategy = search_best_strategy
-                                global_best_mfu = search_best_strategy['mfu']
+                            for recompute_type in recompute_search_type:
+                                if recompute_type == 'no_recompute':
+                                    self.strategy.recompute_granularity = None
+                                    self.strategy.recompute_layer_num = 0
+                                    self.strategy.recompute_variance = True 
+                                    search_best_strategy = self.search_best_strategy_no_recompute(gmi_error=gmi_error,
+                                                                                                       use_reserved_memory=use_reserved_memory,
+                                                                                                       best_mfu=global_best_mfu,
+                                                                                                       all_search_result=all_search_result)
+                                elif recompute_type == 'full_block':
+                                    self.strategy.recompute_granularity = "full_block"
+                                    self.strategy.recompute_variance = False # megatron-LM's full recompute does not support variance
+                                    search_best_strategy = self.search_best_recompute_layer_num(
+                                                                            layer_num=self.model_config.layer_num, 
+                                                                            use_reserved_memory = use_reserved_memory,
+                                                                            gmi_error=gmi_error,
+                                                                            best_mfu=global_best_mfu,
+                                                                            all_search_result=all_search_result,
+                                                                            save_path=best_strategy_cost_path)
+                                elif recompute_type == 'layer_only':
+                                    # recompute_granularity is defined by user, we only search the best layer num
+                                    search_best_strategy = self.search_best_recompute_layer_num(
+                                                                            layer_num=self.model_config.layer_num, 
+                                                                            use_reserved_memory = use_reserved_memory,
+                                                                            gmi_error=gmi_error,
+                                                                            best_mfu=global_best_mfu,
+                                                                            all_search_result=all_search_result,
+                                                                            save_path=best_strategy_cost_path)
+                                elif recompute_type == 'selective_recompute':
+                                    self.strategy.recompute_granularity = "selective_recompute"
+                                    self.strategy.recompute_layer_num = math.ceil(layer_num/pp_size)
+                                    search_best_strategy = self.search_best_selective_recompute(
+                                        use_reserved_memory=use_reserved_memory,
+                                        gmi_error=gmi_error,
+                                        best_mfu=global_best_mfu,
+                                        all_search_result=all_search_result,
+                                        save_path=best_strategy_cost_path
+                                    )
+                                else:
+                                    raise NotImplementedError(f'recompute strategy {recompute_search_type} not implemented')
+                                
+                                if search_best_strategy and 'mfu' in search_best_strategy:
+                                    global_best_strategy = search_best_strategy
+                                    global_best_mfu = search_best_strategy['mfu']
 
         if dump_path is not None and len(global_best_strategy) > 0:
             model_name = self.model_config.model_name
@@ -2060,28 +1675,49 @@ class PerfLLM(PerfBase):
 
             if 'peak_mem' in global_best_strategy and isinstance(global_best_strategy['peak_mem'], dict):
                 global_best_strategy['peak_mem'] = str(global_best_strategy['peak_mem']) # serialize dict to string to avoid csv dump error
-            estimate_details_of_best_strategy = global_best_strategy.pop('estimate_details', None)
             best_strategy_df = pd.DataFrame(global_best_strategy, index=[0])
-            best_strategy_df.to_csv(f"{dump_path}/{model_name}_{system_name}_seq_len{self.strategy.seq_len}_world_size{self.strategy.world_size}_gbs{self.strategy.global_batch_size}_best_strategy.csv") 
+            best_strategy_df.to_csv(f"{dump_path}/{model_name}_{system_name}_seqlen{self.strategy.seq_len}_worldsize{self.strategy.world_size}_gbs{self.strategy.global_batch_size}_best_strategy.csv") 
             print(best_strategy_df)
 
             if all_search_result is not None:
                 all_search_result_df = pd.DataFrame(all_search_result)
                 all_search_result_df = all_search_result_df.sort_values(by ='mfu',  ascending=False)
-                all_search_result_df.to_csv(f"{dump_path}/{model_name}_{system_name}_seq_len{self.strategy.seq_len}_world_size{self.strategy.world_size}_gbs{self.strategy.global_batch_size}_all_search_strategies.csv")
+                all_search_result_df.to_csv(f"{dump_path}/{model_name}_{system_name}_seqlen{self.strategy.seq_len}_worldsize{self.strategy.world_size}_gbs{self.strategy.global_batch_size}_all_search_strategies.csv")
             
-            if dump_best_strategy_details and estimate_details_of_best_strategy:
-                save_path = f'{dump_path}/best_strategy_details'
-                os.makedirs(save_path, exist_ok=True)
-                for k, v in estimate_details_of_best_strategy.items():
-                    with open(f"{save_path}/{k}.json", "w") as f:
-                        f.write(v)
         return global_best_strategy                        
     
-    def analysis(self, save_path=None):
+    def _dump_memory_and_cost(self, mem_result:dict, compute_result:dict, save_path:str):
+        print(f"Saving analysis results to {save_path}")
+        os.makedirs(save_path, exist_ok=True)
+        base_info = {}
+        base_info["arch"] = str(self.model_chunk_dict)
+        base_info["all_param"] = self.model_config.param_numel
+        base_info["act_param"] = self.model_config.activated_param_numel
+        with open(f"{save_path}/model_arch", "w") as f:
+            f.write(base_info["arch"])
+        with open(f"{save_path}/base_info.json", "w") as f:
+            f.write(json.dumps(base_info, indent=2, sort_keys=False, ensure_ascii=False))
+
+        with open(f"{save_path}/mem_result.json", "w") as f:
+            f.write(str(mem_result))
+
+        with open(f"{save_path}/compute_result.json", "w") as f:
+            f.write(str(compute_result))
+        
+        with open(f"{save_path}/strategy_config.json", "w") as f:
+            f.write(str(self.strategy))
+
+        with open(f"{save_path}/system_config.json", "w") as f:
+            f.write(str(self.system))
+
+        with open(f"{save_path}/model_config.json", "w") as f:
+            f.write(str(self.model_config))
+
+    def analysis(self, save_path=None, console_log = True):
         """Analyze the performance of the model. Return a dictionary containing the results."""
         mem_result = self.analysis_mem()
         compute_result = self.analysis_cost()
+        
         if SIMU_CHECK:
             save_path = TMP_PATH
         if save_path is not None:
@@ -2114,30 +1750,45 @@ class PerfLLM(PerfBase):
         # print mfu/tflops/peak_mem
         peak_mem = mem_result.data["peak_mem"] if 'peak_mem' in mem_result.data else (({s:r['peak_mem'] for s, r in mem_result.data.items()}))
         peak_mem_with_reserved = mem_result.data["peak_mem_with_reserved"] if 'peak_mem_with_reserved' in mem_result.data else (({s:r['peak_mem_with_reserved'] for s, r in mem_result.data.items()}))
-        tp = self.strategy.tp_size
-        ep = self.strategy.ep_size
-        pp = self.strategy.pp_size
-        print(f'-------------SIMUMAX SUMMARY \033[33mTP={tp},EP={ep},PP={pp}\033[0m -------------')
-        print(f'- parallelism = {self.strategy.parallelism}')
-        print(f'- recompute = {self.strategy.recompute_status}')
-        print(f"- \033[31mdtype = {'fp8' if self.strategy.fp8 else 'bf16'}, grad_reduce = {'bf16' if self.strategy.grad_reduce_in_bf16 else 'fp32'}\033[0m")
-        print(f"- system = {self.system.sys_name}")
-        print(f"- model = {self.model_config.model_type}")
-        print(f"- \033[32mmfu = {compute_result.data['mfu_6nd_with_attn']:.2f}\033[0m")
-        print(f"- \033[32mTFLOPS = {compute_result.data['throughput per GPU (TFLOP/s/GPU)']:.2f} (tflops={compute_result.data['flops_info']['theory_flops']}, duration={compute_result.data['duration_time_per_iter']})\033[0m")
-        print(f"- TGS_per_gpu = {compute_result.data['throughput_per_accelerator']}")
-        print(f"- \033[31mpeak_alloc_mem = {peak_mem}\033[0m")
-        # print(f"- peak_alloc_mem_with_reserved = {peak_mem_with_reserved}")
-        # print(f'- net = {self.strategy.net} ')
-        # print(f"------------------------------------------")
-        
+        if console_log:
+            tp = self.strategy.tp_size
+            ep = self.strategy.ep_size
+            pp = self.strategy.pp_size
+            act_info = f", act={compute_result.data['param_numel_info']['activations']}" if self.model_config.model_type == 'moe' else ''
+            print(f"-------------SIMUMAX SUMMARY  \033[33m{self.model_config.model_name}({compute_result.data['param_numel_info']['all']}{act_info}) TP={tp},EP={ep},PP={pp}\033[0m -------------")
+            print(f'- parallelism = layer{self.model_config.layer_num}.dense{self.model_config.dense_layers}.{self.strategy.parallelism}')
+            print(f'- recompute = {self.strategy.recompute_status}')
+            print(f"- \033[31mdtype = {'fp8' if self.strategy.fp8 else 'bf16'}, grad_reduce = {'bf16' if self.strategy.grad_reduce_in_bf16 else 'fp32'}\033[0m")
+            print(f"- system = {self.system.sys_name}")
+            print(f"- model_type = {self.model_config.model_type}")
+            print(f"· \033[32mmfu = {compute_result.data['mfu_6nd_with_attn']:.2f}\033[0m")
+            print(f"· \033[32mTFLOPS = {compute_result.data['throughput per GPU (TFLOP/s/GPU)']:.2f}T (tflops={compute_result.data['flops_info']['theory_flops']}, duration={compute_result.data['duration_time_per_iter']})\033[0m")
+            print(f"· \033[32mTFLOPS_PER_TOKEN = {compute_result.data['throughput per GPU per token (TFLOP/s/GPU/token)']:.2f}T, duration={compute_result.data['duration_time_per_iter']})\033[0m")
+            print(f"· \033[31mpeak_alloc_mem = {peak_mem}\033[0m")
+            print(f"- peak_alloc_mem_with_reserved = {peak_mem_with_reserved}")
+            print(f"- TGS_per_gpu = {compute_result.data['throughput_per_accelerator']}")
+            print(f'- net = {self.strategy.net} ')
+            print(f"------------------------------------------")
+
+            
+        # capture graph
+        if ENABLE_SIMU_GRAPH:
+            self.capture(save_path)
+            visualize_with_graphviz(os.path.join(save_path, 'model_graph.json'), output_path=os.path.join(save_path, 'computational_graph'))
         return {
+            'model': self.model_config.model_name,
+            'model_type': self.model_config.model_type,
+            'params': compute_result.data['param_numel_info']['all'],
+            'system': self.system.sys_name,
             'peak_mem': peak_mem,
+            'peak_mem_with_reserved': peak_mem_with_reserved,
+            'duration_time_per_iter': compute_result.data['duration_time_per_iter'],
             'TFLOPS': compute_result.data['throughput per GPU (TFLOP/s/GPU)'],
             'TGS_per_gpu': compute_result.data['throughput_per_accelerator'],
             'mfu': compute_result.data['mfu_6nd_with_attn'],
             'parallelism': self.strategy.parallelism,
             'recompute': self.strategy.recompute_status,
-            'dtype': f"{'fp8' if self.strategy.fp8 else 'bf16'},grad_reduce in {'bf16' if self.strategy.grad_reduce_in_bf16 else 'fp32'}"
+            'dtype': f"{'fp8' if self.strategy.fp8 else 'bf16'},grad_reduce in {'bf16' if self.strategy.grad_reduce_in_bf16 else 'fp32'}",
+            'net': self.strategy.net,
         }
  

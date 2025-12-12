@@ -13,7 +13,8 @@ from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, MLPRe
 import simumax.core.transformer.simu_ops as simu_ops
 from simumax.core.transformer.dense_module import Swiglu, Gelu, MLP, Float8Quantizer, LinearCol, LinearRow
 from simumax.core.utils import get_rank_group
-
+from simumax.core.transformer.function import AddFunction
+Input = InputOutputInfo
 #region ------------------ Atomic module ------------------
 class Router(MetaModule):
     """
@@ -89,15 +90,13 @@ class Router(MetaModule):
         ep_num = self.expert_num
         return b * seq_len * ep_num
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         # FIXME(sherry): check this, return [hidden_states, scores, routting_map]
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
-        hidden_size = self.input_info.tensors[0].size(2)
+        # hidden_size = self.input_info.tensors[0].size(2)
         hidden_states = InputOutputInfo(
-            tensors=[TensorSize(shape=(batch_size, seq_len, hidden_size)), 
-                     TensorSize(shape=(batch_size, seq_len, self.expert_num), dtype="int32")]
+            tensors=[TensorSize(shape=(batch_size, seq_len, self.expert_num), dtype="int32")]
         )
         return hidden_states
     
@@ -144,7 +143,7 @@ class Router(MetaModule):
         seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.input_info.tensors[0].size(2)
         input_size = batch_size * seq_len * hidden_size
-        self._act_info.activation_mem_cache = self.input_info.tensors[0].numel() * self.element_size
+        self._act_info.activation_mem_cache = input_size * self.element_size
         
         if self.has_cached_inputs:
             self._act_info.activation_mem_cache = 0
@@ -167,21 +166,22 @@ class Router(MetaModule):
         weight = input(linear), scores([S,K], softmax)
         """
         weight_numel = self.hidden_size * self.expert_num
-        self._model_info.weight_bytes = weight_numel * self.element_size
-        self._model_info.grad_bytes = (
-            self._model_info.weight_bytes
+        self._model_info.weight_numel = weight_numel
+        self._model_info.dense_weight_bytes = weight_numel * self.element_size
+        self._model_info.dense_grad_bytes = (
+            self._model_info.dense_weight_bytes
             if not self.strategy.use_fp32_accum_grad
             else self.dtype_to_element_size["fp32"] * weight_numel
         )
-        self._model_info.state_bytes = (
+        self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
         if self.strategy.zero_state >= 1:
-            self._model_info.state_bytes /= self.strategy.edp_size
+            self._model_info.dense_state_bytes /= self.strategy.edp_size
         if self.strategy.zero_state >= 2:
-            self._model_info.grad_bytes /= self.strategy.edp_size
+            self._model_info.dense_grad_bytes /= self.strategy.edp_size
         if self.strategy.zero_state >= 3:
-            self._model_info.weight_bytes /= self.strategy.edp_size
+            self._model_info.dense_weight_bytes /= self.strategy.edp_size
 
     def _comp_leaf_flops_info(self):
         # Count Gating
@@ -387,8 +387,14 @@ class Permutation(MetaModule):
         hidden_size = self.input_info.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
 
-    @property
-    def output_info(self):
+    def _pre_op(self):
+        super()._pre_op()
+        # if self.strategy.dispatch_probs:
+        #     assert len(self.input_info.tensors) == 2, "dispatch_probs=True requires two inputs in Permutation, [x, probs]"
+        # else:
+        #     assert len(self.input_info.tensors) == 1, "dispatch_probs=False requires one inputs in Permutation, [x]"
+
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         part_seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.input_info.tensors[0].size(2)
@@ -406,9 +412,6 @@ class Permutation(MetaModule):
                 TensorSize(
                     shape=(balance_token_num, hidden_size)
                 ),  # permuted moe input
-                # TensorSize(
-                #     shape=(batch_size, part_seq_len, hidden_size)
-                # ),  # original moe input
             ]
         )
         return output_info
@@ -424,7 +427,7 @@ class Permutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
-                comm_stage="Permutation_FWD_EP"
+                comm_stage="Dispatch_FWD_EP"
             )
             # bwd
             self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
@@ -432,7 +435,7 @@ class Permutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
-                comm_stage="Permutation_BWD_EP"
+                comm_stage="Dispatch_BWD_EP"
             )
         if self.strategy.ep_size > 1:
             comm_size = (
@@ -444,16 +447,37 @@ class Permutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
-                comm_stage="Permutation_FWD_EP"
+                comm_stage="Dispatch_FWD_EP"
             )
+        
             # bwd
             self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
                 "all2all",
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
-                comm_stage="Permutation_BWD_EP"
+                comm_stage="Dispatch_BWD_EP"
             )
+
+            # HACK(sherry): all2all the router probs to expert, and fused combined probs to SiluOp in ExpertMLP, to avoid the activation_mem_cache in Unpermutaion
+            if self.strategy.dispatch_probs:
+                prob_comm_size = self.input_info.tensors[1].numel() * self.dtype_to_element_size[self.strategy.dtype]
+                self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                    "all2all",
+                    prob_comm_size,
+                    comm_num=self.strategy.ep_size,
+                    net=self.strategy.ep_net,
+                    comm_stage="Permutation_FWD_EP_PROB"
+                )
+                self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
+                    "all2all",
+                    prob_comm_size,
+                    comm_num=self.strategy.ep_size,
+                    net=self.strategy.ep_net,
+                    comm_stage="Permutation_BWD_EP_PROB"
+                )
+            # HACK(sherry)
+
         if self.strategy.etp_size > 1:
             comm_size = (
                 self.permuted_act_size
@@ -480,16 +504,17 @@ class Permutation(MetaModule):
             self._cost_info.recompute_net_time = self._cost_info.fwd_net_time
 
     def _comp_leaf_act_info_impl(self):
-        self._act_info.activation_mem_cache = self.input_info.tensors[1].numel() * 8
+        probs_mem = self.input_info.tensors[1].numel() * 8
+        self._act_info.activation_mem_cache = probs_mem
         self._act_info.fwd_peak_mem_no_cache = 0
         self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = 0
         self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
-        self._model_info.weight_bytes = 0
-        self._model_info.grad_bytes = 0
-        self._model_info.state_bytes = 0
+        self._model_info.dense_weight_bytes = 0
+        self._model_info.dense_grad_bytes = 0
+        self._model_info.dense_state_bytes = 0
 
     def _comp_leaf_flops_info(self):
         """
@@ -569,6 +594,7 @@ class UnPermutation(MetaModule):
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
         self.moe_dispatcher_policy = moe_dispatcher_policy
+        self.ori_shape = None
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
@@ -688,13 +714,24 @@ class UnPermutation(MetaModule):
     @property
     def act_size_after_combined(self):
         # only consider balanced case
-        act_size = self.output_info.tensors[0].numel()
+        act_size = self.output_info_.tensors[0].numel()
         return act_size
+    
+    def _pre_op(self):
+        super()._pre_op()
+        if not self.strategy.dispatch_probs:
+            assert len(self.input_info.tensors) == 2, "dispatch_probs=False requires two inputs in Permutation, [x, probs]"
+        else:
+            assert len(self.input_info.tensors) == 1, "dispatch_probs=True requires one inputs in Permutation, [x]"
+    def set_ori_shape(self, shape):
+        self.ori_shape = shape
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         # recover the original input
-        output_info = InputOutputInfo(tensors=[self.input_info.tensors[1]])
+        assert self.output_info_ is None
+        assert self.ori_shape is not None
+        output_info = InputOutputInfo(tensors=[TensorSize(shape=self.ori_shape)])
+        # print('-- unpermute output_info', output_info)
         return output_info
 
     def _comp_leaf_intra_net_info(self):
@@ -771,16 +808,26 @@ class UnPermutation(MetaModule):
         """
         Mainly layout operators, ignore for now
         """
-        self._act_info.activation_mem_cache = self.input_info.tensors[0].numel() * self.element_size
-        self._act_info.fwd_peak_mem_no_cache = self.input_info.tensors[0].numel() * self.element_size
+        # HACK(sherry): the weighted_probs is fused in SiluOP.
+        # if dispatch_probs=True, no cache.
+        # if dispatch_probs=False, cache the unpermute_before_hidden_states and probs (for mul op).
+        if self.strategy.dispatch_probs:
+            self._act_info.activation_mem_cache = 0
+            self._act_info.fwd_peak_mem_no_cache = max(self.act_size_before_combined, self.act_size_after_combined) * self.element_size
+            self._act_info.bwd_peak_mem_no_cache = 0
+        else:
+            # mul
+            self._act_info.activation_mem_cache =  self.act_size_before_combined * self.element_size # Cache hidden states, probs are cache in Permutation
+            self._act_info.fwd_peak_mem_no_cache = self.act_size_before_combined * self.element_size + self.act_size_after_combined * self.element_size
+            self._act_info.bwd_peak_mem_no_cache = self.act_size_before_combined * self.element_size + self.act_size_after_combined * self.element_size
+        # HACK(sherry)
         self._act_info.fwd_peak_prev_cache_mem = 0
-        self._act_info.bwd_peak_mem_no_cache = 0
         self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
-        self._model_info.weight_bytes = 0
-        self._model_info.grad_bytes = 0
-        self._model_info.state_bytes = 0
+        self._model_info.dense_weight_bytes = 0
+        self._model_info.dense_grad_bytes = 0
+        self._model_info.dense_state_bytes = 0
 
     def _comp_leaf_flops_info(self):
         """
@@ -807,7 +854,8 @@ class UnPermutation(MetaModule):
         permutate1_mem_accessed = ( # none-fused: contiguous memory(drop_and_pad) or sort_chunks_by_idxs
             2 * self.act_size_before_combined
         ) * self.dtype_to_element_size[self.strategy.dtype]
-        permutate2_and_combine_mem_accessed = ( # fused: combine permuted_features by probs and scatter_add
+        
+        permutate2_and_combine_mem_accessed = ( # fused-op: combine permuted_features by probs and scatter_add
             self.act_size_before_combined + self.act_size_after_combined
         ) * self.dtype_to_element_size[self.strategy.dtype]
 
@@ -847,7 +895,8 @@ class GroupLinearCol(GroupLinearBase):
         enable_recompute: bool,
         mode:str,
         strategy: StrategyConfig,
-        system: SystemConfig
+        system: SystemConfig,
+        is_last_recompute: bool = False
     ) -> None:
         super().__init__(local_expert_num, input_size, output_size, strategy, system)
         assert mode in ['parallel', 'serial']
@@ -859,7 +908,10 @@ class GroupLinearCol(GroupLinearBase):
         self.use_bias = use_bias  # for now unless
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
-
+        self.is_last_recompute = is_last_recompute
+        
+        if self.is_last_recompute and self.enable_recompute:
+            self.set_variance_node(True)
         if self.strategy.fp8:
             self.w_dtype = "fp8"
             self.a_dtype = "fp8"
@@ -929,11 +981,10 @@ class GroupLinearCol(GroupLinearBase):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        token_num = self.output_info.tensors[0].size(0)
+        token_num = self.output_info_.tensors[0].size(0)
         return token_num * self.output_size
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         token_num = self.input_info.tensors[0].size(0)
         origin_input_info = self.input_info.tensors[1:]
         output_info = InputOutputInfo(
@@ -955,7 +1006,7 @@ class GroupLinearCol(GroupLinearBase):
         self._act_info.activation_mem_cache = (
             self.micro_hidden_state_size * self.a_element_size # fp8
         )
-        if self.has_cached_inputs:
+        if self.has_cached_inputs or self.offload_inputs:
             self._act_info.activation_mem_cache = 0
         weight_size = (
             self.local_expert_num
@@ -973,11 +1024,12 @@ class GroupLinearCol(GroupLinearBase):
         output_size = self.micro_output_grad_size * self.element_size   # bf16
         self._act_info.fwd_peak_mem_no_cache = input_size + output_size + (0 if self.strategy.use_accm_weight else weight_size)
         self._act_info.fwd_peak_prev_cache_mem = 0
-        self._act_info.bwd_peak_mem_no_cache = input_size + output_size + (grad_size if self.strategy.fp8 else 0)
+        self._act_info.bwd_peak_mem_no_cache = input_size + output_size + (grad_size if self.strategy.fp8 else 0) + (input_size if self.offload_inputs else 0)
         self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.local_expert_num * self.input_size * self.output_size
+        self._model_info.moe_weight_numel = weight_numel * self.strategy.ep_size * self.strategy.etp_size # Statistics the parameters of all etp ranks and ep ranks
         self._model_info.moe_weight_bytes = weight_numel * self.w_element_size # fp8
         self._model_info.moe_grad_bytes = (
             self._model_info.moe_weight_bytes
@@ -1069,6 +1121,7 @@ class GroupLinearRow(GroupLinearBase):
         mode:str,
         strategy: StrategyConfig,
         system: SystemConfig,
+        is_last_recompute: bool = False
     ) -> None:
         super().__init__(local_expert_num, input_size, output_size, strategy, system)
         assert mode in ['parallel', 'serial']
@@ -1080,6 +1133,9 @@ class GroupLinearRow(GroupLinearBase):
         self.use_bias = use_bias
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
+        self.is_last_recompute = is_last_recompute
+        if self.is_last_recompute and self.enable_recompute:
+            self.set_variance_node(True)
         if self.strategy.fp8:
             self.w_dtype = "fp8"
             self.a_dtype = "fp8"
@@ -1155,13 +1211,12 @@ class GroupLinearRow(GroupLinearBase):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        token_num = self.output_info.tensors[0].size(0)
-        hidden_size = self.output_info.tensors[0].size(1)
+        token_num = self.output_info_.tensors[0].size(0)
+        hidden_size = self.output_info_.tensors[0].size(1)
         # hidden_size = self.output_info.tensors[0].size(2)
         return token_num * hidden_size
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         token_num = self.input_info.tensors[0].size(0)
         origin_input_info = self.input_info.tensors[1:]
 
@@ -1206,6 +1261,7 @@ class GroupLinearRow(GroupLinearBase):
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.input_size * self.output_size * self.local_expert_num
+        self._model_info.moe_weight_numel = weight_numel * self.strategy.ep_size * self.strategy.etp_size # Statistics the parameters of all etp ranks and ep ranks
         self._model_info.moe_weight_bytes = weight_numel * self.w_element_size # fp8
         self._model_info.moe_grad_bytes = (
             self._model_info.moe_weight_bytes
@@ -1293,11 +1349,16 @@ class QuantizedGroupLinearCol(MetaModule):
         enable_recompute: bool,
         mode:str,
         strategy: StrategyConfig,
-        system: SystemConfig
+        system: SystemConfig,
+        is_last_recompute: bool = False
         ):
         super().__init__(strategy, system)
-
-        self.quantizer = Float8Quantizer(enable_recompute=enable_recompute, strategy=strategy, system=system)
+        quantizer_recompute = False if strategy.cache_groupgemm_col_fp8_inputs else enable_recompute
+        self.quantizer = Float8Quantizer(enable_recompute=quantizer_recompute, strategy=strategy, system=system)
+        enable_cahce_bf16_inputs = not self.strategy.cache_groupgemm_col_fp8_inputs
+        if enable_cahce_bf16_inputs:
+            self.quantizer.offload_inputs = self.strategy.offload_groupgemm_col_inputs  # the quantizer can perform offload When the input of bf16 needs to be cached
+       
         self.linear = GroupLinearCol(
             layer_idx,
             input_size,
@@ -1308,7 +1369,8 @@ class QuantizedGroupLinearCol(MetaModule):
             enable_recompute,
             mode,
             strategy,
-            system
+            system,
+            is_last_recompute
         )
     def forward(self, hidden_states, path_debug_context=None):
         hidden_states = self.quantizer(hidden_states, path_debug_context)
@@ -1327,9 +1389,11 @@ class QuantizedGroupLinearRow(MetaModule):
         enable_recompute: bool,
         mode:str,
         strategy: StrategyConfig,
-        system: SystemConfig,):
+        system: SystemConfig,
+        if_first_recompute: bool = False,
+        is_last_recompute: bool = False
+    ):
         super().__init__(strategy, system)
-
         self.quantizer = Float8Quantizer(enable_recompute=enable_recompute, strategy=strategy, system=system)
         self.linear = GroupLinearRow(
                     layer_idx,
@@ -1342,6 +1406,7 @@ class QuantizedGroupLinearRow(MetaModule):
                     mode,
                     strategy,
                     system,
+                    is_last_recompute
                 )
 
     def forward(self, hidden_states, path_debug_context=None):
@@ -1376,14 +1441,14 @@ class ExpertMLP(MetaModule):
             if self.config.use_swiglu
             else ffn_hidden_size
         )
-
+        self.mlp_recompute = mlp_recompute
         self.shared_expert = None
         if getattr(self.config, "moe_shared_expert_intermediate_size", None) is not None:
             self.shared_expert = MLP(
                     layer_idx=f"{layer_idx}-shareExpert",
                     config=self.config,
                     enable_recompute=enable_recompute, # for old version 
-                    mlp_recompute=mlp_recompute,
+                    mlp_recompute_conf=mlp_recompute,
                     strategy=strategy,
                     system=system,
                     intermediate_size=self.config.moe_shared_expert_intermediate_size
@@ -1391,6 +1456,7 @@ class ExpertMLP(MetaModule):
 
         GroupLinearCol_ = QuantizedGroupLinearCol if self.strategy.fp8 else GroupLinearCol
         GroupLinearRow_ = QuantizedGroupLinearRow if self.strategy.fp8 else GroupLinearRow
+        
         self.router = Router(
                 layer_idx=layer_idx,
                 hidden_size=self.config.hidden_size,
@@ -1427,6 +1493,15 @@ class ExpertMLP(MetaModule):
                 strategy=strategy,
                 system=system,
             )
+        if self.strategy.fp8:
+            # fp8
+            if self.strategy.cache_groupgemm_col_fp8_inputs:
+                self.group_linear1.linear.offload_inputs = self.strategy.offload_groupgemm_col_inputs
+            else:
+                self.group_linear1.quantizer.offload_inputs = self.strategy.offload_groupgemm_col_inputs
+        else:
+            # bf16
+            self.group_linear1.offload_inputs = self.strategy.offload_groupgemm_col_inputs
         
         if self.config.use_swiglu:
             self.expert_activation_layer = Swiglu(
@@ -1435,6 +1510,7 @@ class ExpertMLP(MetaModule):
                     enable_recompute=mlp_recompute.linear_recompute,
                     strategy=strategy,
                     system=system,
+                    is_weighted_silu= self.strategy.dispatch_probs
                 )
         else:
             self.expert_activation_layer =Gelu(
@@ -1450,6 +1526,7 @@ class ExpertMLP(MetaModule):
                 local_expert_num=self.local_expert_num,
                 has_cached_inputs=False,
                 enable_recompute=mlp_recompute.linear_recompute,
+                is_last_recompute = True,
                 mode=self.config.group_linear_mode,
                 use_bias=False,
                 strategy=strategy,
@@ -1474,30 +1551,42 @@ class ExpertMLP(MetaModule):
                 mlp_recompute.linear_recompute and
                 self.shared_expert.recompute_granularity == "full" if self.shared_expert else True):
             self.recompute_granularity = "submodule"
-        
+    
+    def preprocess(self, input_info:InputOutputInfo):
+        self.unpermutation.set_ori_shape(input_info.tensors[0].shape.copy())
+
     def forward(self, input_info:InputOutputInfo, path_debug_context:PathDebugContext):
+        self.preprocess(input_info) 
         if self.shared_expert:
             shared_out = self.shared_expert(input_info, path_debug_context)
-        hidden_states = self.router(input_info, path_debug_context) # add router scores
+        probs = self.router(input_info, path_debug_context) # add router scores
 
-        hidden_states = self.permutation(hidden_states, path_debug_context)
+        if self.strategy.dispatch_probs:
+            permute_hidden_states = self.permutation(Input(tensors=[input_info.tensors[0], 
+                                                                              probs.tensors[0]]),
+                                                    path_debug_context) 
+            grou1_out = self.group_linear1(permute_hidden_states, path_debug_context)
+            act_out = self.expert_activation_layer(Input(tensors=[grou1_out.tensors[0], probs.tensors[0]]), path_debug_context)
+            group2_out = self.group_linear2(act_out, path_debug_context)
+            out = self.unpermutation(group2_out, path_debug_context)
 
-        hidden_states = self.group_linear1(hidden_states, path_debug_context)
-        hidden_states = self.expert_activation_layer(hidden_states, path_debug_context)
-        hidden_states = self.group_linear2(hidden_states, path_debug_context)
-
-        merge_input = InputOutputInfo(
-            tensors=[
-                hidden_states,
-                *input_info.tensors,
-            ]
-        )
-        out = self.unpermutation(merge_input, path_debug_context) 
-        # print(f'--------- out={out}')
-
+        else:
+            permute_hidden_states = self.permutation(Input(tensors=[input_info.tensors[0], 
+                                                                probs.tensors[0]]),path_debug_context) # pass probs to Permutation to cache.
+            grou1_out = self.group_linear1(permute_hidden_states, path_debug_context)
+            act_out = self.expert_activation_layer(grou1_out, path_debug_context)
+            group2_out = self.group_linear2(act_out, path_debug_context)
+            out = self.unpermutation(Input(tensors=[group2_out.tensors[0], probs.tensors[0]]), path_debug_context)
+           
         # FIXME(sherry):  add mul, routed_expert hidden_states * router scores
         if self.shared_expert:
-            return out + shared_out
+            # return out + shared_out
+            return AddFunction.apply(parent_model=self,
+                                     enable_recompute=self.recompute_granularity == 'full_block',
+                                     tensor_size1=out,
+                                     tensor_size2=shared_out,
+                                     path_debug_context=path_debug_context,
+                                     name='SharedExpertAddFunction')
         return out 
        
     def prefill(self, args, call_stk='', com_buff=None):

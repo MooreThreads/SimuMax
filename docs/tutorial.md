@@ -26,6 +26,8 @@ cost_result = perf_model.analysis_cost()
 ```
 In the above example, `system_config_file`, `strategy_config_file`, and `model_config_file` are paths to your configuration files.
 
+Please refer to [./system.md](./system.md) and [./strategy.md](./strategy.md) for more details on parameter configuration.
+
 The run_estimate method simulates the training process and estimates the performance.
 
 The analysis_mem method analyzes the memory usage during the training process and returns a mem_result object. This object contains information about the memory usage of different parts of the model, such as the weight memory usage, gradient memory usage, and state memory usage.
@@ -131,5 +133,26 @@ python perf_llama3_70b_layer12_tp2_full_recompute.py  # the result is saved in d
 ```
 
 
-
-
+## Strategy Search
+### search_best_parallel_strategy_with_recompute
+The `search_best_parallel_strategy_with_recompute` interface can search for the best parallel strategy with the given recompute search space. The full example is as follows:
+```python
+perf_model = PerfLLM()
+perf_model.configure(
+    strategy_config=StrategyConfig.init_from_config_file(strategy_config_file),
+    model_config=ModelConfig.init_from_config_file(model_config_file),
+    system_config=SystemConfig.init_from_config_file(system_config_file),
+)
+perf_model.search_best_parallel_strategy_with_recompute(
+        world_size=2048,
+        gmi_error=6, # 6G memory reserved
+        micro_batch_size=1,
+        global_batch_size= 2048*8,
+        all_search_result=all_search_result,
+        tp_search_list=[1],
+        ep_search_list=[8, 16, 32, 64],
+        recompute_search_type=['no_recompute', 'full_block', 'selective_recompute'],
+        use_reserved_memory=False,
+        dump_path=f"search_{perf_model.model_config.model_name}_{perf_model.system.sys_name}"
+    )
+```

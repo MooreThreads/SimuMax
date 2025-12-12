@@ -3,8 +3,8 @@
 from copy import deepcopy
 from dataclasses import dataclass, asdict
 from typing import List
-from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugContext, LinearBase, RecomputeStatus
-from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, AttentionRecomputeConfig, MLPRecomputeConfig, SIMU_DEBUG
+from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugContext, LinearBase, RecomputeStatus, RecomputeBreakModule
+from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, AttentionRecomputeConfig, MLPRecomputeConfig, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.transformer.dense_module import Embedding, Attention, MLAAttention, LayerNorm, LinearCol, MLP, ParallelCE
 from simumax.core.transformer.moe_module import ExpertMLP
 
@@ -41,7 +41,7 @@ class PeakPoint:
             self.recomp_bwd_peak_mem = mem
 
     def update_peak(self, path, mem, stage:str):
-        if mem > self.peak_mem:
+        if mem >= self.peak_mem:
             self.set_peak(path, mem, stage)
 
     def set_stage(self, stage):
@@ -126,7 +126,7 @@ class LLMBlock(MetaModule):
                 norm_type="rms_norm",
                 use_fused_norm=self.strategy.use_fused_norm,
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.input_norm_recompute,
+                enable_recompute=attention_recompute.input_layernorm_recompute,
                 strategy=strategy,
                 system=system,
             )
@@ -140,7 +140,7 @@ class LLMBlock(MetaModule):
                     layer_idx=layer_idx,
                     config=self.config,
                     enable_recompute=enable_attn_recompute,  # for old version 
-                    attention_recompute = attention_recompute,
+                    attention_recompute_conf = attention_recompute,
                     strategy=strategy,
                     system=system,
                     specific_name='SelfAttention'
@@ -150,7 +150,7 @@ class LLMBlock(MetaModule):
                     layer_idx=layer_idx,
                     config=self.config,
                     enable_recompute=enable_attn_recompute,  # for old version 
-                    attention_recompute = attention_recompute,
+                    attention_recompute_conf = attention_recompute,
                     strategy=strategy,
                     system=system,
                     specific_name='SelfAttention'
@@ -173,7 +173,7 @@ class LLMBlock(MetaModule):
                     layer_idx=layer_idx,
                     config=self.config,
                     enable_recompute=enable_mlp_recompute,  # for old version 
-                    mlp_recompute = mlp_recompute,
+                    mlp_recompute_conf = mlp_recompute,
                     strategy=strategy,
                     system=system,
                 )
@@ -187,7 +187,6 @@ class LLMBlock(MetaModule):
                     system=system,
                     specific_name='MoELayer'
                 )
-        # if self.layernorm_input.enable_recompute:
     def forward(self, input_info:InputOutputInfo, path_debug_context:PathDebugContext):
         hidden_state = self.layernorm_input(input_info, path_debug_context)
         hidden_state = self.attention(hidden_state, path_debug_context)
@@ -234,9 +233,9 @@ class LLMModel(MetaModule):
                 )
         # self.layers = []
         for i in range(layer_num):
-            enable_recompute = self.strategy.enable_recompute and (
+            enable_recompute = self.strategy.is_recompute and (
                 i < self.strategy.recompute_layer_num
-            )
+            ) 
             attention_recompute_config = self.strategy.parse_attention_recompute(i)
             mlp_recompute_config = self.strategy.parse_mlp_recompute(i)
             setattr(self, f'layer_{i}', LLMBlock(
@@ -290,6 +289,7 @@ class LLMModel(MetaModule):
             cur_m = sub_module
 
             if cur_m.is_leaf_module:
+                cur_m.call_idx = len(self.all_leaf_nodes)
                 self.all_leaf_nodes.append(cur_m)
 
                 # set default recompute status
@@ -359,7 +359,7 @@ class LLMModel(MetaModule):
                     act_info.cache_for_bwd_mem = act_info.total_activation_mem_cache
                     global_cache_mem += act_info.cache_for_bwd_mem 
                 elif stage == "forward" and m.recompute_status == RecomputeStatus.FIRST:
-                    act_info.cache_for_bwd_mem = m.all_input_element_num()
+                    act_info.cache_for_bwd_mem = m.all_input_element_num() if not m.offload_inputs else 0
                     global_cache_mem += act_info.cache_for_bwd_mem 
 
             else:
@@ -368,7 +368,7 @@ class LLMModel(MetaModule):
 
             if stage == "forward" and enable_recompute:
                 # if m.recompute_status in [RecomputeStatus.FIRST, RecomputeStatus.LAST, RecomputeStatus.MIDDLE, RecomputeStatus.NO_RECOMPUTE]:
-                if m.recompute_status in [RecomputeStatus.FIRST, RecomputeStatus.MIDDLE,  RecomputeStatus.LAST]:
+                if m.recompute_status in [RecomputeStatus.FIRST,  RecomputeStatus.LAST]:
                     if SIMU_DEBUG:
                         print(f"Find {m.recompute_status} node: {m.full_name}")
         peak_point.update_peak(f"{m.full_name}: {m.current_full_module_path}", global_cache_mem, stage)
@@ -422,7 +422,8 @@ class LLMModel(MetaModule):
                 prepare_recompute_ready = False
             else:
                 act_info = m.get_act_info()                
-                cur_peak_mem = global_cache_mem + m.all_input_element_num() if is_last_module else act_info.bwd_peak_mem_no_cache
+                cur_peak_mem = global_cache_mem + (m.all_input_element_num() if is_last_module else act_info.bwd_peak_mem_no_cache)
+                # cur_peak_mem = global_cache_mem + m.all_input_element_num() if is_last_module else act_info.bwd_peak_mem_no_cache
                 
                 peak_point.update_peak(f"{m.full_name}: {m.current_full_module_path}", cur_peak_mem, "backward")
                 
@@ -443,39 +444,23 @@ class LLMModel(MetaModule):
     def compute_activations(self):
         leaf_nodes = self.get_all_leaf_modules()
         self.set_breakpoints(leaf_nodes)
-
-        no_recompute_peak_point = PeakPoint()
-        with_recompute_peak_point = PeakPoint()
-        
-        # no recompute
-        enable_recompute = False
+        peak_point = PeakPoint()        
+        enable_recompute = self.strategy.enable_recompute
         global_cache_mem = self._comp_fwd_activations(enable_recompute=enable_recompute, 
                                                         compute_nodes=leaf_nodes, 
                                                         global_cache_mem=0, 
-                                                        peak_point=no_recompute_peak_point)
+                                                        peak_point=peak_point)
 
         global_cache_mem = self._comp_bwd_activations(enable_recompute=enable_recompute, 
                                                         global_cache_mem=global_cache_mem, 
-                                                        peak_point=no_recompute_peak_point)
+                                                        peak_point=peak_point)
        
         for i, m in enumerate(leaf_nodes):
             assert m._act_info.cache_for_bwd_mem == 0, f"{leaf_nodes[i].full_name}._act_info.cache_for_bwd_mem should be 0, but is {m._act_info.cache_for_bwd_mem/1024/1024:.2f} MB"
 
         assert global_cache_mem == 0, f"global_cache_mem should be 0, but is {global_cache_mem/1024/1024:.2f} MB"          
 
-        # with recompute
-        enable_recompute = True
-        with_recompute_global_cache_mem = self._comp_fwd_activations(enable_recompute=enable_recompute, 
-                                                                       compute_nodes = leaf_nodes, 
-                                                                       global_cache_mem=0, 
-                                                                       peak_point=with_recompute_peak_point)
-        with_recompute_global_cache_mem = self._comp_bwd_activations(enable_recompute=enable_recompute, 
-                                                                       global_cache_mem=with_recompute_global_cache_mem, 
-                                                                       peak_point=with_recompute_peak_point)
-        assert with_recompute_global_cache_mem == 0, f"with_recompute_global_cache_mem should be 0, but is {with_recompute_global_cache_mem/1024/1024:.2f} MB"    
-
-        return dict(no_recompute_peak_point=no_recompute_peak_point, 
-                    with_recompute_peak_point=with_recompute_peak_point)
+        return peak_point
     
     def get_all_gemm_cost_info(self):
         all_gemm_info = {
@@ -524,7 +509,7 @@ class LLMModel(MetaModule):
 
     def analysis_op_info(self, return_details=False):
         assert self.init_ready and self.input_info and self.status_ready, "Please initialize the model first!"
-        leaf_moduls = self.get_all_leaf_modules()
+        leaf_modules = self.get_all_leaf_modules()
         op_infos = {
             "op":[],
             "input_shapes":[],
@@ -540,9 +525,9 @@ class LLMModel(MetaModule):
             op_infos['compute_only_details'] = []
             op_infos['IO_details'] = []
 
-        for m in leaf_moduls:
+        for m in leaf_modules:
             # forward
-            output_shape = m.output_info.shapes if isinstance(m.output_info, InputOutputInfo) else [m.output_info.shape]
+            output_shape = m.output_info_.shapes if isinstance(m.output_info_, InputOutputInfo) else [m.output_info_.shape]
             op_infos["op"].append(m.__class__.__name__)
             op_infos["input_shapes"].append(m.input_info.shapes + ([m.weight.shape] if hasattr(m, "weight") else []))
             op_infos['output_shapes'].append(output_shape)
@@ -590,7 +575,7 @@ class LLMModel(MetaModule):
                 else:
                     d_w_lhs_shape = [m.input_info.shapes]
                 op_infos["op"].append(m.__class__.__name__ + "_bwd_w")
-                op_infos["input_shapes"].append(d_w_lhs_shape + m.output_info.shapes)
+                op_infos["input_shapes"].append(d_w_lhs_shape + m.output_info_.shapes)
                 op_infos['output_shapes'].append([m.get_weight().shape])
                 op_infos["flops"].append(m._compute_info.bwd_grad_w_flops)
                 op_infos["IO"].append(m._compute_info.bwd_grad_w_accessed_mem)

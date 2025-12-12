@@ -9,7 +9,7 @@ def split(tensor_size: TensorSize, split_size_or_sections:List[int], dim = -1):
         split_size_or_sections = [tensor_size[dim] // split_size_or_sections] * split_size_or_sections  
 
     assert tensor_size[dim] == sum(split_size_or_sections), f"tensor_size[dim]={tensor_size[dim]} sum(split_size_or_sections)={sum(split_size_or_sections)}"
-    return [tensor_size.new(dim, size) for size in split_size_or_sections]
+    return [tensor_size.new_with_dim(dim, size) for size in split_size_or_sections]
 
 
 def transpose(tensor_size: TensorSize, dim0: int, dim1: int):
@@ -20,7 +20,7 @@ def cat(tensor_sizes: List[TensorSize], dim:int = -1):
     if len(tensor_sizes) == 0:
         return tensor_sizes
     concat_size = sum([t[dim] for t in tensor_sizes])
-    return tensor_sizes[0].new(dim, concat_size)
+    return tensor_sizes[0].new_with_dim(dim, concat_size)
 
 def unsqueeze(tensor_size: TensorSize, dim:int):
     return tensor_size.unsqeeze(dim)

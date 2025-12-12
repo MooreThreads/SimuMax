@@ -242,18 +242,18 @@
                 "tflops": 312,
                 "efficient_factor": 0.75,
                 "accurate_efficient_factor":{
-                    "ng=40, M=616, N=3072, K=5120, stage=fwd, grad=False, accumulate=False, use_split_accumulator=False, single_output=True": 0.6313438865579614,
-                    "ng=40, M=616, N=3072, K=5120, stage=bwd_grad_act, grad=True, accumulate=False, use_split_accumulator=True, single_output=False": 0.6790978664070304,
-                    "ng=40, M=616, N=3072, K=5120, stage=bwd_grad_w, grad=True, accumulate=True, use_split_accumulator=True, single_output=False": 0.5196854178569805,
-                    "ng=40, M=616, N=5120, K=1536, stage=fwd, grad=False, accumulate=False, use_split_accumulator=False, single_output=True": 0.6293014330752734,
-                    "ng=40, M=616, N=5120, K=1536, stage=bwd_grad_act, grad=True, accumulate=False, use_split_accumulator=True, single_output=False": 0.6581820454471095,
-                    "ng=40, M=616, N=5120, K=1536, stage=bwd_grad_w, grad=True, accumulate=True, use_split_accumulator=True, single_output=False": 0.5198101456129606,
-                    "ng=20, M=1232, N=3072, K=5120, stage=fwd, grad=False, accumulate=False, use_split_accumulator=False, single_output=True": 0.7073733774506031,
-                    "ng=20, M=1232, N=3072, K=5120, stage=bwd_grad_act, grad=True, accumulate=False, use_split_accumulator=True, single_output=False": 0.703850799964959,
-                    "ng=20, M=1232, N=3072, K=5120, stage=bwd_grad_w, grad=True, accumulate=True, use_split_accumulator=True, single_output=False": 0.6036380796120573,
-                    "ng=20, M=1232, N=5120, K=1536, stage=fwd, grad=False, accumulate=False, use_split_accumulator=False, single_output=True": 0.675450005377,
-                    "ng=20, M=1232, N=5120, K=1536, stage=bwd_grad_act, grad=True, accumulate=False, use_split_accumulator=True, single_output=False": 0.6572401208370234,
-                    "ng=20, M=1232, N=5120, K=1536, stage=bwd_grad_w, grad=True, accumulate=True, use_split_accumulator=True, single_output=False": 0.6372032871212036
+                    "ng=40, M=616, N=3072, K=5120, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=fwd, grad=False, accumulate=False, use_split_accumulator=False, single_output=True": 0.6313438865579614,
+                    "ng=40, M=616, N=3072, K=5120, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=bwd_grad_act, grad=True, accumulate=False, use_split_accumulator=True, single_output=False": 0.6790978664070304,
+                    "ng=40, M=616, N=3072, K=5120, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=bwd_grad_w, grad=True, accumulate=True, use_split_accumulator=True, single_output=False": 0.5196854178569805,
+                    "ng=40, M=616, N=5120, K=1536, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=fwd, grad=False, accumulate=False, use_split_accumulator=False, single_output=True": 0.6293014330752734,
+                    "ng=40, M=616, N=5120, K=1536, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=bwd_grad_act, grad=True, accumulate=False, use_split_accumulator=True, single_output=False": 0.6581820454471095,
+                    "ng=40, M=616, N=5120, K=1536, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=bwd_grad_w, grad=True, accumulate=True, use_split_accumulator=True, single_output=False": 0.5198101456129606,
+                    "ng=20, M=1232, N=3072, K=5120, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=fwd, grad=False, accumulate=False, use_split_accumulator=False, single_output=True": 0.7073733774506031,
+                    "ng=20, M=1232, N=3072, K=5120, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=bwd_grad_act, grad=True, accumulate=False, use_split_accumulator=True, single_output=False": 0.703850799964959,
+                    "ng=20, M=1232, N=3072, K=5120, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=bwd_grad_w, grad=True, accumulate=True, use_split_accumulator=True, single_output=False": 0.6036380796120573,
+                    "ng=20, M=1232, N=5120, K=1536, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=fwd, grad=False, accumulate=False, use_split_accumulator=False, single_output=True": 0.675450005377,
+                    "ng=20, M=1232, N=5120, K=1536, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=bwd_grad_act, grad=True, accumulate=False, use_split_accumulator=True, single_output=False": 0.6572401208370234,
+                    "ng=20, M=1232, N=5120, K=1536, dtype=bf16, out_dtype=bf16, main_grad_dtype=fp32, stage=bwd_grad_w, grad=True, accumulate=True, use_split_accumulator=True, single_output=False": 0.6372032871212036
                 }
             },
             "fp8_group_matmul" : {
