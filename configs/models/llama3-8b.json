@@ -7,6 +7,6 @@
     "head_size": 128,
     "intermediate_size": 14336,
     "layer_num": 32,
-    "vocab_size": 128257,
+    "vocab_size": 128256,
     "use_swiglu": true
 }
