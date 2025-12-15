@@ -62,18 +62,18 @@ class ParameterAnalyzer:
         }
         
         # 硬件配置选项
-        from simumax.utils import DEV_MODELS,DEV_SYSTEM
+        from simumax.utils import RELEASE_MODELS,RELEASE_SYSTEM
         self.simumax_hardware_options = {
-            'A100-80GB-PCIE': DEV_SYSTEM['a100_pcie'],
+            'A100-80GB-PCIE': RELEASE_SYSTEM['a100_pcie'],
         }
         # 模型规模选项
-        self.simumax_model_options = DEV_MODELS
+        self.simumax_model_options = RELEASE_MODELS
         self.simumax_model_options = {
-            'deepseek_v2': DEV_MODELS['deepseekv2'],
-            'deepseek_v3': DEV_MODELS['deepseekv3'],
-            'llama3_8b': DEV_MODELS['llama3-8b'],
-            'llama3_70b': DEV_MODELS['llama3-70b'],
-            'llama3_405b': DEV_MODELS['llama3-405b_padding_128'],
+            'deepseek_v2': RELEASE_MODELS['deepseekv2'],
+            'deepseek_v3': RELEASE_MODELS['deepseekv3'],
+            'llama3_8b': RELEASE_MODELS['llama3-8b'],
+            'llama3_70b': RELEASE_MODELS['llama3-70b'],
+            'llama3_405b': RELEASE_MODELS['llama3-405b_padding_128'],
         }
 
     def analyze_parameters(self, params, hardware_name, model_name):

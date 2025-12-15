@@ -8,6 +8,9 @@
 * [Community](#Community)
 ## Latest News
 - 📣 NEW! [App](./develop/app/README.md) - Add a user application to the SimuMax.
+- 📣 NEW! [Strategy Search](./examples/search/llm_search.py) - Support strategy search.
+- 📣 NEW! [System Config Pipeline](./simu_tools/efficency_test/README.md) - Add a Pipeline to generate system file include computing and communication efficiency.
+
 
 ## Introduction
 SimuMax is a distributed training simulator designed for large-scale language model (LLM) workloads. It leverages a static analytical model to simulate and analyze both performance and memory usage, providing detailed insights into training efficiency without running the actual training process. Based on these analyses, SimuMax helps users explore potential ways to maximize computational efficiency.
@@ -37,6 +40,8 @@ It's appropriate to address various use-cases:
 - [x] Megatron Compatibility: Simplified model migration pipeline
 - [x] Finer-grained selective recompute
 - [x] Efficiency measurement across shapes/layouts
+- [x] Efficiency measurement pipeline for both computing and commucation
+- [x] Strategy Search
 
 
 ### Benchmarks
@@ -114,8 +119,7 @@ We provide a set of benchmark testing scripts that run on NVIDIA GPUs, which can
 
 ## Notes
 - Currently, all Linear models are forced to perform gradient accumulation fusion.
-# Unitest
-after clone the repo, plz use "git config core.hooksPath git_hooks" to set commit hook, which will check the perf result in some config is still the same before commit automatically.
+
 
 # TODO
 SimuMax is in active development, may contain bugs or incomplete features. Contributions are welcome!
@@ -124,7 +128,6 @@ There are features to be added. Several significants are:
 - More pipeline scheduler
 - Overlap between computation and communication
 - Offloading
-- Strategy search
 - More accurate memory-bound operator simulation
 
 
