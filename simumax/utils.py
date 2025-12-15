@@ -31,7 +31,7 @@ def get_config(key, version, r_maps:dict, d_maps:dict, m_type):
         assert key in r_maps.keys(), f"{key} not found, please add {m_type} config in {r_maps['root']}"
         return r_maps[key]
     elif version == 'dev':
-        assert key in DEV_MODELS.keys(), f"{key} not found, please add {m_type} config in {d_maps['root']}"
+        assert key in d_maps.keys(), f"{key} not found, please add {m_type} config in {d_maps['root']}"
         return d_maps[key]
     else:
         raise ValueError('type must be release or dev')
@@ -74,6 +74,46 @@ def show_simu_system(version='release'):
         show_dict(DEV_SYSTEM, headers)
     else:
         raise ValueError('type must be release or dev')
+
+
+def parse_parallel_config(s):
+    parts = s.split('_')
+    config = {}
+    for part in parts:
+        if part.startswith('ep'):
+            config['ep_size'] = int(part[2:])
+        elif part.startswith('tp'):
+            config['tp_size'] = int(part[2:])
+        elif part.startswith('pp'):
+            config['pp_size'] = int(part[2:])
+    return config
+
+def create_default_strategy(strs="", seq_len=4096, micro_batch_size=1, micro_batch_num=81, dtype='bf16'):
+    default_config = {
+        "seq_len": seq_len,
+        "micro_batch_size": micro_batch_size,
+        "micro_batch_num": micro_batch_num,
+        "dtype": "bf16",
+        "world_size": 8,
+        "tp_size": 1,
+        "pp_size": 1,
+        "ep_size": 1,
+        "etp_size": 1,
+        "moe_dispatcher_policy": "all2all",
+        "enable_sequence_parallel": True,
+        "interleaving_size": 1,
+        "zero_state": 1,
+        "enable_dropout": False,
+        "use_fused_norm": True,
+        "use_math_sdp": False,
+        "use_flash_sdp": True,
+        "use_fp32_accum_grad": True,
+        "enable_recompute": True,
+        "mem_factor": 0.94,
+        "fp8" : True if dtype == 'fp8' else False,
+    }
+    default_config.update(parse_parallel_config(strs))
+    return default_config
 
 
     

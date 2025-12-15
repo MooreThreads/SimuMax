@@ -7,10 +7,10 @@ from simumax.core.base_struct import (all_gather, reduce_scatter, all_reduce, al
                            AtomModel, LeafModel, FwdQue,
                            send_next, send_prev, recv_next, recv_prev,
                            COM_BUFF)
-from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, AttentionRecomputeConfig, MLPRecomputeConfig
+from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, AttentionRecomputeConfig, MLPRecomputeConfig, ENABLE_SIMU_GRAPH
 from simumax.core.utils import get_rank_group
 import simumax.core.transformer.simu_ops as simu_ops
-from simumax.core.transformer.function import ConcatFunction
+from simumax.core.transformer.function import ConcatFunction,SplitFunction
 
 
 #region ------------------ Atomic module ------------------
@@ -74,13 +74,12 @@ class Embedding(MetaModule):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        batch_size = self.output_info.tensors[0].size(0)
-        seq_len = self.output_info.tensors[0].size(1)
-        hidden_size = self.output_info.tensors[0].size(2)
+        batch_size = self.output_info_.tensors[0].size(0)
+        seq_len = self.output_info_.tensors[0].size(1)
+        hidden_size = self.output_info_.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         # hidden_size = self.input_info.tensors[0].size(2)
@@ -140,21 +139,22 @@ class Embedding(MetaModule):
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.vocab_size * self.hidden_size
-        self._model_info.weight_bytes = weight_numel * self.element_size
-        self._model_info.grad_bytes = (
-            self._model_info.weight_bytes
+        self._model_info.weight_numel = weight_numel * self.strategy.tp_size # Statistics the parameters of all tp ranks
+        self._model_info.dense_weight_bytes = weight_numel * self.element_size
+        self._model_info.dense_grad_bytes = (
+            self._model_info.dense_weight_bytes
             if not self.strategy.use_fp32_accum_grad
             else self.dtype_to_element_size["fp32"] * weight_numel
         )
-        self._model_info.state_bytes = (
+        self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
         if self.strategy.zero_state >= 1:
-            self._model_info.state_bytes /= self.strategy.dp_size
+            self._model_info.dense_state_bytes /= self.strategy.dp_size
         if self.strategy.zero_state >= 2:
-            self._model_info.grad_bytes /= self.strategy.dp_size
+            self._model_info.dense_grad_bytes /= self.strategy.dp_size
         if self.strategy.zero_state >= 3:
-            self._model_info.weight_bytes /= self.strategy.dp_size
+            self._model_info.dense_weight_bytes /= self.strategy.dp_size
 
     def _comp_leaf_flops_info(self):
         self._compute_info.fwd_flops = 0
@@ -206,16 +206,21 @@ class LinearCol(LinearBase):
         strategy: StrategyConfig,
         system: SystemConfig,
         enable_fp8:bool = True,
+        is_last_recompute = False,
+        disable_tensor_parallel = False,
         specific_name='ColumnParallelLinear'
     ) -> None:
         super().__init__(input_size, output_size, strategy, system, specific_name)
         assert output_size % self.strategy.tp_size == 0
         self.layer_idx = layer_idx
         self.input_size = input_size
-        self.output_size = output_size // self.strategy.tp_size # Split the output size across tp_size, tensor parallel on attention heads dimension
+        self.output_size = output_size if disable_tensor_parallel else output_size // self.strategy.tp_size # Split the output size across tp_size, tensor parallel on attention heads dimension
         self.use_bias = use_bias  # FIXME(for now unless)
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
+        self.is_last_recompute = is_last_recompute
+        if self.is_last_recompute and self.enable_recompute:
+            self.set_variance_node(True)
         if self.strategy.fp8 and enable_fp8:
             self.w_dtype = "fp8"
             self.a_dtype = "fp8"
@@ -319,13 +324,12 @@ class LinearCol(LinearBase):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        batch_size = self.output_info.tensors[0].size(0)
-        seq_len = self.output_info.tensors[0].size(1)
+        batch_size = self.output_info_.tensors[0].size(0)
+        seq_len = self.output_info_.tensors[0].size(1)
         # hidden_size = self.output_info.tensors[0].size(2)
         return batch_size * seq_len * self.output_size
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         if self.strategy.enable_sequence_parallel:
@@ -435,21 +439,22 @@ class LinearCol(LinearBase):
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.input_size * self.output_size
-        self._model_info.weight_bytes = weight_numel * self.w_element_size # fp8_enabled = True, w_element_size=1
-        self._model_info.grad_bytes = (
-            self._model_info.weight_bytes
+        self._model_info.weight_numel = weight_numel * self.strategy.tp_size # Statistics the parameters of all tp ranks
+        self._model_info.dense_weight_bytes = weight_numel * self.w_element_size # fp8_enabled = True, w_element_size=1
+        self._model_info.dense_grad_bytes = (
+            self._model_info.dense_weight_bytes
             if not self.strategy.use_fp32_accum_grad
             else self.dtype_to_element_size["fp32"] * weight_numel
         )
-        self._model_info.state_bytes = (
+        self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel # w/m/v
         )
         if self.strategy.zero_state >= 1:
-            self._model_info.state_bytes /= self.strategy.dp_size
+            self._model_info.dense_state_bytes /= self.strategy.dp_size
         if self.strategy.zero_state >= 2:
-            self._model_info.grad_bytes /= self.strategy.dp_size
+            self._model_info.dense_grad_bytes /= self.strategy.dp_size
         if self.strategy.zero_state >= 3:
-            self._model_info.weight_bytes /= self.strategy.dp_size
+            self._model_info.dense_weight_bytes /= self.strategy.dp_size
 
     def _comp_leaf_flops_info(self):
         base_flops = 2 * self.micro_hidden_state_size * self.output_size
@@ -518,6 +523,7 @@ class LinearRow(LinearBase):
         enable_recompute: bool,
         strategy: StrategyConfig,
         system: SystemConfig,
+        is_last_recompute = False,
         specific_name='RowParallelLinear'
 
     ) -> None:
@@ -528,6 +534,9 @@ class LinearRow(LinearBase):
         self.output_size = output_size
         self.use_bias = use_bias  # FIXME(for now unless)
         self.enable_recompute = enable_recompute
+        self.is_last_recompute = is_last_recompute
+        if self.is_last_recompute and self.enable_recompute:
+            self.set_variance_node(True)
         self.has_cached_inputs = has_cached_inputs
         if self.strategy.fp8:
             self.w_dtype = "fp8"
@@ -606,15 +615,14 @@ class LinearRow(LinearBase):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        batch_size = self.output_info.tensors[0].size(0)
-        seq_len = self.output_info.tensors[0].size(1)
-        hidden_size = self.output_info.tensors[0].size(2)
+        batch_size = self.output_info_.tensors[0].size(0)
+        seq_len = self.output_info_.tensors[0].size(1)
+        hidden_size = self.output_info_.tensors[0].size(2)
         if self.strategy.enable_sequence_parallel:
             seq_len *= self.strategy.tp_size   
         return batch_size * seq_len * hidden_size
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         if self.strategy.enable_sequence_parallel:
@@ -707,21 +715,22 @@ class LinearRow(LinearBase):
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.input_size * self.output_size
-        self._model_info.weight_bytes = weight_numel * self.w_element_size # fp8_enabled = True, w_element_size=1
-        self._model_info.grad_bytes = (
-            self._model_info.weight_bytes
+        self._model_info.weight_numel = weight_numel * self.strategy.tp_size # Statistics the parameters of all tp ranks
+        self._model_info.dense_weight_bytes = weight_numel * self.w_element_size # fp8_enabled = True, w_element_size=1
+        self._model_info.dense_grad_bytes = (
+            self._model_info.dense_weight_bytes
             if not self.strategy.use_fp32_accum_grad
             else self.dtype_to_element_size["fp32"] * weight_numel
         )
-        self._model_info.state_bytes = (
+        self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
         if self.strategy.zero_state >= 1:
-            self._model_info.state_bytes /= self.strategy.dp_size
+            self._model_info.dense_state_bytes /= self.strategy.dp_size
         if self.strategy.zero_state >= 2:
-            self._model_info.grad_bytes /= self.strategy.dp_size
+            self._model_info.dense_grad_bytes /= self.strategy.dp_size
         if self.strategy.zero_state >= 3:
-            self._model_info.weight_bytes /= self.strategy.dp_size
+            self._model_info.dense_weight_bytes /= self.strategy.dp_size
 
     def _comp_leaf_flops_info(self):
         base_flops = 2 * self.micro_hidden_state_size * self.output_size
@@ -823,13 +832,12 @@ class LayerNorm(MetaModule):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        batch_size = self.output_info.tensors[0].size(0)
-        seq_len = self.output_info.tensors[0].size(1)
-        hidden_size = self.output_info.tensors[0].size(2)
+        batch_size = self.output_info_.tensors[0].size(0)
+        seq_len = self.output_info_.tensors[0].size(1)
+        hidden_size = self.output_info_.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.input_info.tensors[0].size(2)
@@ -903,21 +911,22 @@ class LayerNorm(MetaModule):
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.norm_size
-        self._model_info.weight_bytes = weight_numel * self.element_size
-        self._model_info.grad_bytes = (
-            self._model_info.weight_bytes
+        self._model_info.weight_numel = weight_numel
+        self._model_info.dense_weight_bytes = weight_numel * self.element_size
+        self._model_info.dense_grad_bytes = (
+            self._model_info.dense_weight_bytes
             if not self.strategy.use_fp32_accum_grad
             else self.dtype_to_element_size["fp32"] * weight_numel
         )
-        self._model_info.state_bytes = (
+        self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
         if self.strategy.zero_state >= 1:
-            self._model_info.state_bytes /= self.strategy.dp_size
+            self._model_info.dense_state_bytes /= self.strategy.dp_size
         if self.strategy.zero_state >= 2:
-            self._model_info.grad_bytes /= self.strategy.dp_size
+            self._model_info.dense_grad_bytes /= self.strategy.dp_size
         if self.strategy.zero_state >= 3:
-            self._model_info.weight_bytes /= self.strategy.dp_size
+            self._model_info.dense_weight_bytes /= self.strategy.dp_size
 
     def _comp_leaf_flops_info(self):
         # ignore memory bound kernel flops for now
@@ -993,7 +1002,6 @@ class LayerNorm(MetaModule):
         )
         return repr_info
 
-
 class Cat(MetaModule):
     """A simple module just to split, cat, reshape tensor"""
     def __init__(
@@ -1005,8 +1013,7 @@ class Cat(MetaModule):
         super().__init__(strategy, system)
         self.output_dim = output_dim
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         output_info = InputOutputInfo(
@@ -1022,9 +1029,9 @@ class Cat(MetaModule):
             layer.prefill(args, self.call_stk, com_buff=com_buff)
 
     def _comp_leaf_model_info_impl(self):
-        self._model_info.weight_bytes = 0
-        self._model_info.grad_bytes = 0
-        self._model_info.state_bytes = 0
+        self._model_info.dense_weight_bytes = 0
+        self._model_info.dense_grad_bytes = 0
+        self._model_info.dense_state_bytes = 0
 
     def _comp_leaf_act_info_impl(self):
         """
@@ -1062,8 +1069,6 @@ class Cat(MetaModule):
             bwd_grad_w_op="default",
             enable_recompute=self.enable_recompute,
         )
-
-    
 class CoreAttention(MetaModule):
     """Scaled Dot-Product Attention"""
 
@@ -1079,6 +1084,7 @@ class CoreAttention(MetaModule):
         strategy: StrategyConfig,
         system: SystemConfig,
         specific_name='DotProductAttention',
+        is_last_recompute: bool = False,
     ) -> None:
         super().__init__(strategy, system, specific_name)
         self.use_math_sdp = use_math_sdp
@@ -1095,6 +1101,9 @@ class CoreAttention(MetaModule):
         self.v_head_dim = head_size
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
+        self.is_last_recompute = is_last_recompute
+        if self.is_last_recompute and self.enable_recompute:
+            self.set_variance_node(True)
         
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
@@ -1119,13 +1128,12 @@ class CoreAttention(MetaModule):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        batch_size = self.output_info.tensors[0].size(0)
-        seq_len = self.output_info.tensors[0].size(1)
-        hidden_size = self.output_info.tensors[0].size(2)
+        batch_size = self.output_info_.tensors[0].size(0)
+        seq_len = self.output_info_.tensors[0].size(1)
+        hidden_size = self.output_info_.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.head_num * self.head_size
@@ -1142,7 +1150,7 @@ class CoreAttention(MetaModule):
     def get_input_shapes_desc(self, stage):
         hidden_states = self.input_info.tensors[0]
         batch, seq_len = hidden_states.shape[:2]
-        qkv_contiguous = False if 's5000' in self.system.sys_name else True # TODO(sherry): get qkv_contiguous by input stride
+        qkv_contiguous = True # TODO(sherry): get qkv_contiguous by input stride
         shape_str = f'batch={int(batch)}, seq_len={int(seq_len)}, head_num={int(self.head_num)}, kv_head_num={int(self.kv_head_num)}, qk_head_dim={int(self.head_size)}, v_head_dim={int(self.v_head_dim)}, qkv_contiguous={qkv_contiguous}'
         return shape_str
 
@@ -1154,8 +1162,6 @@ class CoreAttention(MetaModule):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.input_info.tensors[0].size(2)
-        # TODO(sherry): 基于cache_info 计算 self._act_info.activation_mem_cache
-        # self._act_info.activation_mem_cache = self._comp_input_cache_size()
 
         q_size = batch_size * self.head_num * seq_len * self.head_size
         # repeat kv
@@ -1196,18 +1202,15 @@ class CoreAttention(MetaModule):
             # The sdp interface of a certain pytorch will use an extra memory,
             # not sure if it is fixed now
             bwd_soft_factor += 1
-        elif self.use_math_sdp and self.system.accelerator.backend == "musa":
-            # torch_musa sdp kernel reuse the output grad memory
-            bwd_soft_factor -= 1
         self._act_info.bwd_peak_prev_cache_mem = (q_size + k_size) * self.element_size
         self._act_info.bwd_peak_mem_no_cache = (
             bwd_soft_factor * softmax_size * self.element_size
         )
 
     def _comp_leaf_model_info_impl(self):
-        self._model_info.weight_bytes = 0
-        self._model_info.grad_bytes = 0
-        self._model_info.state_bytes = 0
+        self._model_info.dense_weight_bytes = 0
+        self._model_info.dense_grad_bytes = 0
+        self._model_info.dense_state_bytes = 0
 
     def _comp_leaf_flops_info(self):
         seq_len = self.input_info.tensors[0].size(1)
@@ -1305,18 +1308,13 @@ class MLACoreAttention(CoreAttention):
         strategy: StrategyConfig,
         system: SystemConfig,
         specific_name='DotProductAttention',
+        is_last_recompute: bool = False,
         v_head_dim: int=None,
     ) -> None:
         super().__init__(head_size,head_num,kv_head_num,use_math_sdp,use_flash_sdp,
-                         has_cached_inputs,enable_recompute,strategy,system,specific_name)
+                         has_cached_inputs,enable_recompute,strategy,system,specific_name, is_last_recompute)
         self.v_head_dim = v_head_dim
     
-    # def set_input_state_info(self, input_info):
-    #     super().set_input_state_info(input_info)
-    #     attention_out = self.output_info
-    #     if self.use_flash_sdp and self.strategy.fp8: #TODO(sherry): FP8并且使用FA，将attention out cache
-    #         self.save_for_backward(attention_out) 
-
     
     #TODO: memory and net usage need to specify while the implement is different from general core attention
     def _comp_leaf_flops_info(self):
@@ -1341,8 +1339,7 @@ class MLACoreAttention(CoreAttention):
             self._compute_info.bwd_grad_act_flops += base_flops
         self._compute_info.bwd_grad_w_flops = 0
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.head_num * self.v_head_dim
@@ -1409,9 +1406,6 @@ class MLACoreAttention(CoreAttention):
             # The sdp interface of a certain pytorch will use an extra memory,
             # not sure if it is fixed now
             bwd_soft_factor += 1
-        elif self.use_math_sdp and self.system.accelerator.backend == "musa":
-            # torch_musa sdp kernel reuse the output grad memory
-            bwd_soft_factor -= 1
         self._act_info.bwd_peak_prev_cache_mem = (q_size + k_size) * self.element_size
         self._act_info.bwd_peak_mem_no_cache = (
             bwd_soft_factor * softmax_size * self.element_size
@@ -1485,17 +1479,16 @@ class RotaryEmbedding(MetaModule):
         hidden_size = self.input_info.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
     
-    @property
-    def output_info(self):
+    def create_output_info(self):
         output_info = InputOutputInfo(
-            tensors=self.input_info.tensors
+            tensors=[t.new() for t in self.input_info.tensors]
         )
         return output_info
     
     def _comp_leaf_model_info_impl(self):
-        self._model_info.weight_bytes = 0
-        self._model_info.grad_bytes = 0
-        self._model_info.state_bytes = 0
+        self._model_info.dense_weight_bytes = 0
+        self._model_info.dense_grad_bytes = 0
+        self._model_info.dense_state_bytes = 0
 
     def _comp_leaf_act_info_impl(self):
         """
@@ -1543,11 +1536,13 @@ class Swiglu(MetaModule):
         enable_recompute: bool,
         strategy: StrategyConfig,
         system: SystemConfig,
+        is_weighted_silu: bool = False,
     ) -> None:
         super().__init__(strategy, system)
         self.is_fused = is_fused
         self.enable_recompute = enable_recompute
         self.has_cached_inputs = has_cached_inputs
+        self.is_weighted_silu = is_weighted_silu
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
@@ -1566,19 +1561,18 @@ class Swiglu(MetaModule):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        input_numel = self.output_info.tensors[0].numel()
+        input_numel = self.output_info_.tensors[0].numel()
         return input_numel
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         hidden_size = self.input_info.tensors[0].size(-1)
         assert hidden_size % 2 == 0, "hidden size should be even"
         output_size_list = list(self.input_info.tensors[0].shape[:-1]) + [
             hidden_size // 2,
         ]
         output_tensor = [TensorSize(shape=tuple(output_size_list))]
-        if len(self.input_info.tensors) > 1:
-            output_tensor += self.input_info.tensors[1:]
+        # if len(self.input_info.tensors) > 1:
+        #     output_tensor += self.input_info.tensors[1:]
         output_info = InputOutputInfo(tensors=output_tensor)
         return output_info
 
@@ -1603,10 +1597,16 @@ class Swiglu(MetaModule):
         self._act_info.bwd_peak_mem_no_cache = input_size + output_size
         self._act_info.bwd_peak_prev_cache_mem = 0
 
+        if self.is_weighted_silu:
+            probs_mem = self.input_info.tensors[1].numel() * 8
+            # self._act_info.activation_mem_cache += probs_mem # probs are cached in the Permutation
+            self._act_info.fwd_peak_mem_no_cache += probs_mem
+            self._act_info.bwd_peak_mem_no_cache += probs_mem
+
     def _comp_leaf_model_info_impl(self):
-        self._model_info.weight_bytes = 0
-        self._model_info.grad_bytes = 0
-        self._model_info.state_bytes = 0
+        self._model_info.dense_weight_bytes = 0
+        self._model_info.dense_grad_bytes = 0
+        self._model_info.dense_state_bytes = 0
 
     def _comp_leaf_flops_info(self):
         # ignore memory bound kernel flops for now
@@ -1633,6 +1633,11 @@ class Swiglu(MetaModule):
                 2 * output_size + 2 * 3 * output_size
             )
             self._compute_info.bwd_grad_w_accessed_mem = 0
+
+        if self.is_weighted_silu:
+            probs_mem = self.input_info.tensors[1].numel() * self.dtype_to_element_size[self.strategy.dtype]
+            self._compute_info.fwd_accessed_mem += probs_mem
+            self._compute_info.bwd_grad_act_accessed_mem += probs_mem
 
         self._compute_info.recompute_accessed_mem = (
             self._compute_info.fwd_accessed_mem if self.enable_recompute else 0
@@ -1683,8 +1688,7 @@ class Gelu(MetaModule):
         input_numel = self.input_info.tensors[0].numel()
         return input_numel
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         output_tensor = [deepcopy(self.input_info.tensors[0])]
         if len(self.input_info.tensors) > 1:
             output_tensor += self.input_info.tensors[1:]
@@ -1711,9 +1715,9 @@ class Gelu(MetaModule):
         self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
-        self._model_info.weight_bytes = 0
-        self._model_info.grad_bytes = 0
-        self._model_info.state_bytes = 0
+        self._model_info.dense_weight_bytes = 0
+        self._model_info.dense_grad_bytes = 0
+        self._model_info.dense_state_bytes = 0
 
     def _comp_leaf_flops_info(self):
         # ignore memory bound kernel flops for now
@@ -1806,8 +1810,7 @@ class ParallelCE(MetaModule):
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
         
-    @property
-    def output_info(self):
+    def create_output_info(self):
         output_info = InputOutputInfo(tensors=[TensorSize(shape=(1,))])
         return output_info
 
@@ -1860,9 +1863,9 @@ class ParallelCE(MetaModule):
         self._act_info_with_recomp = self._act_info
 
     def _comp_leaf_model_info_impl(self):
-        self._model_info.weight_bytes = 0
-        self._model_info.grad_bytes = 0
-        self._model_info.state_bytes = 0
+        self._model_info.dense_weight_bytes = 0
+        self._model_info.dense_grad_bytes = 0
+        self._model_info.dense_state_bytes = 0
 
     def _comp_leaf_flops_info(self):
         # ignore memory bound kernel flops for now
@@ -1934,7 +1937,6 @@ class ParallelCE(MetaModule):
             enable_recompute=self.enable_recompute,
         )
 
-
 class Float8Quantizer(MetaModule):
     def __init__(self, enable_recompute, strategy, system, specific_name='', parent_module=None):
         super().__init__(strategy, system, specific_name, parent_module)
@@ -1942,8 +1944,7 @@ class Float8Quantizer(MetaModule):
         self.cache_inputs = False 
         self.cache_outputs = False
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         if isinstance(self.input_info, TensorSize):
             output_info = InputOutputInfo([Float8Tensor(deepcopy(self.input_info.shape))])
         else:
@@ -1965,6 +1966,8 @@ class Float8Quantizer(MetaModule):
 
     def extra_repr(self):
         return f"enable_recompute={self.enable_recompute}"
+
+
 #endregion 
 
 #region ----------------- Composite module ----------------
@@ -1978,11 +1981,15 @@ class QuantizedColLinear(MetaModule):
                  enable_recompute, 
                  strategy, 
                  system, 
+                 is_last_recompute = False,
+                 disable_tensor_parallel = False,
                  specific_name='QuantizedColLinear'):
         super().__init__(strategy, system, specific_name, parent_module=None)
         assert self.strategy.fp8, 'QuantizedColLinear only support fp8'
-        self.quntizer = Float8Quantizer(enable_recompute, strategy, system)
-        self.linear = LinearCol(layer_idx, input_size, output_size, use_bias, has_cached_inputs, enable_recompute, strategy, system)
+        self.quntizer = Float8Quantizer(enable_recompute=enable_recompute, strategy=strategy, system=system)
+        self.linear = LinearCol(layer_idx, input_size, output_size, use_bias, has_cached_inputs, enable_recompute, strategy, system, 
+                                is_last_recompute = is_last_recompute, 
+                                disable_tensor_parallel = disable_tensor_parallel)
     
     def set_breakpoints(self, status):
         self.linear.set_breakpoints(status)
@@ -2001,11 +2008,13 @@ class QuantizedRowLinear(MetaModule):
                  enable_recompute, 
                  strategy, 
                  system, 
+                 is_last_recompute = False,
                  specific_name='QuantizedColLinear'):
         super().__init__(strategy, system, specific_name, parent_module=None)
         assert self.strategy.fp8, 'QuantizedColLinear only support fp8'
-        self.quntizer = Float8Quantizer(enable_recompute, strategy, system)
-        self.linear = LinearRow(layer_idx, input_size, output_size, use_bias, has_cached_inputs, enable_recompute, strategy, system)
+        self.quntizer = Float8Quantizer(enable_recompute=enable_recompute, strategy=strategy, system=system)
+        self.linear = LinearRow(layer_idx, input_size, output_size, use_bias, has_cached_inputs, enable_recompute, strategy, system, 
+                                is_last_recompute = is_last_recompute)
 
     def set_breakpoints(self, status):
         self.linear.set_breakpoints(status)
@@ -2023,7 +2032,7 @@ class Attention(MetaModule):
         layer_idx,
         config: ModelConfig,
         enable_recompute: bool,
-        attention_recompute: AttentionRecomputeConfig,
+        attention_recompute_conf: AttentionRecomputeConfig,
         strategy: StrategyConfig,
         system: SystemConfig,
         specific_name='',
@@ -2033,7 +2042,7 @@ class Attention(MetaModule):
         self.config = config
         self.strategy = strategy
         self.system = system
-        self.attention_recompute = attention_recompute
+        self.attention_recompute_conf = attention_recompute_conf
         
 
         self.enable_recompute = enable_recompute   # for old version 
@@ -2059,7 +2068,7 @@ class Attention(MetaModule):
                 output_size=output_size,
                 use_bias=False,
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.qkv_recompute,
+                enable_recompute=attention_recompute_conf.q_up_recompute,
                 strategy=strategy,
                 system=system
             )
@@ -2071,16 +2080,18 @@ class Attention(MetaModule):
                 use_math_sdp=self.strategy.use_math_sdp,
                 use_flash_sdp=self.strategy.use_flash_sdp,
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.attn_recompute,
+                enable_recompute=attention_recompute_conf.core_attn_recompute,
                 strategy=strategy,
-                system=system
+                system=system,
+                is_last_recompute = True
             )
+        linear_out_input_size = self.config.head_num * self.config.head_size
         self.linear_out = LinearRow_(
                 layer_idx=layer_idx,
-                input_size=self.config.hidden_size,
+                input_size=linear_out_input_size,
                 output_size=self.config.hidden_size,
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.out_recompute,
+                enable_recompute=attention_recompute_conf.out_recompute,
                 use_bias=False,
                 strategy=strategy,
                 system=system
@@ -2113,13 +2124,12 @@ class Attention(MetaModule):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        batch_size = self.output_info.tensors[0].size(0)
-        seq_len = self.output_info.tensors[0].size(1)
-        hidden_size = self.output_info.tensors[0].size(2)
+        batch_size = self.output_info_.tensors[0].size(0)
+        seq_len = self.output_info_.tensors[0].size(1)
+        hidden_size = self.output_info_.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.input_info.tensors[0].size(2)
@@ -2136,7 +2146,7 @@ class MLAAttention(MetaModule):
         layer_idx,
         config: ModelConfig,
         enable_recompute: bool,
-        attention_recompute: AttentionRecomputeConfig,
+        attention_recompute_conf: AttentionRecomputeConfig,
         strategy: StrategyConfig,
         system: SystemConfig,
         specific_name='',
@@ -2147,11 +2157,11 @@ class MLAAttention(MetaModule):
         self.config = config
         self.strategy = strategy
         self.system = system
-        self.attention_recompute = attention_recompute  # for old version 
+        self.attention_recompute_conf = attention_recompute_conf  # for old version 
         self.enable_recompute = enable_recompute 
         query_projection_size = self.config.v_head_dim * self.config.head_num
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
-        self.num_attention_heads_per_partition = self.config.head_num // self.strategy.tp_size #TODO(sherry): 强制走tp还是不强制走tp
+        self.num_attention_heads_per_partition = self.config.head_num // self.strategy.tp_size
         # only_enable_sdp = False
         if self.strategy.recompute_granularity == "sdp_only":
             self.recompute_granularity = "submodule"
@@ -2172,7 +2182,7 @@ class MLAAttention(MetaModule):
                     output_size=self.config.head_num * self.q_head_dim,
                     use_bias=False,
                     has_cached_inputs=False,
-                    enable_recompute=attention_recompute.qkv_recompute,
+                    enable_recompute=attention_recompute_conf.q_up_recompute,
                     strategy=strategy,
                     system=system
                 )
@@ -2183,7 +2193,9 @@ class MLAAttention(MetaModule):
                 output_size=self.config.q_lora_rank,
                 use_bias=False,
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.qkv_recompute,
+                enable_recompute=attention_recompute_conf.q_down_recompute,
+                is_last_recompute = True,
+                # disable_tensor_parallel=True,
                 strategy=strategy,
                 system=system
             )
@@ -2193,7 +2205,7 @@ class MLAAttention(MetaModule):
                     norm_type="rms_norm",
                     use_fused_norm=self.strategy.use_fused_norm,
                     has_cached_inputs=False,
-                    enable_recompute=attention_recompute.qkv_norm_recompute,
+                    enable_recompute=attention_recompute_conf.q_layernorm_recompute,
                     strategy=strategy,
                     system=system
                 )
@@ -2203,7 +2215,7 @@ class MLAAttention(MetaModule):
                     output_size=self.config.head_num * self.q_head_dim, 
                     use_bias=False,
                     has_cached_inputs=False,
-                    enable_recompute=attention_recompute.qkv_recompute,
+                    enable_recompute=attention_recompute_conf.q_up_recompute,
                     strategy=strategy,
                     system=system
                 )
@@ -2214,22 +2226,18 @@ class MLAAttention(MetaModule):
                 output_size=self.config.kv_lora_rank + self.config.qk_pos_emb_head_dim,
                 use_bias=False,
                 has_cached_inputs=True,
-                enable_recompute=attention_recompute.qkv_recompute,
+                enable_recompute=attention_recompute_conf.kv_down_recompute,
+                is_last_recompute = True,
                 strategy=strategy,
                 system=system
             )
-        
-        if self.strategy.mla_rms_recompute and self.strategy.recompute_granularity == "selective_recompute":
-            if self.config.q_lora_rank is not None:
-                self.linear_q_down_proj.set_breakpoints(True)
-            self.linear_kv_down_proj.set_breakpoints(True)
-
+    
         self.kv_layernorm = LayerNorm(
                 norm_size=self.config.kv_lora_rank,
                 norm_type="rms_norm",
                 use_fused_norm=self.strategy.use_fused_norm,
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.qkv_norm_recompute,
+                enable_recompute=attention_recompute_conf.kv_layernorm_recompute,
                 strategy=strategy,
                 system=system
             )
@@ -2240,13 +2248,13 @@ class MLAAttention(MetaModule):
                                                                 self.config.v_head_dim),
                 use_bias=False,
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.qkv_recompute,
+                enable_recompute=attention_recompute_conf.kv_up_recompute,
                 strategy=strategy,
                 system=system,
             )
         self.rotary_pos_emb = RotaryEmbedding(
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.qkv_recompute,
+                enable_recompute=attention_recompute_conf.rope_recompute,
                 # enable_recompute=False,
                 strategy=strategy,
                 system=system
@@ -2259,7 +2267,8 @@ class MLAAttention(MetaModule):
                 use_math_sdp=self.strategy.use_math_sdp,
                 use_flash_sdp=self.strategy.use_flash_sdp,
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.attn_recompute,
+                enable_recompute=attention_recompute_conf.core_attn_recompute,
+                is_last_recompute = True,
                 strategy=strategy,
                 system=system,
                 v_head_dim=config.v_head_dim
@@ -2270,16 +2279,23 @@ class MLAAttention(MetaModule):
                 input_size=query_projection_size,
                 output_size=self.config.hidden_size,
                 has_cached_inputs=False,
-                enable_recompute=attention_recompute.out_recompute, # TODO: enable_out_recompute
+                enable_recompute=attention_recompute_conf.out_recompute, # TODO: enable_out_recompute
                 use_bias=False,
                 strategy=strategy,
                 system=system
             )
-        if self.linear_out_proj.enable_recompute and self.strategy.recompute_granularity == "selective_recompute":
-            self.linear_out_proj.is_breakpoints = True
-        
-        is_bf16_and_next_recompute = (not self.strategy.fp8 and self.linear_out_proj.enable_recompute)
-        self.core_attention.cache_outputs = self.strategy.use_flash_sdp and (self.strategy.fp8 or is_bf16_and_next_recompute) # FIXME(sherry)：bf16
+        if ENABLE_SIMU_GRAPH:
+            ...
+        else:
+            if self.strategy.mla_rms_recompute and self.strategy.recompute_granularity == "selective_recompute":
+                if self.config.q_lora_rank is not None:
+                    self.linear_q_down_proj.set_breakpoints(True)
+                self.linear_kv_down_proj.set_breakpoints(True)
+            if self.linear_out_proj.enable_recompute and self.strategy.recompute_granularity == "selective_recompute":
+                self.linear_out_proj.is_breakpoints = True
+            
+            is_bf16_and_next_recompute = (not self.strategy.fp8 and self.linear_out_proj.enable_recompute)
+            self.core_attention.cache_outputs = self.strategy.use_flash_sdp and (self.strategy.fp8 or is_bf16_and_next_recompute) # FIXME(sherry)：bf16
 
     def forward(self, hidden_states:TensorSize, path_debug_context:PathDebugContext):
         # ref: Megatron-LM/megatron/core/transformer/multi_latent_attention.py:306
@@ -2314,9 +2330,17 @@ class MLAAttention(MetaModule):
         # kv_combined = gather_from_tensor_model_parallel_region(kv_combined)
 
         # kv_compressed:[s, b, 512], k_pos_emb: [s, b, 64]
-        kv_compressed, k_pos_emb = simu_ops.split(
-            kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
-        )
+        # kv_compressed, k_pos_emb = simu_ops.split(
+        #     kv_combined, [self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], dim=-1
+        # )
+        kv_compressed, k_pos_emb = SplitFunction.apply(parent_model=self, 
+                                             enable_recompute=self.attention_recompute_conf.core_attn_recompute,
+                                            tensor_size = kv_combined, 
+                                            split_size_or_sections=[self.config.kv_lora_rank, self.config.qk_pos_emb_head_dim], split_dim=-1,
+                                            path_debug_context=path_debug_context,
+                                            name='kv_combined_Split'
+                                        )
+
 
         # if self.config.sequence_parallel:
         #     kv_compressed = scatter_to_sequence_parallel_region(kv_compressed)
@@ -2332,7 +2356,14 @@ class MLAAttention(MetaModule):
         )
 
         # k_no_pe: [s, b, n, 128], value: [s, b, n, 128]
-        k_no_pe, value = simu_ops.split(kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
+        # k_no_pe, value = simu_ops.split(kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1)
+        k_no_pe, value = SplitFunction.apply(parent_model=self, 
+                                             enable_recompute=self.attention_recompute_conf.core_attn_recompute, 
+                                             tensor_size=kv, 
+                                             split_size_or_sections=[self.config.qk_head_dim, self.config.v_head_dim], split_dim=-1, 
+                                             path_debug_context=path_debug_context,
+                                             name='KV_Split')
+        
 
         # [s, b, 64] -> [s, b, 1, 64]
         k_pos_emb:TensorSize = simu_ops.unsqueeze(k_pos_emb, 2)
@@ -2344,7 +2375,10 @@ class MLAAttention(MetaModule):
 
         # key: [s, b, n, 192]
         k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
-        key = ConcatFunction.apply(self, self.attention_recompute.attn_recompute, [k_no_pe, k_pos_emb], dim=-1, path_debug_context=path_debug_context) # There is storage overhead, cat is defined as Module to manage statistics
+        key = ConcatFunction.apply(self, self.attention_recompute_conf.core_attn_recompute, 
+                                   [k_no_pe, k_pos_emb], 
+                                   dim=-1, path_debug_context=path_debug_context,
+                                   name='K_pos_emb_Concat') # There is storage overhead, cat is defined as Module to manage statistics
 
         # TODO(sherry): contiguous
         # query = query.contiguous()
@@ -2355,7 +2389,13 @@ class MLAAttention(MetaModule):
         query = query.view(s, b, n*d)
         key = key.view(s, b, n*d)
         value = value.view(s, b, n*d2)
-        attn_input = simu_ops.cat([query, key, value], dim = -1) # for simuxmax attention input
+        # attn_input = simu_ops.cat([query, key, value], dim = -1) # for simuxmax attention input
+        attn_input = ConcatFunction.apply(parent_model=self, enable_recompute=self.attention_recompute_conf.core_attn_recompute,
+                                          tensor_sizes=[query, key, value], 
+                                          dim = -1,
+                                          path_debug_context=path_debug_context,
+                                          name='QKV_Concat') # for simuxmax attention input
+        
         attention_out = self.core_attention(attn_input, path_debug_context) # atomic module
 
         out = self.linear_out_proj(attention_out, path_debug_context)
@@ -2380,13 +2420,12 @@ class MLAAttention(MetaModule):
     @property
     def micro_output_grad_size(self):
         # [B, S, H]
-        batch_size = self.output_info.tensors[0].size(0)
-        seq_len = self.output_info.tensors[0].size(1)
-        hidden_size = self.output_info.tensors[0].size(2)
+        batch_size = self.output_info_.tensors[0].size(0)
+        seq_len = self.output_info_.tensors[0].size(1)
+        hidden_size = self.output_info_.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
 
-    @property
-    def output_info(self):
+    def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.input_info.tensors[0].size(2)
@@ -2401,7 +2440,7 @@ class MLP(MetaModule):
     def __init__(self, layer_idx, 
         config:ModelConfig, 
         enable_recompute:bool, 
-        mlp_recompute:MLPRecomputeConfig,
+        mlp_recompute_conf:MLPRecomputeConfig,
         strategy:StrategyConfig, 
         system:SystemConfig, 
         intermediate_size=None
@@ -2412,7 +2451,7 @@ class MLP(MetaModule):
         self.strategy = strategy
         self.system = system
         self.enable_recompute = enable_recompute # for old version 
-        if not mlp_recompute.linear_recompute:
+        if not mlp_recompute_conf.linear_recompute:
             self.recompute_granularity = "submodule"
         
         local_intermediate_size = (intermediate_size if intermediate_size is not None 
@@ -2426,14 +2465,14 @@ class MLP(MetaModule):
         LinearRow_ = QuantizedRowLinear if self.strategy.fp8 else LinearRow
 
         # support selective recompute
-      
+        enable_recompute = mlp_recompute_conf.shared_linear_recompute if isinstance(layer_idx, str) and ('shareExpert' in layer_idx) else mlp_recompute_conf.linear_recompute
         self.linear_fc1 = LinearCol_(
                 layer_idx=layer_idx,
                 input_size=self.config.hidden_size,
                 output_size=intermediate_size,
                 use_bias=False,
                 has_cached_inputs=False,
-                enable_recompute=mlp_recompute.linear_recompute,
+                enable_recompute=enable_recompute,
                 strategy=strategy,
                 system=system,
             )
@@ -2442,7 +2481,8 @@ class MLP(MetaModule):
                 input_size=local_intermediate_size,
                 output_size=self.config.hidden_size,
                 has_cached_inputs=False,
-                enable_recompute=mlp_recompute.linear_recompute,
+                enable_recompute=enable_recompute,
+                is_last_recompute=True,
                 use_bias=False,
                 strategy=strategy,
                 system=system,
@@ -2451,14 +2491,14 @@ class MLP(MetaModule):
             self.activation_layer = Swiglu(
                     is_fused=self.strategy.use_fused_swiglu,
                     has_cached_inputs=False,
-                    enable_recompute=mlp_recompute.linear_recompute,
+                    enable_recompute=enable_recompute,
                     strategy=strategy,
                     system=system,
                 )
         else:
             self.activation_layer = Gelu(
                     has_cached_inputs=False,
-                    enable_recompute=mlp_recompute.linear_recompute,
+                    enable_recompute=enable_recompute,
                     strategy=strategy,
                     system=system,
                 )

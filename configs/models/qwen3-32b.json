@@ -1,0 +1,12 @@
+{
+    "model_name": "qwen3-32b",
+    "model_type":"dense",
+    "hidden_size": 5120,
+    "head_num": 64,
+    "kv_head_num": 8,
+    "head_size": 128,
+    "intermediate_size": 25600,
+    "layer_num": 64,
+    "vocab_size": 151936,
+    "use_swiglu": true
+}

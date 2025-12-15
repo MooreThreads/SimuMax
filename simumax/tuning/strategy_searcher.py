@@ -20,14 +20,12 @@ CANDIDATE_STRATEGY = {
     "interleaving_size": [1],
     "zero_state": [1],
     "use_fused_norm": [True],
-    "no_sync": [True],
     "use_math_sdp": [False],
     "use_flash_sdp": [True],
     "use_fp32_accum_grad": [True],
     "use_fused_swiglu": [True],
     "enable_recompute": [False, True],
     "recompute_granularity": ["full_block"],
-    "skip_ckpt_micro_batch_num": [0],
     "mem_factor": [0.94],
 }
 

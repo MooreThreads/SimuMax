@@ -5,6 +5,7 @@ from dataclasses import dataclass, asdict
 from abc import ABC
 from typing import List, Tuple, Dict
 import time
+import types
 import multiprocessing
 try:
     from mpi4py import MPI
@@ -15,11 +16,11 @@ import time
 import json
 import os
 from simumax.core.tensor import TensorSize
-from simumax.core.config import StrategyConfig, SystemConfig
+from simumax.core.config import StrategyConfig, SystemConfig, get_capture_graph_only, SIMU_DEBUG, TMP_PATH
 from simumax.core.utils import get_point_name, path_convert_to_str, to_json_string 
 from simumax.core.utils import human_readable_bytes, human_readable_nums, human_readable_times
 from simumax.core.utils import get_rank_group
-
+from simumax.core.graph import SimuONNXGraphBuilder
 
 class RecomputeStatus:
     NO_RECOMPUTE = "no_recompute"
@@ -293,36 +294,41 @@ class ModuleMemoryInfo:
     2. Gradient memory usage
     3. State memory usage
     """
-
-    weight_bytes: int = 0
-    grad_bytes: int = 0
-    state_bytes: int = 0
+    weight_numel: int = 0
+    dense_weight_bytes: int = 0
+    dense_grad_bytes: int = 0
+    dense_state_bytes: int = 0
+    moe_weight_numel: int = 0
     moe_weight_bytes: int = 0
     moe_grad_bytes: int = 0
     moe_state_bytes: int = 0
 
     @property
     def all(self):
-        return self.weight_bytes + self.grad_bytes + self.state_bytes + self.moe_weight_bytes + self.moe_grad_bytes + self.moe_state_bytes
+        return self.dense_weight_bytes + self.dense_grad_bytes + self.dense_state_bytes + self.moe_weight_bytes + self.moe_grad_bytes + self.moe_state_bytes
     
     @property
     def all_state_bytes(self):
-        return self.state_bytes + self.moe_state_bytes  
+        return self.dense_state_bytes + self.moe_state_bytes  
     
     @property
     def all_weight_bytes(self):
-        return self.weight_bytes + self.moe_weight_bytes
+        return self.dense_weight_bytes + self.moe_weight_bytes
+    
+    @property
+    def all_weight_numel(self):
+        return self.weight_numel + self.moe_weight_numel
     
     @property
     def all_grad_bytes(self):
-        return self.grad_bytes + self.moe_grad_bytes
+        return self.dense_grad_bytes + self.moe_grad_bytes
     
     def _format_repr_info(self):
         attributes = {
             "all": self.all,
-            "weight_bytes": self.weight_bytes,
-            "grad_bytes": self.grad_bytes,
-            "state_bytes": self.state_bytes,
+            "weight_bytes": self.dense_weight_bytes,
+            "grad_bytes": self.dense_grad_bytes,
+            "state_bytes": self.dense_state_bytes,
             "moe_weight_bytes": self.moe_weight_bytes,
             "moe_grad_bytes": self.moe_grad_bytes,
             "moe_state_bytes": self.moe_state_bytes
@@ -345,9 +351,11 @@ class ModuleMemoryInfo:
                 f"Unsupported operand type for +: ModuleMemoryInfo and {type(other)}"
             )
         return ModuleMemoryInfo(
-            weight_bytes=self.weight_bytes + other.weight_bytes,
-            grad_bytes=self.grad_bytes + other.grad_bytes,
-            state_bytes=self.state_bytes + other.state_bytes,
+            weight_numel=self.weight_numel + other.weight_numel,
+            dense_weight_bytes=self.dense_weight_bytes + other.dense_weight_bytes,
+            dense_grad_bytes=self.dense_grad_bytes + other.dense_grad_bytes,
+            dense_state_bytes=self.dense_state_bytes + other.dense_state_bytes,
+            moe_weight_numel = self.moe_weight_numel + other.moe_weight_numel,
             moe_weight_bytes=self.moe_weight_bytes + other.moe_weight_bytes,
             moe_grad_bytes=self.moe_grad_bytes + other.moe_grad_bytes,
             moe_state_bytes=self.moe_state_bytes + other.moe_state_bytes
@@ -379,6 +387,12 @@ class ModuleCostInfo:
     def fwd_time(self):
         return self.fwd_compute_time + self.fwd_net_exposed_time
 
+    # def all_time(self):
+    #     return self.fwd_time + self.fwd_net_time + self.recompute_compute_time + self.recompute_net_time + self.bwd_time + self.bwd_net_time
+    @property
+    def all_time(self):
+        return self.fwd_time + self.fwd_net_time + self.bwd_time + self.bwd_net_time
+
     @property
     def recompute_time(self):
         return self.recompute_compute_time + self.recompute_net_exposed_time
@@ -394,6 +408,10 @@ class ModuleCostInfo:
     @property
     def bwd_net_time(self):
         return self.bwd_grad_w_net_time + self.bwd_grad_act_net_time
+    
+    @property
+    def net_time(self):
+        return self.fwd_net_time + self.bwd_net_time + self.recompute_net_time
 
     def get_all_costs(self):
         """Get all cost of the model in forward and backward(bwd_act, bwd_w) pass"""
@@ -556,11 +574,12 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
     """
 
     dtype_to_element_size = {"fp32": 4, "fp16": 2, "bf16": 2, "fp8": 1}
-
+    id_counter = 0
     def __init__(self, strategy:StrategyConfig, system:SystemConfig, specific_name='', parent_module = None) -> None:
         super().__init__(specific_name)
         self.strategy = strategy
         self.system = system
+        self.offload_inputs = False
 
         self.children_ordered_module:List[MetaModule] = []
         self.children_modules:List[MetaModule] = [] # children modules是所有子模块的列表（无序）
@@ -568,7 +587,8 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         self.default_dtype = strategy.dtype 
         self._init_strategy = False
         self.input_info = None
-        self.cache_info = []
+        self.output_info_ = None
+        # self.cache_info = []
         self.enable_recompute = False
         self.recompute_granularity = "full"
         self.parent_module:MetaModule = parent_module
@@ -585,11 +605,15 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         self.is_recompute_forward_finished = False
         self.full_name = "self"
         self.name = ''
+        self.call_idx = -1
 
         # for Selective recompute strategy
         self.all_recompute_nodes:List[MetaModule] = []
         self.all_leaf_nodes:List[MetaModule] = []
         self.status_ready = False
+        self.is_variance_node = False
+        self.id = MetaModule.id_counter
+        MetaModule.id_counter += 1
 
     def __post_init__(self):
         self.is_leaf_module = self.set_children_modules()
@@ -606,6 +630,15 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
                     self.children_modules.append(member) 
                     self.children_modules_names[member] = name
         return is_leaf
+    
+    def set_variance_node(self, is_variance_node:bool):
+        if self.strategy.recompute_variance:
+            self.is_variance_node = is_variance_node        
+    @property
+    def output_info(self):
+        if self.output_info_ is None:
+            self.output_info_ = self.create_output_info()
+        return self.output_info_
     
     def set_leaf_full_name(self, parent_name:str):
         for child, name in self.children_modules_names.items():
@@ -733,18 +766,6 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
 
     def all_input_element_num(self):
         res = 0
-        # for x in self.input_info.tensors:
-        #     if hasattr(self, "a_element_size"):
-        #         element_size = self.a_element_size
-        #     else:
-        #         element_size = self.element_size
-        #     res += x.numel() * element_size
-        # return res
-
-        # if hasattr(self, "a_element_size"):
-        #     element_size = self.a_element_size # for fp8 gemm
-        # else:
-        #     element_size = self.element_size
 
         if isinstance(self.input_info, InputOutputInfo):
             input_info = [self.input_info]
@@ -757,33 +778,7 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             elif isinstance(ii, TensorSize):
                 res += ii.get_memory_size()
         return res
-    def all_output_shape(self):
-        res = 0
-        # for x in self.input_info.tensors:
-        #     if hasattr(self, "a_element_size"):
-        #         element_size = self.a_element_size
-        #     else:
-        #         element_size = self.element_size
-        #     res += x.numel() * element_size
-        # return res
 
-        # if hasattr(self, "a_element_size"):
-        #     element_size = self.a_element_size # for fp8 gemm
-        # else:
-        #     element_size = self.element_size
-        shapes = []
-        # element_size = self.element_size
-        if isinstance(self.output_info, InputOutputInfo):
-            output_info = [self.output_info]
-        else:
-            output_info = self.output_info
-        for oi in output_info:
-            if isinstance(oi, InputOutputInfo):
-                for x in oi.tensors:
-                    shapes.append(x.shape)
-            elif isinstance(oi, TensorSize):
-                shapes.append(oi.shape)
-        return shapes
     def all_output_element_num(self):
         res = 0
         # element_size = self.element_size
@@ -802,17 +797,11 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
     def set_input_state_info(self, input_info: InputOutputInfo):
         # self.input_info = deepcopy(input_info)
         self.input_info = input_info # reference assignments are allowed here
-    
-    def save_for_backward(self, input_info: InputOutputInfo):
-        self.cache_info.append(input_info) # reference assignments are allowed here
 
     def set_path_debug_context(self, path_debug_context: PathDebugContext):
         self.path_debug_context = deepcopy(path_debug_context)
 
-    @property
-    def output_info(self):
-        
-        # raise NotImplementedError(f"{self.__class__.__name__} 没有实现 output_info 属性")
+    def create_output_info(self):
         return InputOutputInfo([])
 
     # =========================
@@ -842,12 +831,20 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             # leaf module act info is the same with recompute,
             # because _act_info_with_recomp is used to distinguish
             # the case of recompute in the combined module
+            if self.is_variance_node:
+                # print("Warning: variance node change peak")
+                # self._act_info.activation_mem_cache = 0
+                # self._act_info.bwd_peak_mem_no_cache += self._act_info.activation_mem_cache
+                pass
             self._act_info_with_recomp = deepcopy(self._act_info)
+        else:
+            for module in self.children_ordered_module:
+                self._act_info.activation_mem_cache = self._act_info.activation_mem_cache + module._act_info.activation_mem_cache
 
     def _comp_leaf_model_info_impl(self):
-        self._model_info.weight_bytes = 0
-        self._model_info.grad_bytes = 0
-        self._model_info.state_bytes = 0
+        self._model_info.dense_weight_bytes = 0
+        self._model_info.dense_grad_bytes = 0
+        self._model_info.dense_state_bytes = 0
 
     def _comp_model_info(self):
         if len(self.children_ordered_module) > 0:
@@ -855,22 +852,6 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
                 self._model_info = self._model_info + module.get_model_info()
         else:
             self._comp_leaf_model_info_impl()
-
-
-    def _comp_input_cache_size(self):
-        def get_cache_size(cache):
-            if cache is None:
-                return 0
-            if isinstance(cache, InputOutputInfo):
-                # return sum([t.try_get_allocated_memory() for t in cache.tensors])
-                return sum([t.get_memory_size() for t in cache.tensors])
-            elif isinstance(cache, TensorSize):
-                return cache.get_memory_size()
-            else:
-                raise TypeError(f"{self.__class__.__name__} cache_info should be InputOutputInfo or TensorSize, but got {type(cache)}")
-        
-        all_cache_size = [get_cache_size(cache) for cache in self.cache_info]
-        return sum(all_cache_size)
 
     # =========================
     # Compute or Communicate Related
@@ -899,6 +880,13 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             self._comp_leaf_flops_info()
             self._comp_leaf_mem_accessed_info()
             self._comp_leaf_intra_net_info()
+            if self.strategy.recompute_variance and self.is_variance_node:
+                self._compute_info.recompute_accessed_mem = 0
+                self._compute_info.recompute_flops = 0
+                self._cost_info.recompute_net_time = 0
+                self._cost_info.recompute_net_exposed_time = 0
+                if SIMU_DEBUG:
+                    print(f"- {self.full_name} is variance node, recompute_accessed_mem and recompute_flops are set to 0")
 
     def _comp_cost_info(self):
         if len(self.children_ordered_module) > 0:
@@ -911,7 +899,8 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
                 bwd_grad_act_op="default",
                 bwd_grad_w_op="default",
                 enable_recompute=self.enable_recompute,
-            )   
+            )  
+                 
         if (
             self.path_debug_context
             and self.path_debug_context.target_point is not None
@@ -952,40 +941,6 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             "io_details" : deepcopy(io_details),
         }
 
-    def get_input_shapes_desc2(self, stage):
-            m, n, k = 0, 0, 0
-            weight = self.get_weight()
-            if weight:
-                weight_shape = [weight.shape] # [out, in]
-                weight_T_shape = [weight.T.shape] # [in, out]
-            else:
-                weight_shape = []  
-                weight_T_shape = [] 
-
-            if isinstance(self, LinearBase):
-                if stage == 'fwd':
-                    input_shapes = self.input_info.shapes + weight_T_shape
-                    lhs = self.input_info.tensors[0]
-                    rhs = weight.T
-                elif stage == 'bwd_grad_act':
-                    output_shape = self.output_info.shapes if isinstance(self.output_info, InputOutputInfo) else [self.output_info.shape]
-                    input_shapes = output_shape + weight_T_shape
-                elif stage == 'bwd_grad_w':
-                    d_w_lhs_shape = [self.input_info.tensors[0].transpose(-1,-2).shape]
-                    input_shapes = d_w_lhs_shape + (self.output_info.shapes if isinstance(self.output_info, InputOutputInfo) else [self.output_info.shape])
-                else:
-                    raise ValueError(f"Unknown stage: {stage}")
-                
-                input_shapes = [[int(i) for i in shape] for shape in input_shapes]
-                lhs_shape = list(input_shapes[0])
-                rhs_shape = list(input_shapes[1])
-                lhs_shape = [int(x) for x in lhs_shape]
-                rhs_shape = [int(x) for x in rhs_shape]
-                shapes_desc = str(lhs_shape) + ' x ' + str(rhs_shape)
-            else:
-                shapes_desc = ""
-            return shapes_desc
-
     def get_input_shapes_desc(self, stage):
         if isinstance(self, LinearBase):
             bmnk_info = self.get_gemm_bmnk(stage)
@@ -1005,7 +960,7 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
     ):
         def compute_details(op_name, stage, flops, accessed_mem):
             #compute_details include compute time, tflops of accelerator, flops of current op, etc.
-            compute_details = self.system.compute_op_accuracy_time2(op_name, flops, shape_desc= self.get_input_shapes_desc(stage), reture_detail=True)
+            compute_details = self.system.compute_op_accuracy_time(op_name, flops, shape_desc= self.get_input_shapes_desc(stage), reture_detail=True)
 
             # io_details include io time, gbps of accelerator, io size of current op, etc.
             io_details = self.system.compute_mem_access_time(op_name,
@@ -1027,40 +982,45 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         self._cost_info.bwd_grad_act_time = compute_details(bwd_grad_act_op, 'bwd_grad_act', self._compute_info.bwd_grad_act_flops, self._compute_info.bwd_grad_act_accessed_mem)
         self._cost_info.bwd_grad_w_time = compute_details(bwd_grad_w_op, 'bwd_grad_w', self._compute_info.bwd_grad_w_flops, self._compute_info.bwd_grad_w_accessed_mem)
 
-        if enable_recompute:
-            self._cost_info.recompute_compute_time = self._cost_info.fwd_time
-        
-        if (
-            self.path_debug_context
-            and self.path_debug_context.target_point is not None
-        ):
-            # get the parent path of the current module
-            path = get_point_name(
-                parent=self.parent, current=self.current, sep=" -> "
-            )
-            if path in self.path_debug_context.target_point:
-                file_path = f'{TMP_PATH}/cost_log.json'
-                os.makedirs(TMP_PATH, exist_ok=True)
-                if os.path.exists(file_path):
-                    with open(file_path, 'r', encoding='utf-8') as file:
-                        try:
-                            existing_data = json.load(file) 
-                        except json.JSONDecodeError:
-                            existing_data = {}
-                else:
-                    existing_data = {}
-                existing_data.update(
-                    {path:{"cost_F": self._cost_info.fwd_compute_time,
-                            "cost_B": self._cost_info.bwd_grad_act_time,
-                            "cost_W": self._cost_info.bwd_grad_w_time,
-                            "recompute_F": self._cost_info.recompute_compute_time,
-                            "net_F": self._cost_info.fwd_net_time,
-                            "net_B": self._cost_info.bwd_net_time,
-                            }
-                            }
-                )
-                with open(file_path, 'w', encoding='utf-8') as file:
-                    json.dump(existing_data, file, indent=4, ensure_ascii=False)
+        self._cost_info.recompute_compute_time = self._cost_info.fwd_time if self.enable_recompute else 0
+
+        if self.enable_recompute and self.is_variance_node:
+            self._cost_info.recompute_compute_time = 0
+            if SIMU_DEBUG:
+            # if 1:
+                print(f'%% {self.name} is variance node, recompute_compute_time is 0')
+
+        # if (
+        #     self.path_debug_context
+        #     and self.path_debug_context.target_point is not None
+        # ):
+        #     # get the parent path of the current module
+        #     path = get_point_name(
+        #         parent=self.parent, current=self.current, sep=" -> "
+        #     )
+        #     if path in self.path_debug_context.target_point:
+        #         file_path = f'{TMP_PATH}/cost_log.json'
+        #         os.makedirs(TMP_PATH, exist_ok=True)
+        #         if os.path.exists(file_path):
+        #             with open(file_path, 'r', encoding='utf-8') as file:
+        #                 try:
+        #                     existing_data = json.load(file) 
+        #                 except json.JSONDecodeError:
+        #                     existing_data = {}
+        #         else:
+        #             existing_data = {}
+        #         existing_data.update(
+        #             {path:{"cost_F": self._cost_info.fwd_compute_time,
+        #                     "cost_B": self._cost_info.bwd_grad_act_time,
+        #                     "cost_W": self._cost_info.bwd_grad_w_time,
+        #                     "recompute_F": self._cost_info.recompute_compute_time,
+        #                     "net_F": self._cost_info.fwd_net_time,
+        #                     "net_B": self._cost_info.bwd_net_time,
+        #                     }
+        #                     }
+        #         )
+        #         with open(file_path, 'w', encoding='utf-8') as file:
+        #             json.dump(existing_data, file, indent=4, ensure_ascii=False)
 
     # =========================
     # Agg Related
@@ -1102,6 +1062,7 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
     def __call__(
         self, input_info: InputOutputInfo, path_debug_context: PathDebugContext
     ) -> InputOutputInfo:
+        is_capture_only = get_capture_graph_only()
         if isinstance(input_info, TensorSize):
             input_info = InputOutputInfo([input_info])
 
@@ -1129,34 +1090,30 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
             self.current = current_repr
             self.current_full_module_path = get_point_name(parent=self.parent, current=self.current, sep=" -> ") #FIXME(sherry): path_debug_context is deepcopy to module. How to modify the parent of the temporary variable and pass it to the next module?
 
-        
-
         # call once, return all fwd, bwd info
         self._pre_op()
         output_info = None        
-        
-        self.call_forward_pre_hook(input_info)
-
-        # Save the input info for backward
-        if self.cache_inputs:
-            self.save_for_backward(input_info)
 
         if not self.is_leaf_module:
             output_info = self.forward(input_info, self.path_debug_context)
+        else:
+            output_info = output_info if output_info else self.output_info # output_info = None, return leaf output
+            if is_capture_only:
+                graph_builder = SimuONNXGraphBuilder()
+                graph_builder.add_node(op = self,
+                                    op_type = self.__class__.__name__, 
+                                    inputs = input_info.tensors if isinstance(input_info, InputOutputInfo) else [input_info],
+                                    outputs = output_info.tensors  if isinstance(output_info, InputOutputInfo) else [output_info]
+                                    )
         
-        output_info = output_info if output_info else self.output_info # output_info = None, return leaf output
+        if not is_capture_only:
+            # aggregate the info or compute the leaf info
+            self._comp_model_info()  #static model memory usage
+            self._comp_act_info()  #activation
+            self._comp_compute_info()
+            self._post_op()
+            self._comp_cost_info()
         
-        # Save the output info for backward
-        if self.cache_outputs:
-            self.save_for_backward(output_info)
-        self.call_forward_post_hook(input_info, output_info)
-
-        # aggregate the info or compute the leaf info
-        self._comp_model_info()  #static model memory usage
-        self._comp_act_info()  #activation
-        self._comp_compute_info()
-        self._post_op()
-        self._comp_cost_info()
         self._info_ready = True
         
         if isinstance(output_info, InputOutputInfo) and len(output_info.tensors) == 1:
@@ -1231,22 +1188,33 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
                 main_str += extra_lines[0]
             else:
                 main_str += "\n  " + "\n  ".join(lines) + "\n"
-        main_str += ")"
+        
 
         module = self
         
         # TODO(sherry): delete this, for debug
-        debug = False
-        if self.is_leaf_module and debug:
-            main_str += f"\n\t\t-- fwd_call_idx={module._act_info.fwd_idx}, all_input={module.all_input_element_num()/1024/1024:.2f} MB, all_ouput={module.all_output_element_num()/1024/1024:.2f} MB, output_shape={module.all_output_shape()}, activation_mem_cache={module._act_info_with_recomp.activation_mem_cache/1024/1024:.2f} MB, "
-            main_str += f"\n\t\t-- recompute_status={module.recompute_status}"
-        cost_info = module._cost_info
-        main_str += f"\t\t{self.name} fwd_cost={cost_info.fwd_time+cost_info.fwd_net_time:.2f} ms-[compute={cost_info.fwd_compute_time*1000:.2f} us, net={cost_info.fwd_net_time*1000:.2f} us], bwd_cost={cost_info.bwd_time+cost_info.bwd_net_time:.2f} ms-[compute={cost_info.bwd_compute_time*1000:.2f} us, net={cost_info.bwd_net_time*1000:.2f} us]"
-        # main_str += f"\t\t{cost_info}"
-        # , fwd_flops={module._compute_info.fwd_flops:.0f}, bwd_flops={module._compute_info.bwd_flops:.0f}
-        # fwd_activation={module._act_info.activation_mem_cache/1024/1024:.2f} MB"
+
+        main_str += ")"
+
+        show_details = True
+        if show_details:
+            cost_info = module._cost_info
+            main_str += f"\n\t1. cost: (total_time={cost_info.all_time:.2f} ms, fwd_details=(sum={cost_info.fwd_time+cost_info.fwd_net_time:.2f} ms, compute={cost_info.fwd_compute_time*1000:.2f} us, net={cost_info.fwd_net_time*1000:.2f} us), bwd_details=(sum={cost_info.bwd_time+cost_info.bwd_net_time:.2f} ms, compute={cost_info.bwd_compute_time*1000:.2f} us, net={cost_info.bwd_net_time*1000:.2f} us), variance_node={self.is_variance_node} flops={sum(module._compute_info.get_all_flops())/1e12:.2f} T) "
+
+            module_info = module._model_info
+            main_str += f"\n\t2. memory: (d_w={module_info.dense_weight_bytes}, d_g={module_info.dense_grad_bytes}, m_w={module_info.moe_weight_bytes}, m_g={module_info.moe_grad_bytes})"
+
         return main_str
 
+class RecomputeBreakModule(MetaModule):
+    def __init__(self, strategy, system, specific_name='', parent_module=None):
+        super().__init__(strategy, system, specific_name, parent_module=parent_module)
+        self.enable_recompute = False
+    
+    # TODO(sherry): no memory and not cost. Need to be implemented
+    def create_output_info(self):
+        output_info = InputOutputInfo(tensors=[t.new() for t in self.input_info.tensors])
+        return output_info
 class LinearBase(MetaModule):
     def __init__(self, input_size, output_size, strategy, system, specific_name='', parent_module=None):
         super().__init__(strategy, system, specific_name, parent_module)
@@ -1333,8 +1301,13 @@ class GroupLinearBase(LinearBase):
         self.local_expert_num = local_expert_num    
 
     def get_input_shapes_desc(self, stage):
+        assert self.input_info.tensors[0].size(0) % self.local_expert_num == 0, f'input size {self.input_info.tensors[0].size(0)} is not divisible by local_expert_num {self.local_expert_num} {self.strategy.parallelism}'
         num_tokens = self.input_info.tensors[0].size(0) // self.local_expert_num
         shape_str = f'ng={self.local_expert_num}, M={num_tokens}, N={self.output_size}, K={self.input_size}'
+
+        dtype_str = f", dtype={'fp8' if self.strategy.fp8 else 'bf16'}, out_dtype=bf16, main_grad_dtype={'bf16' if self.strategy.grad_reduce_in_bf16 else 'fp32'}"
+        # if self.strategy.fp8:
+        shape_str += dtype_str
         if stage == 'fwd':
             shape_str += ', stage=fwd, grad=False, accumulate=False, use_split_accumulator=False, single_output=True'
         elif stage == 'bwd_grad_act':

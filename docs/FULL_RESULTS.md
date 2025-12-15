@@ -3,7 +3,6 @@
 # Benchmarks
 Performance of some models on a single node. Llama3-70B was trimmed to 12 layers and DeepSeek-236B was trimmed to 4 layers.
 
-
 ## A100-Pcie
 
 ![alt text](../assets/A100-Pcie.png)
