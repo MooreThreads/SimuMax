@@ -7,7 +7,7 @@
 * [Acknowledgements](#acknowledgements)
 * [Community](#Community)
 ## Latest News
-- 📣 NEW! [App](./develop/app/README.md) - Add a user application to the SimuMax.
+- 📣 NEW! [App](./app/README.md) - Add a user application to the SimuMax.
 - 📣 NEW! [Strategy Search](./examples/search/llm_search.py) - Support strategy search.
 - 📣 NEW! [System Config Pipeline](./simu_tools/efficency_test/README.md) - Add a Pipeline to generate system file include computing and communication efficiency.
 
@@ -150,4 +150,8 @@ If you're passionate about:
 Large-scale models for MoE, Reinforcement Learning, Multi-Modal
 GPU/GPU-Cluster Training/Inference performance optimization
 
-Feel free to reach out to 1354789084@qq.com.
+Feel free to reach out to hxuerong7@gmail.com.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=MooreThreads/SimuMax&type=date&legend=top-left)](https://www.star-history.com/#MooreThreads/SimuMax&type=date&legend=top-left)  
