@@ -150,6 +150,7 @@ class PerfBase(ABC):
         tp_size = self.strategy.tp_size
         etp_size = self.strategy.etp_size
         ep_size = self.strategy.ep_size
+        edp_size = self.strategy.edp_size
         pp_size = self.strategy.pp_size
         dp_size = self.strategy.dp_size
         num_gpu_per_nodes = self.system.num_per_node    
