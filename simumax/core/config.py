@@ -438,8 +438,13 @@ class StrategyConfig(Config):
         ], "moe_dispatcher_policy must be in ['all2all', 'all2all-seq']"
         assert self.pp_schedule in [
             "1f1b",
+            "zb_h1",
             "zb_h2",
-        ], f"pp_schedule must be in ['1f1b', 'zb_h2'], got {self.pp_schedule}"
+            "gpipe",
+        ], (
+            f"pp_schedule must be in ['1f1b', 'zb_h1', 'zb_h2', 'gpipe'], "
+            f"got {self.pp_schedule}"
+        )
         if self.interleaving_size == 1:
             warnings.warn(
                 "interleaving_size is not supported yet, the configuration will be ignored."

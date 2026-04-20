@@ -13,6 +13,7 @@ Examples
 """
 
 import argparse
+import sys
 
 import matplotlib
 
@@ -26,6 +27,8 @@ from simumax.utils import (
     get_simu_system_config,
 )
 
+SUPPORTED_SCHEDULES = ["1f1b", "zb_h1", "zb_h2", "gpipe"]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -38,11 +41,20 @@ def parse_args():
     parser.add_argument("--output", default=None,
                         help="Output PNG path for the Gantt chart. "
                              "Defaults to a schedule-specific filename.")
+    parser.add_argument("--list-schedules", action="store_true",
+                        help="Print the supported pp_schedule values and exit.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    if args.list_schedules:
+        print("Supported pp_schedule values:")
+        for s in SUPPORTED_SCHEDULES:
+            print(f"  - {s}  -> default Gantt: "
+                  f"{PerfLLM.default_gantt_filename(s)}")
+        sys.exit(0)
 
     strategy_path = get_simu_strategy_config(args.strategy)
     model_path = get_simu_model_config(args.model)
@@ -64,11 +76,7 @@ def main():
 
     pp = perf_model.strategy.pp_size
     mbc = perf_model.strategy.micro_batch_num
-    default_path = {
-        "1f1b": "corrected_1F1B_pipeline.png",
-        "zb_h2": "zb_h2_pipeline.png",
-    }.get(schedule, "pp_pipeline.png")
-    out_path = args.output or default_path
+    out_path = args.output or PerfLLM.default_gantt_filename(schedule)
 
     print()
     print(f"schedule = {schedule}")
