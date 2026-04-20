@@ -441,13 +441,24 @@ class StrategyConfig(Config):
             "zb_h1",
             "zb_h2",
             "gpipe",
+            "interleaved_1f1b",
+            "zb_v",
         ], (
-            f"pp_schedule must be in ['1f1b', 'zb_h1', 'zb_h2', 'gpipe'], "
-            f"got {self.pp_schedule}"
+            f"pp_schedule must be in ['1f1b', 'zb_h1', 'zb_h2', 'gpipe', "
+            f"'interleaved_1f1b', 'zb_v'], got {self.pp_schedule}"
         )
-        if self.interleaving_size == 1:
+        if self.pp_schedule == "zb_v":
+            assert self.interleaving_size == 2, (
+                f"zb_v requires interleaving_size == 2, got {self.interleaving_size}"
+            )
+        elif self.pp_schedule == "interleaved_1f1b":
+            assert self.interleaving_size >= 1, (
+                f"interleaved_1f1b requires interleaving_size >= 1, got {self.interleaving_size}"
+            )
+        elif self.interleaving_size != 1:
             warnings.warn(
-                "interleaving_size is not supported yet, the configuration will be ignored."
+                f"interleaving_size={self.interleaving_size} is ignored for "
+                f"pp_schedule={self.pp_schedule}; only used by interleaved_1f1b and zb_v."
             )
         if self.enable_dropout:
             warnings.warn(

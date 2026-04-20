@@ -1217,6 +1217,698 @@ class PerfLLM(PerfBase):
 
         return max_time
 
+    def _run_virtual_stage_scheduler(self, pp, V, events_per_rank, vs_to_rank,
+                                     fwd_times_vs, bwd_times_vs=None,
+                                     b_times_vs=None, w_times_vs=None,
+                                     schedule_name="",
+                                     draw=False, output_path=None):
+        """Event-pass scheduler for virtual-stage schedules.
+
+        Each event is a tuple ``(kind, mb, vs_local)`` where ``kind`` is
+        one of ``"F"``, ``"B"``, ``"W"`` and the global virtual-stage
+        index is recovered via ``vs_to_rank``. Dependencies:
+        - F(mb, gvs): F(mb, gvs-1) on its owning rank, if gvs > 0.
+        - B(mb, gvs): F(mb, gvs) on this rank AND B(mb, gvs+1) on its
+          owning rank if gvs < V*pp - 1.
+        - W(mb, gvs): B(mb, gvs) on this rank.
+
+        Pass ``bwd_times_vs`` for fused-B schedules (Interleaved 1F1B) or
+        ``(b_times_vs, w_times_vs)`` for the split-B/W ZB-V schedule.
+        """
+        total_vs = V * pp
+        split = b_times_vs is not None
+
+        # Map (rank, vs_local) ↔ global vs.
+        vs_local_map = [{} for _ in range(pp)]  # rank -> {gvs: vs_local}
+        owned_vs = [[] for _ in range(pp)]
+        for gvs in range(total_vs):
+            r = vs_to_rank(gvs)
+            vs_local = len(owned_vs[r])
+            owned_vs[r].append(gvs)
+            vs_local_map[r][gvs] = vs_local
+
+        def gvs_of(r, vs_local):
+            return owned_vs[r][vs_local]
+
+        schedules = [[] for _ in range(pp)]
+        fwd_done = [{} for _ in range(pp)]  # (mb, vs_local) -> end
+        b_done = [{} for _ in range(pp)]
+        rank_t = [0.0] * pp
+        # Each rank dispatches the first not-yet-done event whose deps
+        # are ready, scanning forward through its event list rather
+        # than stalling on a blocked head (matches the rlpp ZB-V
+        # reference — necessary to break fold-rank deadlocks on
+        # cross-chunk cross-rank cycles).
+        dispatched = [set() for _ in range(pp)]
+
+        def try_schedule(r, kind, mb, vs_local):
+            gvs = gvs_of(r, vs_local)
+            if kind == "F":
+                if gvs > 0:
+                    prev_gvs = gvs - 1
+                    pr = vs_to_rank(prev_gvs)
+                    pv = vs_local_map[pr][prev_gvs]
+                    if (mb, pv) not in fwd_done[pr]:
+                        return None
+                    dep = fwd_done[pr][(mb, pv)]
+                else:
+                    dep = 0.0
+                dur = fwd_times_vs[gvs]
+                start = max(rank_t[r], dep)
+                return start, dur, start + dur
+            if kind == "B":
+                if (mb, vs_local) not in fwd_done[r]:
+                    return None
+                dep_f = fwd_done[r][(mb, vs_local)]
+                if gvs < total_vs - 1:
+                    next_gvs = gvs + 1
+                    nr = vs_to_rank(next_gvs)
+                    nv = vs_local_map[nr][next_gvs]
+                    if (mb, nv) not in b_done[nr]:
+                        return None
+                    dep_b = b_done[nr][(mb, nv)]
+                else:
+                    dep_b = 0.0
+                dur = (b_times_vs[gvs] if split else bwd_times_vs[gvs])
+                start = max(rank_t[r], dep_f, dep_b)
+                return start, dur, start + dur
+            # W
+            if (mb, vs_local) not in b_done[r]:
+                return None
+            dep = b_done[r][(mb, vs_local)]
+            dur = w_times_vs[gvs]
+            start = max(rank_t[r], dep)
+            return start, dur, start + dur
+
+        def commit(r, kind, mb, vs_local, start, dur, end):
+            schedules[r].append((kind, mb, vs_local, start, dur, end))
+            if kind == "F":
+                fwd_done[r][(mb, vs_local)] = end
+            elif kind == "B":
+                b_done[r][(mb, vs_local)] = end
+            rank_t[r] = end
+
+        def all_done():
+            return all(
+                len(dispatched[r]) == len(events_per_rank[r])
+                for r in range(pp)
+            )
+
+        while not all_done():
+            progressed = False
+            for r in range(pp):
+                if len(dispatched[r]) == len(events_per_rank[r]):
+                    continue
+                for idx, ev in enumerate(events_per_rank[r]):
+                    if idx in dispatched[r]:
+                        continue
+                    kind, mb, vs_local = ev
+                    result = try_schedule(r, kind, mb, vs_local)
+                    if result is not None:
+                        start, dur, end = result
+                        commit(r, kind, mb, vs_local, start, dur, end)
+                        dispatched[r].add(idx)
+                        progressed = True
+                        break
+            if not progressed:
+                blocked = []
+                for r in range(pp):
+                    heads = [
+                        (i, events_per_rank[r][i])
+                        for i in range(len(events_per_rank[r]))
+                        if i not in dispatched[r]
+                    ][:3]
+                    blocked.append(f"r{r} next: {heads}")
+                raise RuntimeError(
+                    f"{schedule_name} scheduler deadlock; blocked:\n"
+                    + "\n".join(blocked)
+                )
+
+        max_time = max(s[-1][5] for s in schedules)
+
+        if draw:
+            fig, ax = plt.subplots(figsize=(16, 5))
+            colors = {"F": "#6b8ec9", "B": "#6db5b5", "W": "#5fa75f"}
+            for r, tasks in enumerate(schedules):
+                for kind, mb, vs_local, start, dur, end in tasks:
+                    ax.barh(y=pp - 1 - r, width=dur, left=start,
+                            height=0.6, color=colors[kind], edgecolor="black")
+                    txt_color = "black" if vs_local == 0 else "white"
+                    label = f"{kind}{mb + 1}"
+                    ax.text(start + dur / 2, pp - 1 - r, label,
+                            va="center", ha="center", fontsize=7,
+                            color=txt_color)
+            ax.set_yticks(range(pp))
+            ax.set_yticklabels([f"Rank {i}" for i in reversed(range(pp))])
+            ax.set_xlabel("Time")
+            ax.set_title(
+                f"{schedule_name} Pipeline Timeline "
+                f"(pp={pp}, V={V}, total_vs={total_vs})"
+            )
+            plt.grid(True, axis="x", linestyle="--", alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(output_path or self.default_gantt_filename(schedule_name))
+            plt.close(fig)
+
+        return max_time
+
+    def calculate_interleaved_1f1b_bubble(self, pp, mbc, V, fwd_times_vs,
+                                          bwd_times_vs, draw=False,
+                                          output_path=None):
+        """Interleaved 1F1B (Narayanan et al. 2021, Megatron).
+
+        Each rank owns ``V`` non-contiguous virtual stages via round-robin
+        mapping: rank ``g`` ↔ global vs ``{g, g+p, ..., g+(V-1)*p}``.
+        Warmup on rank ``g``: ``(V-1)*p + (p - g - 1)`` Fs. Steady state
+        alternates (B, F) at the virtual-stage level; drain is remaining
+        Bs.
+        """
+        def vs_to_rank(gvs):
+            return gvs % pp
+
+        # Build per-rank F / B sequences in microbatch-group-major order.
+        # Forward: for each group of pp mbs, cycle vs_local=0..V-1, firing F
+        # for each mb in the group.
+        # Backward: same grouping, but vs_local descends (V-1..0) since
+        # gradients flow back through the highest virtual stage first.
+        def build_mb_groups(n):
+            groups = []
+            n_full = n // pp
+            for gi in range(n_full):
+                groups.append(list(range(gi * pp, (gi + 1) * pp)))
+            if n_full * pp < n:
+                groups.append(list(range(n_full * pp, n)))
+            return groups
+
+        groups = build_mb_groups(mbc)
+        per_rank_f_seq = []
+        per_rank_b_seq = []
+        for _g in range(pp):
+            f_seq = []
+            b_seq = []
+            for grp in groups:
+                for vs_local in range(V):
+                    for mb in grp:
+                        f_seq.append((mb, vs_local))
+                for vs_local in range(V - 1, -1, -1):
+                    for mb in grp:
+                        b_seq.append((mb, vs_local))
+            per_rank_f_seq.append(f_seq)
+            per_rank_b_seq.append(b_seq)
+
+        # Megatron-LM formula: warmup = 2*(p - g - 1) + (V - 1)*p.
+        # Steady state is 1F1B at the virtual-stage level: (F, B) pairs.
+        # Cooldown drains remaining B's.
+        events_per_rank = []
+        for g in range(pp):
+            f_seq = per_rank_f_seq[g]
+            b_seq = per_rank_b_seq[g]
+            warmup = min(2 * (pp - g - 1) + (V - 1) * pp, len(f_seq))
+            warmup = max(1, warmup)
+            events = []
+            f_idx = 0
+            b_idx = 0
+            for _ in range(warmup):
+                mb, vs_local = f_seq[f_idx]
+                events.append(("F", mb, vs_local)); f_idx += 1
+            while f_idx < len(f_seq):
+                mb_f, vs_f = f_seq[f_idx]
+                events.append(("F", mb_f, vs_f)); f_idx += 1
+                mb_b, vs_b = b_seq[b_idx]
+                events.append(("B", mb_b, vs_b)); b_idx += 1
+            while b_idx < len(b_seq):
+                mb_b, vs_b = b_seq[b_idx]
+                events.append(("B", mb_b, vs_b)); b_idx += 1
+            events_per_rank.append(events)
+
+        return self._run_virtual_stage_scheduler(
+            pp, V, events_per_rank, vs_to_rank,
+            fwd_times_vs=fwd_times_vs, bwd_times_vs=bwd_times_vs,
+            schedule_name="Interleaved 1F1B",
+            draw=draw, output_path=output_path,
+        )
+
+    def _run_vs_greedy_scheduler_split(self, pp, V, f_queues_per_vs,
+                                         b_queues_per_vs, w_queues_per_vs,
+                                         vs_to_rank, fwd_times_vs, b_times_vs,
+                                         w_times_vs, mem_limit,
+                                         schedule_name="",
+                                         draw=False, output_path=None):
+        """Greedy scheduler with per-(rank, vs_local) queues.
+
+        On each rank, F/B/W queues are indexed by vs_local so that the
+        scheduler can prefer firing the action that unblocks the chain.
+        Priority within a rank: B(vs=V-1..0) > F(vs=V-1..0) > W(vs=V-1..0)
+        — B first to advance the critical path, F next to feed future
+        B's / keep the pipeline full, W last (deferred until needed to
+        free memory). Each queue is processed head-to-tail per mb.
+        """
+        total_vs = V * pp
+        vs_local_map = [{} for _ in range(pp)]
+        owned_vs = [[] for _ in range(pp)]
+        for gvs in range(total_vs):
+            r = vs_to_rank(gvs)
+            owned_vs[r].append(gvs)
+            vs_local_map[r][gvs] = len(owned_vs[r]) - 1
+
+        def gvs_of(r, vs_local):
+            return owned_vs[r][vs_local]
+
+        schedules = [[] for _ in range(pp)]
+        fwd_done = [{} for _ in range(pp)]
+        b_done = [{} for _ in range(pp)]
+        rank_t = [0.0] * pp
+        # f_ptr[r][vs] / b_ptr[r][vs] / w_ptr[r][vs]
+        f_ptr = [[0] * V for _ in range(pp)]
+        b_ptr = [[0] * V for _ in range(pp)]
+        w_ptr = [[0] * V for _ in range(pp)]
+        live = [0] * pp
+
+        def try_F(r, mb, vs_local):
+            gvs = gvs_of(r, vs_local)
+            if gvs > 0:
+                prev_gvs = gvs - 1
+                pr = vs_to_rank(prev_gvs)
+                pv = vs_local_map[pr][prev_gvs]
+                if (mb, pv) not in fwd_done[pr]:
+                    return None
+                dep = fwd_done[pr][(mb, pv)]
+            else:
+                dep = 0.0
+            dur = fwd_times_vs[gvs]
+            start = max(rank_t[r], dep)
+            return start, dur, start + dur
+
+        def try_B(r, mb, vs_local):
+            gvs = gvs_of(r, vs_local)
+            if (mb, vs_local) not in fwd_done[r]:
+                return None
+            dep_f = fwd_done[r][(mb, vs_local)]
+            if gvs < total_vs - 1:
+                next_gvs = gvs + 1
+                nr = vs_to_rank(next_gvs)
+                nv = vs_local_map[nr][next_gvs]
+                if (mb, nv) not in b_done[nr]:
+                    return None
+                dep_b = b_done[nr][(mb, nv)]
+            else:
+                dep_b = 0.0
+            dur = b_times_vs[gvs]
+            start = max(rank_t[r], dep_f, dep_b)
+            return start, dur, start + dur
+
+        def try_W(r, mb, vs_local):
+            if (mb, vs_local) not in b_done[r]:
+                return None
+            gvs = gvs_of(r, vs_local)
+            dep = b_done[r][(mb, vs_local)]
+            dur = w_times_vs[gvs]
+            start = max(rank_t[r], dep)
+            return start, dur, start + dur
+
+        def commit(r, kind, mb, vs_local, start, dur, end):
+            schedules[r].append((kind, mb, vs_local, start, dur, end))
+            if kind == "F":
+                fwd_done[r][(mb, vs_local)] = end
+                live[r] += 1
+            elif kind == "B":
+                b_done[r][(mb, vs_local)] = end
+            else:
+                live[r] -= 1
+            rank_t[r] = end
+
+        def remaining():
+            for r in range(pp):
+                for vs in range(V):
+                    if f_ptr[r][vs] < len(f_queues_per_vs[r][vs]):
+                        return True
+                    if b_ptr[r][vs] < len(b_queues_per_vs[r][vs]):
+                        return True
+                    if w_ptr[r][vs] < len(w_queues_per_vs[r][vs]):
+                        return True
+            return False
+
+        while remaining():
+            progressed = False
+            order = sorted(range(pp), key=lambda r: rank_t[r])
+            for r in order:
+                fired = False
+                # Priority: B (vs=V-1..0) > F (vs=V-1..0) > W (vs=V-1..0).
+                for vs in range(V - 1, -1, -1):
+                    if b_ptr[r][vs] < len(b_queues_per_vs[r][vs]):
+                        mb = b_queues_per_vs[r][vs][b_ptr[r][vs]]
+                        res = try_B(r, mb, vs)
+                        if res is not None:
+                            commit(r, "B", mb, vs, *res)
+                            b_ptr[r][vs] += 1
+                            fired = True; progressed = True; break
+                if fired:
+                    continue
+                for vs in range(V - 1, -1, -1):
+                    if (f_ptr[r][vs] < len(f_queues_per_vs[r][vs])
+                            and live[r] < mem_limit):
+                        mb = f_queues_per_vs[r][vs][f_ptr[r][vs]]
+                        res = try_F(r, mb, vs)
+                        if res is not None:
+                            commit(r, "F", mb, vs, *res)
+                            f_ptr[r][vs] += 1
+                            fired = True; progressed = True; break
+                if fired:
+                    continue
+                for vs in range(V - 1, -1, -1):
+                    if w_ptr[r][vs] < len(w_queues_per_vs[r][vs]):
+                        mb = w_queues_per_vs[r][vs][w_ptr[r][vs]]
+                        res = try_W(r, mb, vs)
+                        if res is not None:
+                            commit(r, "W", mb, vs, *res)
+                            w_ptr[r][vs] += 1
+                            fired = True; progressed = True; break
+            if not progressed:
+                blocked = []
+                for r in range(pp):
+                    heads = []
+                    for vs in range(V):
+                        if f_ptr[r][vs] < len(f_queues_per_vs[r][vs]):
+                            heads.append(f"F(mb={f_queues_per_vs[r][vs][f_ptr[r][vs]]}, vs={vs})")
+                        if b_ptr[r][vs] < len(b_queues_per_vs[r][vs]):
+                            heads.append(f"B(mb={b_queues_per_vs[r][vs][b_ptr[r][vs]]}, vs={vs})")
+                        if w_ptr[r][vs] < len(w_queues_per_vs[r][vs]):
+                            heads.append(f"W(mb={w_queues_per_vs[r][vs][w_ptr[r][vs]]}, vs={vs})")
+                    blocked.append(f"r{r} live={live[r]} {heads}")
+                raise RuntimeError(
+                    f"{schedule_name} split greedy deadlock:\n"
+                    + "\n".join(blocked)
+                )
+
+        max_time = max(s[-1][5] for s in schedules)
+
+        if draw:
+            fig, ax = plt.subplots(figsize=(16, 5))
+            colors = {"F": "#6b8ec9", "B": "#6db5b5", "W": "#5fa75f"}
+            for r, tasks in enumerate(schedules):
+                for kind, mb, vs_local, start, dur, end in tasks:
+                    ax.barh(y=pp - 1 - r, width=dur, left=start,
+                            height=0.6, color=colors[kind], edgecolor="black")
+                    txt_color = "black" if vs_local == 0 else "white"
+                    label = f"{kind}{mb + 1}"
+                    ax.text(start + dur / 2, pp - 1 - r, label,
+                            va="center", ha="center", fontsize=7,
+                            color=txt_color)
+            ax.set_yticks(range(pp))
+            ax.set_yticklabels([f"Rank {i}" for i in reversed(range(pp))])
+            ax.set_xlabel("Time")
+            ax.set_title(
+                f"{schedule_name} Pipeline Timeline "
+                f"(pp={pp}, V={V}, total_vs={total_vs})"
+            )
+            plt.grid(True, axis="x", linestyle="--", alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(output_path or self.default_gantt_filename(schedule_name))
+            plt.close(fig)
+
+        return max_time
+
+    def _run_vs_greedy_scheduler(self, pp, V, f_queues, b_queues, w_queues,
+                                  vs_to_rank, fwd_times_vs, b_times_vs,
+                                  w_times_vs, mem_limit, schedule_name="",
+                                  draw=False, output_path=None):
+        """Greedy event-driven scheduler for virtual-stage schedules.
+
+        Each rank maintains independent F/B/W queues processed in-order
+        per queue, but the queue to fire from each step is chosen
+        greedily: prefer W (free memory), then B (critical path), then F
+        (only when ``live < mem_limit``). ``live[r] = fires[F] - fires[W]``
+        is the per-rank activation count bounded by ``mem_limit``.
+
+        Dependencies (same as the strict scheduler):
+        - F(mb, gvs): F(mb, gvs-1) on its owning rank.
+        - B(mb, gvs): F(mb, gvs) locally AND B(mb, gvs+1) on its owning rank.
+        - W(mb, gvs): B(mb, gvs) locally.
+        """
+        total_vs = V * pp
+
+        vs_local_map = [{} for _ in range(pp)]
+        owned_vs = [[] for _ in range(pp)]
+        for gvs in range(total_vs):
+            r = vs_to_rank(gvs)
+            owned_vs[r].append(gvs)
+            vs_local_map[r][gvs] = len(owned_vs[r]) - 1
+
+        def gvs_of(r, vs_local):
+            return owned_vs[r][vs_local]
+
+        schedules = [[] for _ in range(pp)]
+        fwd_done = [{} for _ in range(pp)]
+        b_done = [{} for _ in range(pp)]
+        rank_t = [0.0] * pp
+        f_ptr = [0] * pp
+        b_ptr = [0] * pp
+        w_ptr = [0] * pp
+        live = [0] * pp
+
+        def try_F(r, mb, vs_local):
+            gvs = gvs_of(r, vs_local)
+            if gvs > 0:
+                prev_gvs = gvs - 1
+                pr = vs_to_rank(prev_gvs)
+                pv = vs_local_map[pr][prev_gvs]
+                if (mb, pv) not in fwd_done[pr]:
+                    return None
+                dep = fwd_done[pr][(mb, pv)]
+            else:
+                dep = 0.0
+            dur = fwd_times_vs[gvs]
+            start = max(rank_t[r], dep)
+            return start, dur, start + dur
+
+        def try_B(r, mb, vs_local):
+            gvs = gvs_of(r, vs_local)
+            if (mb, vs_local) not in fwd_done[r]:
+                return None
+            dep_f = fwd_done[r][(mb, vs_local)]
+            if gvs < total_vs - 1:
+                next_gvs = gvs + 1
+                nr = vs_to_rank(next_gvs)
+                nv = vs_local_map[nr][next_gvs]
+                if (mb, nv) not in b_done[nr]:
+                    return None
+                dep_b = b_done[nr][(mb, nv)]
+            else:
+                dep_b = 0.0
+            dur = b_times_vs[gvs]
+            start = max(rank_t[r], dep_f, dep_b)
+            return start, dur, start + dur
+
+        def try_W(r, mb, vs_local):
+            if (mb, vs_local) not in b_done[r]:
+                return None
+            gvs = gvs_of(r, vs_local)
+            dep = b_done[r][(mb, vs_local)]
+            dur = w_times_vs[gvs]
+            start = max(rank_t[r], dep)
+            return start, dur, start + dur
+
+        def commit(r, kind, mb, vs_local, start, dur, end):
+            schedules[r].append((kind, mb, vs_local, start, dur, end))
+            if kind == "F":
+                fwd_done[r][(mb, vs_local)] = end
+                live[r] += 1
+            elif kind == "B":
+                b_done[r][(mb, vs_local)] = end
+            else:  # W
+                live[r] -= 1
+            rank_t[r] = end
+
+        def remaining():
+            return any(f_ptr[r] < len(f_queues[r]) or
+                       b_ptr[r] < len(b_queues[r]) or
+                       w_ptr[r] < len(w_queues[r]) for r in range(pp))
+
+        while remaining():
+            progressed = False
+            # Fire on the rank with the lowest rank_t first to keep
+            # dependencies unblocked as early as possible.
+            order = sorted(range(pp), key=lambda r: rank_t[r])
+            for r in order:
+                # Priority: B (critical path) -> W (free memory) -> F.
+                if b_ptr[r] < len(b_queues[r]):
+                    mb, vs = b_queues[r][b_ptr[r]]
+                    res = try_B(r, mb, vs)
+                    if res is not None:
+                        commit(r, "B", mb, vs, *res)
+                        b_ptr[r] += 1
+                        progressed = True
+                        continue
+                if w_ptr[r] < len(w_queues[r]):
+                    mb, vs = w_queues[r][w_ptr[r]]
+                    res = try_W(r, mb, vs)
+                    if res is not None:
+                        commit(r, "W", mb, vs, *res)
+                        w_ptr[r] += 1
+                        progressed = True
+                        continue
+                if f_ptr[r] < len(f_queues[r]) and live[r] < mem_limit:
+                    mb, vs = f_queues[r][f_ptr[r]]
+                    res = try_F(r, mb, vs)
+                    if res is not None:
+                        commit(r, "F", mb, vs, *res)
+                        f_ptr[r] += 1
+                        progressed = True
+                        continue
+            if not progressed:
+                blocked = []
+                for r in range(pp):
+                    heads = []
+                    if f_ptr[r] < len(f_queues[r]):
+                        heads.append(f"F{f_queues[r][f_ptr[r]]}")
+                    if b_ptr[r] < len(b_queues[r]):
+                        heads.append(f"B{b_queues[r][b_ptr[r]]}")
+                    if w_ptr[r] < len(w_queues[r]):
+                        heads.append(f"W{w_queues[r][w_ptr[r]]}")
+                    blocked.append(
+                        f"r{r} live={live[r]} heads={heads}"
+                    )
+                raise RuntimeError(
+                    f"{schedule_name} greedy deadlock:\n" + "\n".join(blocked)
+                )
+
+        max_time = max(s[-1][5] for s in schedules)
+
+        if draw:
+            fig, ax = plt.subplots(figsize=(16, 5))
+            colors = {"F": "#6b8ec9", "B": "#6db5b5", "W": "#5fa75f"}
+            for r, tasks in enumerate(schedules):
+                for kind, mb, vs_local, start, dur, end in tasks:
+                    gvs = gvs_of(r, vs_local)
+                    ax.barh(y=pp - 1 - r, width=dur, left=start,
+                            height=0.6, color=colors[kind], edgecolor="black")
+                    label = f"{kind}{mb}.{gvs}"
+                    ax.text(start + dur / 2, pp - 1 - r, label,
+                            va="center", ha="center", fontsize=7, color="black")
+            ax.set_yticks(range(pp))
+            ax.set_yticklabels([f"Rank {i}" for i in reversed(range(pp))])
+            ax.set_xlabel("Time")
+            ax.set_title(
+                f"{schedule_name} Pipeline Timeline "
+                f"(pp={pp}, V={V}, total_vs={total_vs})"
+            )
+            plt.grid(True, axis="x", linestyle="--", alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(output_path or self.default_gantt_filename(schedule_name))
+            plt.close(fig)
+
+        return max_time
+
+    def calculate_zb_v_bubble(self, pp, mbc, fwd_times_vs, b_times_vs,
+                              w_times_vs, draw=False, output_path=None):
+        """ZB-V schedule (Qi et al. 2024, §6; rlpp reference).
+
+        V=2 virtual stages per rank with V-shape mapping: rank ``g``
+        owns ``chunk0 = g`` (early) and ``chunk1 = 2p-1-g`` (late).
+        Pyramid assignment balances activation memory: rank 0 pairs
+        embed-heavy first stage with LM-head-heavy last stage.
+
+        Per-rank event sequence (four phases, from rlpp/zb_v.py):
+
+        1. **Warmup 1a**: ``2(p-g)-1`` F(chunk0) (mb=0..k-1). For g=0
+           this is 7 F's — rank 0 loads the first chunk of the first 7
+           microbatches; then chunk1 of mb=0 returns (pipeline wraps
+           through all ranks and folds back).
+        2. **Warmup 1b**: ``g`` interleaved ``[F(chunk1), F(chunk0)]``
+           pairs, filling the fold-side bubble.
+        3. **Warmup 1c**: ``p-g`` cycles of
+           ``[F(chunk1), B(chunk1), W(chunk1)]`` — immediately frees
+           late-stage memory, keeping peak at ``2p`` live half-chunks.
+        4. **Steady state**: alternating
+           ``F(chunk0), B(chunk0), W(chunk0), F(chunk1), B(chunk1),
+           W(chunk1)`` per mb until F's exhaust.
+        5. **Cooldown**: ``g`` pairs of B(chunk0)+B(chunk1), then
+           ``p-g`` pairs of B(chunk0)+W(chunk0).
+        6. **Tail**: remaining W's.
+
+        Dispatch uses scan-and-skip (not strict head-of-queue) to
+        avoid deadlock on fold-rank cross-chunk cycles.
+        """
+        V = 2
+
+        def vs_to_rank(gvs):
+            return gvs if gvs < pp else (2 * pp - 1 - gvs)
+
+        # vs_local for a given rank g: chunk0 → vs_local=0, chunk1 →
+        # vs_local=1 (matches V-shape ownership order in
+        # _run_virtual_stage_scheduler: gvs=g first, gvs=2p-1-g second).
+        CHUNK0 = 0
+        CHUNK1 = 1
+
+        events_per_rank = []
+        for g in range(pp):
+            f0 = f1 = b0 = b1 = w0 = w1 = 0
+            ops = []
+
+            warmup_n1 = 2 * (pp - g) - 1
+            for _ in range(warmup_n1):
+                if f0 < mbc:
+                    ops.append(("F", f0, CHUNK0)); f0 += 1
+
+            warmup_n2 = g
+            for _ in range(warmup_n2):
+                if f1 < mbc:
+                    ops.append(("F", f1, CHUNK1)); f1 += 1
+                if f0 < mbc:
+                    ops.append(("F", f0, CHUNK0)); f0 += 1
+
+            warmup_n3 = pp - g
+            for _ in range(warmup_n3):
+                if f1 < mbc:
+                    ops.append(("F", f1, CHUNK1)); f1 += 1
+                if b1 < f1 and b1 < mbc:
+                    ops.append(("B", b1, CHUNK1)); b1 += 1
+                if w1 < b1 and w1 < mbc:
+                    ops.append(("W", w1, CHUNK1)); w1 += 1
+
+            while f0 < mbc or f1 < mbc:
+                if f0 < mbc:
+                    ops.append(("F", f0, CHUNK0)); f0 += 1
+                if b0 < f0 and b0 < mbc:
+                    ops.append(("B", b0, CHUNK0)); b0 += 1
+                if w0 < b0 and w0 < mbc:
+                    ops.append(("W", w0, CHUNK0)); w0 += 1
+                if f1 < mbc:
+                    ops.append(("F", f1, CHUNK1)); f1 += 1
+                if b1 < f1 and b1 < mbc:
+                    ops.append(("B", b1, CHUNK1)); b1 += 1
+                if w1 < b1 and w1 < mbc:
+                    ops.append(("W", w1, CHUNK1)); w1 += 1
+
+            cooldown_n1 = g
+            for _ in range(cooldown_n1):
+                if b0 < mbc:
+                    ops.append(("B", b0, CHUNK0)); b0 += 1
+                if b1 < mbc:
+                    ops.append(("B", b1, CHUNK1)); b1 += 1
+
+            cooldown_n2 = pp - g
+            for _ in range(cooldown_n2):
+                if b0 < mbc:
+                    ops.append(("B", b0, CHUNK0)); b0 += 1
+                if w0 < b0 and w0 < mbc:
+                    ops.append(("W", w0, CHUNK0)); w0 += 1
+
+            while w1 < mbc:
+                ops.append(("W", w1, CHUNK1)); w1 += 1
+            while w0 < mbc:
+                ops.append(("W", w0, CHUNK0)); w0 += 1
+
+            events_per_rank.append(ops)
+
+        return self._run_virtual_stage_scheduler(
+            pp, V, events_per_rank, vs_to_rank,
+            fwd_times_vs=fwd_times_vs,
+            b_times_vs=b_times_vs, w_times_vs=w_times_vs,
+            schedule_name="ZB-V",
+            draw=draw, output_path=output_path,
+        )
+
     @staticmethod
     def default_gantt_filename(schedule_name):
         """Canonical Gantt PNG filename per schedule.
@@ -1224,7 +1916,7 @@ class PerfLLM(PerfBase):
         Accepts either the config-level key (e.g. ``"zb_h1"``) or the
         human-readable name used in chart titles (``"ZB-H1"``).
         """
-        key = schedule_name.lower().replace("-", "_")
+        key = schedule_name.lower().replace("-", "_").replace(" ", "_")
         mapping = {
             "1f1b": "corrected_1F1B_pipeline.png",
             "zb_h1": "zb_h1_pipeline.png",
@@ -1269,6 +1961,38 @@ class PerfLLM(PerfBase):
             w_times.append(w)
         return forward_times, b_times, w_times
 
+    def _per_virtual_stage_times(self, V, vs_to_rank, split_bw=False):
+        """Per-virtual-stage timing arrays of length ``V * pp``.
+
+        ``vs_to_rank(gvs)`` maps a global virtual-stage index to the rank
+        that owns it. Each virtual stage inherits its rank's single-batch
+        compute time divided by ``V`` (uniform layer split). Returns
+        ``(fwd, bwd)`` if ``split_bw`` is False, else ``(fwd, b, w)``.
+        """
+        pp = self.strategy.pp_size
+        if split_bw:
+            fwd_r, b_r, w_r = self._per_rank_fwd_b_w_times()
+        else:
+            fwd_r, bwd_r = self._per_rank_fwd_bwd_times()
+        total_vs = V * pp
+        fwd_vs = [0.0] * total_vs
+        if split_bw:
+            b_vs = [0.0] * total_vs
+            w_vs = [0.0] * total_vs
+        else:
+            bwd_vs = [0.0] * total_vs
+        for gvs in range(total_vs):
+            r = vs_to_rank(gvs)
+            fwd_vs[gvs] = fwd_r[r] / V
+            if split_bw:
+                b_vs[gvs] = b_r[r] / V
+                w_vs[gvs] = w_r[r] / V
+            else:
+                bwd_vs[gvs] = bwd_r[r] / V
+        if split_bw:
+            return fwd_vs, b_vs, w_vs
+        return fwd_vs, bwd_vs
+
     def _compute_pp_total_time(self, draw=False, output_path=None):
         pp = self.strategy.pp_size
         mbc = self.strategy.micro_batch_num
@@ -1280,6 +2004,27 @@ class PerfLLM(PerfBase):
                          else self.calculate_zb_h2_bubble)
             return scheduler(
                 pp, mbc, fwd_times, b_times, w_times,
+                draw=draw, output_path=output_path,
+            )
+
+        if schedule == "interleaved_1f1b":
+            V = self.strategy.interleaving_size
+            fwd_vs, bwd_vs = self._per_virtual_stage_times(
+                V, vs_to_rank=lambda gvs: gvs % pp, split_bw=False
+            )
+            return self.calculate_interleaved_1f1b_bubble(
+                pp, mbc, V, fwd_vs, bwd_vs,
+                draw=draw, output_path=output_path,
+            )
+
+        if schedule == "zb_v":
+            V = 2
+            fwd_vs, b_vs, w_vs = self._per_virtual_stage_times(
+                V, vs_to_rank=lambda gvs: gvs if gvs < pp else (2 * pp - 1 - gvs),
+                split_bw=True,
+            )
+            return self.calculate_zb_v_bubble(
+                pp, mbc, fwd_vs, b_vs, w_vs,
                 draw=draw, output_path=output_path,
             )
 

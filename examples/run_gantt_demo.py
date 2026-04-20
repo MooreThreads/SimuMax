@@ -27,7 +27,8 @@ from simumax.utils import (
     get_simu_system_config,
 )
 
-SUPPORTED_SCHEDULES = ["1f1b", "zb_h1", "zb_h2", "gpipe"]
+SUPPORTED_SCHEDULES = ["1f1b", "zb_h1", "zb_h2", "gpipe",
+                       "interleaved_1f1b", "zb_v"]
 
 
 def parse_args():
