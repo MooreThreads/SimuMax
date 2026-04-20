@@ -3,7 +3,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 import numpy as np
 
-DEVICE_BW = 900 # H100机内标称带宽
+DEVICE_BW = 900 # H100 intra-node nominal bandwidth
 '''
 https://www.advancedclustering.com/wp-content/uploads/2022/03/gtc22-whitepaper-hopper.pdf
     While the 4-
@@ -16,22 +16,22 @@ https://www.advancedclustering.com/wp-content/uploads/2022/03/gtc22-whitepaper-h
 
 def get_bws(data, scale=1, ranks=8, title=""):
     x = []
-    data = data.strip().split('\n')  # 移除头尾空行
+    data = data.strip().split('\n')  # Remove leading/trailing empty lines
     for d in data:
         t = d.split()
         n, cost, bw1, bw2 = t[0], t[5], t[6], t[7]
         x.append([n, cost, bw1, bw2])
     y = np.array(x, dtype=float)
 
-    # X: 通信量（B）
+    # X: comm volume (B)
     n = y[:, 0] * (ranks-1) / ranks * scale
     cost = y[:, 1]
 
-    # 拟合
+    # Fit
     a, b = np.polyfit(n[:11], cost[:11], 1)
     show = False
     if show:
-        # -------- 第1张图：性能数据 + 拟合 --------
+        # -------- Figure 1: performance data + fit --------
         plt.figure(figsize=(8, 4))
         plt.plot(n, cost, marker='o', label='Data')
         plt.plot(n, n*a + b, '--', label='Linear Fit')
@@ -42,7 +42,7 @@ def get_bws(data, scale=1, ranks=8, title=""):
         plt.legend()
         plt.grid(True, which='both', linestyle='--', alpha=0.5)
 
-        # -------- 第2张图：相对误差 --------
+        # -------- Figure 2: relative error --------
         plt.figure(figsize=(8, 4))
         rel_error = np.abs(n*a + b - cost) / cost
         plt.plot(n, rel_error, marker='x', color='red')
@@ -52,13 +52,13 @@ def get_bws(data, scale=1, ranks=8, title=""):
         plt.title(f"Relative Fit Error- {title}")
         plt.grid(True, which='both', linestyle='--', alpha=0.5)
 
-    # -------- 返回估算带宽 --------
+    # -------- Return estimated bandwidth --------
     bw = 1 / a / 1024**3 * 1000**2
     eff = round(bw / DEVICE_BW , 4) 
     
     latency_per_p2p = b / ((ranks-1) * scale)
     print(f"{title} Estimated Bandwidth: {bw:.2f} GB/s, Efficiency: {eff:.4f}, Latency per P2P: {latency_per_p2p:.2f} μs")
-    return bw, eff, latency_per_p2p  # 带宽 (GB/s), 起始开销（μs）
+    return bw, eff, latency_per_p2p  # bandwidth (GB/s), startup overhead (μs)
 
 get_bws(data='''     1048576        524288  bfloat16     sum      -1    46.24   22.68   39.69      0    45.89   22.85   39.99      0
      2097152       1048576  bfloat16     sum      -1    45.71   45.88   80.29      0    45.82   45.77   80.10      0

@@ -19,16 +19,16 @@ from simu_tools.efficency_test.utils import get_system_name, sync_device, get_to
 
 def prepare_tensors(B: int, M: int, K: int, N: int,  dtype,  device):
     """
-    准备输入矩阵和workspace
+    Prepare input matrices and workspace.
     Args:
         B: batch size
-        M: A矩阵行数
-        N: B矩阵列数
-        K: A矩阵列数/B矩阵行数
+        M: number of rows in A
+        N: number of columns in B
+        K: number of columns in A / number of rows in B
     Returns:
-        A: shape [B, M, K] (TN布局)
-        B: shape [K, N] (TN布局)
-        workspace: 预分配空间
+        A: shape [B, M, K] (TN layout)
+        B: shape [K, N] (TN layout)
+        workspace: pre-allocated scratch space
     """
     if dtype == 'bf16':
         dtype = torch.bfloat16
@@ -38,14 +38,14 @@ def prepare_tensors(B: int, M: int, K: int, N: int,  dtype,  device):
     A = torch.randn((B, M, K), device=device, dtype=dtype)
     B_matrix = torch.randn((K, N), device=device, dtype=dtype)
     
-    # 为general_gemm分配workspace (典型大小32MB)
+    # Allocate workspace for general_gemm (typical size 32MB)
     workspace = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=device)
-    
+
     return A, B_matrix, workspace
 
 def run_te_gemm(B: int, M: int, K: int, N: int, dtype, device, layout, accumulate, out_dtype, test_steps, warmup_steps):
     """
-    执行general_gemm操作
+    Execute a general_gemm operation.
     Args:
         A: [B, M, K]
         B: [K, N]
@@ -70,7 +70,7 @@ def run_te_gemm(B: int, M: int, K: int, N: int, dtype, device, layout, accumulat
         output = torch.empty((M, N), device=device, dtype=out_dtype)
     else:
         raise ValueError("layout must be 'NN' or 'TN' or 'NN'")
-    # 为general_gemm分配workspace (典型大小32MB)
+    # Allocate workspace for general_gemm (typical size 32MB)
     print(f'dtype: {dtype}, out_dtype: {out_dtype}, layout: {layout}')
     if dtype == 'fp8':
         # quantizer = Float8Quantizer(torch.tensor(1.0), amax=torch.tensor(1.0), fp8_dtype=tex.DType.kBFloat16)
@@ -90,7 +90,7 @@ def run_te_gemm(B: int, M: int, K: int, N: int, dtype, device, layout, accumulat
     sync_device(device)
 
     for i in range(test_steps):
-        # 处理batch维度：对每个batch元素执行GEMM
+        # Handle the batch dimension: run GEMM for each batch element
         if i == warmup_steps:
             sync_device(device)
             start_time = time.time()
@@ -127,7 +127,7 @@ def run_te_gemm(B: int, M: int, K: int, N: int, dtype, device, layout, accumulat
                 )
                 
         """
-        # 检查output中是否存在-1e10，如果存在则说明有错误
+        # Check whether output contains -1e10 (indicates an error)
         # if torch.any(output == -1e10):
         #     raise ValueError("general_gemm returned an invalid value")
     sync_device(device)
@@ -142,7 +142,7 @@ def plot_topk(ops_info, topk, save_path):
     plt.show()
 
 def test_gemm_efficency(gemm_shape_list, max_tflops, device, save_root, dtype, res, test_steps, warmup_steps):
-    # 遍历df每一行，拿到b, m n k， 测试gemm shape的效率，记录在efficency中 
+    # Iterate over each row of df to get b, m, n, k; benchmark the gemm shape efficiency and record it in efficency
     efficiency_file_path = f'{save_root}/gemm_efficency.json'
     matmul_key = 'matmul' if dtype == 'bf16' else 'fp8_matmul'
     if os.path.exists(efficiency_file_path):

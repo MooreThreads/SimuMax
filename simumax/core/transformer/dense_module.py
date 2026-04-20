@@ -420,7 +420,7 @@ class LinearCol(LinearBase):
         return weight_size, input_size, output_size
     
     def _comp_leaf_act_info_impl(self):
-        # self._act_info.activation_mem_cache = self._comp_input_cache_size() # 拿到输入的cache信息, all-gather before
+        # self._act_info.activation_mem_cache = self._comp_input_cache_size() # get input cache info, all-gather before
         self._act_info.activation_mem_cache = (
             self.micro_hidden_state_size * self.a_element_size
         )
@@ -1386,7 +1386,7 @@ class MLACoreAttention(CoreAttention):
             # TODO(sherry): add cache outputs
             # if self.cache_outputs:
             #     print(f"~~~~~~~ CoreAttention, FA cache output! mem={output_grad_size * self.element_size/1024/1024}MB, self.element_size={self.element_size}")
-            #     self._act_info.activation_mem_cache += output_grad_size* self.element_size # TODO(sherry)：check this, fa，需要cache output
+            #     self._act_info.activation_mem_cache += output_grad_size* self.element_size # TODO(sherry): check this; for FA, output needs to be cached
             return
         # kv repeat
         softmax_size = batch_size * self.head_num * seq_len * seq_len
@@ -1858,7 +1858,7 @@ class ParallelCE(MetaModule):
         # self._act_info.fwd_peak_mem_no_cache = ce_fwd_peak_no_cache # FIXME(sherry): why double?
         self._act_info.fwd_peak_mem_no_cache = ce_cache 
         self._act_info.fwd_peak_prev_cache_mem = 0
-        self._act_info.bwd_peak_mem_no_cache = ce_cache # FIXME(sherry)：需要double吗？
+        self._act_info.bwd_peak_mem_no_cache = ce_cache # FIXME(sherry): should this be doubled?
         self._act_info.bwd_peak_prev_cache_mem = 0
         self._act_info_with_recomp = self._act_info
 
@@ -2273,7 +2273,7 @@ class MLAAttention(MetaModule):
                 system=system,
                 v_head_dim=config.v_head_dim
             )
-        # TODO(sherry)：selective_recompute中，linear_out不做recompute
+        # TODO(sherry): in selective_recompute, linear_out is not recomputed
         self.linear_out_proj = LinearCol_(
                 layer_idx=layer_idx,
                 input_size=query_projection_size,
@@ -2321,7 +2321,7 @@ class MLAAttention(MetaModule):
         # q: [s, b, n, 192]
         query = q.view(q_len, bsz, self.num_attention_heads_per_partition, self.q_head_dim)
         # q: [s, b, n, 128], q_pos_emb: [s, b, n, 64]
-        # q_no_pe, q_pos_emb = simu_ops.split( # TODO(sherry): 新增simu_ops.split
+        # q_no_pe, q_pos_emb = simu_ops.split( # TODO(sherry): add simu_ops.split
         #     q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
         # )
 

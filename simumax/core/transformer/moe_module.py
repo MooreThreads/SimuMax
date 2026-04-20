@@ -567,9 +567,9 @@ class UnPermutation(MetaModule):
     3.all2all on ep group
     4.Unpermuation2:
         - no (padding and drop):
-          - 通过argsort的sorted_indices反向unpermutate,然后根据probs进行combine，但是drop的没有残差连接
-        - padding and drop：
-          - 通过final_indices(token indices, [E, C])和scatter_add实现恢复和combine weight
+          - Reverse-unpermute using argsort's sorted_indices, then combine by probs; dropped tokens have no residual connection
+        - padding and drop:
+          - Use final_indices (token indices, [E, C]) and scatter_add to restore tokens and combine weights
     5.all2all on tp group for old policy(all2all-seq)
     """
 
@@ -842,9 +842,9 @@ class UnPermutation(MetaModule):
         """
         4.Unpermuation2:
         - no (padding and drop):
-          - 通过argsort的sorted_indices反向unpermutate,然后根据probs进行combine，但是drop的没有残差连接
-        - padding and drop：
-          - 通过final_indices(token indices, [E, C])和scatter_add实现恢复和combine weight
+          - Reverse-unpermute using argsort's sorted_indices, then combine by probs; dropped tokens have no residual connection
+        - padding and drop:
+          - Use final_indices (token indices, [E, C]) and scatter_add to restore tokens and combine weights
 
         1.permutate1 for ep all2all
         2.permutate2 for mlp compute

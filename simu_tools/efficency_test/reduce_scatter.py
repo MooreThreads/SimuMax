@@ -8,10 +8,10 @@ def run_reduce_scatter(rank, world_size):
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
-    # 每个rank准备 world_size 份输入，每份大小为 240MB / world_size
+    # Each rank prepares world_size inputs, each of size 240MB / world_size
     total_bytes = 240 * 1024 * 1024
     chunk_bytes = total_bytes
-    chunk_elements = chunk_bytes // 2  # float32 每个 4 字节
+    chunk_elements = chunk_bytes // 2  # float32 is 4 bytes each
 
     input_list = [torch.randn(chunk_elements, dtype=torch.bfloat16).cuda(rank) for _ in range(world_size)]
     output_tensor = torch.zeros(chunk_elements, dtype=torch.bfloat16).cuda(rank)
@@ -21,7 +21,7 @@ def run_reduce_scatter(rank, world_size):
         dist.reduce_scatter(output_tensor, input_list, op=dist.ReduceOp.SUM)
     torch.cuda.synchronize()
 
-    # 正式测试 + profiling
+    # Main benchmark + profiling
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
         schedule=torch.profiler.schedule(wait=0, warmup=5, active=50),
@@ -44,7 +44,7 @@ def main():
 
     world_size = torch.cuda.device_count()
     if world_size < 2:
-        raise RuntimeError("需要至少 2 张 GPU 才能进行 reduce-scatter 测试")
+        raise RuntimeError("At least 2 GPUs are required to run the reduce-scatter test")
     mp.spawn(run_reduce_scatter, args=(world_size,), nprocs=world_size, join=True)
 
 if __name__ == "__main__":

@@ -238,7 +238,7 @@ class PerfLLM(PerfBase):
                 if os.path.exists(TMP_PATH):
                     shutil.rmtree(TMP_PATH)
         except Exception as e:
-            print(f"删除文件时出错: {e}")
+            print(f"Error deleting file: {e}")
             
     def get_num_layers_to_build(self, config: StrategyConfig, model_conf: ModelConfig, parallel_stage="first") -> int:
         """
@@ -487,7 +487,7 @@ class PerfLLM(PerfBase):
             result['optim_exposed_time'] = optim_time
             return result
         else:
-            chunk_weight_accessed_time = 3 * state_weight_bytes # why 3倍?
+            chunk_weight_accessed_time = 3 * state_weight_bytes # why 3x?
             optim_time = self.system.compute_mem_access_time(chunk_weight_accessed_time)
             optim_exposed_time = adam_time  # no overlap for now
             result["optim_time"] = adam_time
@@ -851,7 +851,7 @@ class PerfLLM(PerfBase):
         # bubble = sum(f_b_time)+sum(forward_times[idx+1:])+sum(backward_times[idx+1:]) - (pp-idx)*(f_b_time[idx])
         # all_time = bubble + mbc*f_b_time[idx]
         if draw:
-            # 可视化调度图
+            # Visualize the schedule
             fig, ax = plt.subplots(figsize=(12, 5))
             colors = {'F': '#6b8ec9', 'B': '#6db5b5'}
 
@@ -2687,10 +2687,10 @@ class PerfLLM(PerfBase):
             best_strategy (dict): the best strategy of this model, include (tp, ep, pp, full_recompute_layer_num) combination.
         """
         
-        # 256张卡 world_size
+        # world_size = 256 GPUs
         # tp: 1 2 4 8
         # ep: 1 2 4 8
-        # 且 layer num整除
+        # and layer_num must be divisible
         if not isinstance(recompute_search_type, list):
             recompute_search_type = [recompute_search_type]
 
@@ -2721,7 +2721,7 @@ class PerfLLM(PerfBase):
                     is_ep_valid = dp_size % ep_size == 0
                     etp_size = tp_size if use_etp else 1
                     is_etp_valid = (world_size %(ep_size* etp_size) == 0) and (etp_size*ep_size < self.system.num_per_node) 
-                    is_etp_valid = (world_size %(ep_size* etp_size) == 0) # TODO(sherry): 临时限定etp_size*ep_size < self.system.num_per_node
+                    is_etp_valid = (world_size %(ep_size* etp_size) == 0) # TODO(sherry): temporarily limit etp_size*ep_size < self.system.num_per_node
 
                     if pp_size > 1:
                         num_layers_per_pp = math.ceil(layer_num/pp_size)

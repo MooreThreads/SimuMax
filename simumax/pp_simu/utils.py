@@ -60,7 +60,7 @@ def show_overlap_all2all(t_compute,t_comm,save_path):
     'W': 'lightblue',
     'B': 'green'
     }
-    # 绘制data1
+    # Draw data1
     for i, (key, intervals) in enumerate(data1.items()):
         for j in range(0, len(intervals), 2):
             start, end = intervals[j], intervals[j+1]
@@ -69,7 +69,7 @@ def show_overlap_all2all(t_compute,t_comm,save_path):
             ax.add_patch(rect)
             ax.text((start + end) / 2, 1.2, key, color='blue', ha='center', va='center')
 
-    # 绘制data2
+    # Draw data2
     for i, (key, intervals) in enumerate(data2.items()):
         for j in range(0, len(intervals), 2):
             start, end = intervals[j], intervals[j+1]

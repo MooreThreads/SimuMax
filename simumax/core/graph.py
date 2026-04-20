@@ -12,36 +12,36 @@ BPE = {"fp32": 4, "fp16": 2, "bf16": 2, "fp8": 1, "int32" : 4}
 
 @dataclass
 class ValueInfo:
-    """描述张量的信息（名称、形状、数据类型）"""
+    """Describes tensor info (name, shape, dtype)."""
     name: str
-    shape: List[int]  # 使用-1表示动态维度
+    shape: List[int]  # Use -1 for dynamic dimensions
     dtype: str = "float32"
 
 @dataclass
 class Node:
-    """计算图中的节点（操作）"""
-    name: str           # 节点名称
+    """A node (operation) in the computation graph."""
+    name: str           # Node name
     op: callable
-    op_type: str        # 操作类型（如 'Add', 'MatMul', 'Conv'）
-    inputs: List[str]   # 输入张量名称列表
-    outputs: List[str]  # 输出张量名称列表
-    enable_recompute: bool = False  # 是否启用重计算
-    attributes: Dict[str, Any] = None  # 操作属性
-    cache_inputs: bool = False  # 是否缓存输入
-    domain: str = ""    # 操作域（如 '' 表示AI, 'com.microsoft' 等）
+    op_type: str        # Operation type (e.g. 'Add', 'MatMul', 'Conv')
+    inputs: List[str]   # List of input tensor names
+    outputs: List[str]  # List of output tensor names
+    enable_recompute: bool = False  # Whether to enable recompute
+    attributes: Dict[str, Any] = None  # Operation attributes
+    cache_inputs: bool = False  # Whether to cache inputs
+    domain: str = ""    # Operation domain (e.g. '' for AI, 'com.microsoft', etc.)
     visited: bool = False
 
 @dataclass
 class Graph:
-    """完整的计算图"""
+    """Full computation graph."""
     name: str = "model_graph"
-    nodes: List[Node] = None           # 所有操作节点
-    inputs: List[ValueInfo] = None     # 图输入
-    outputs: List[ValueInfo] = None    # 图输出
-    initializers: Dict[str, Any] = None  # 常量参数（权重、偏置等）
-    value_info: Dict[str, ValueInfo] = None  # 中间张量信息
-    name_counts = dict()  # 用于生成唯一名称的计数器
-    forward_edges: Dict[FakeTensor, List[Node]] = field(default_factory=dict) # 前向边
+    nodes: List[Node] = None           # All operation nodes
+    inputs: List[ValueInfo] = None     # Graph inputs
+    outputs: List[ValueInfo] = None    # Graph outputs
+    initializers: Dict[str, Any] = None  # Constant parameters (weights, biases, etc.)
+    value_info: Dict[str, ValueInfo] = None  # Intermediate tensor info
+    name_counts = dict()  # Counter used to generate unique names
+    forward_edges: Dict[FakeTensor, List[Node]] = field(default_factory=dict) # Forward edges
     def __post_init__(self):
         if self.nodes is None:
             self.nodes = []
@@ -92,7 +92,7 @@ class Graph:
                 self.traverse_forward_from_tensor(output, node, set_variance_node)
 
     def to_dict(self):
-        """将图转换为字典格式，便于序列化"""
+        """Convert the graph to a dict for serialization."""
         return {
             "name": self.name,
             "nodes": [{
@@ -122,13 +122,13 @@ class Graph:
         }
 
     def export_json(self, filepath: str):
-        """导出为JSON文件"""
+        """Export to a JSON file."""
         with open(filepath, 'w') as f:
             json.dump(self.to_dict(), f, indent=2)
 
 
 class SimuONNXGraphBuilder:
-    """单例类，用于构建和存储计算图"""
+    """Singleton that builds and stores the computation graph."""
     _instance = None
     
     def __new__(cls):
@@ -148,19 +148,19 @@ class SimuONNXGraphBuilder:
         return self.graph
     
     def reset(self):
-        """重置图构建器"""
+        """Reset the graph builder."""
         self.graph = Graph()
         self.tensor_counter = 0
         self.node_counter = 0
     
     def get_unique_tensor_name(self, prefix: str = "tensor") -> str:
-        """生成唯一的张量名称"""
+        """Generate a unique tensor name."""
         name = f"{prefix}_{self.tensor_counter}"
         self.tensor_counter += 1
         return name
     
     def get_unique_node_name(self, op_type: str) -> str:
-        """生成唯一的节点名称"""
+        """Generate a unique node name."""
         name = f"{op_type}_{self.node_counter}"
         self.node_counter += 1
         # name_count = Graph.name_counts.get(op_type, 0)
@@ -170,10 +170,10 @@ class SimuONNXGraphBuilder:
     
     def add_node(self, op, op_type: str, inputs: List['FakeTensor'], 
                  outputs: List['FakeTensor'], attributes: Dict[str, Any] = None):
-        """添加一个操作节点到图中"""
+        """Add an operation node to the graph."""
         node_name = self.get_unique_node_name(op.name)
         # print(f'Adding node: {op_type}, inputs={inputs}, outputs={outputs}')
-        # 确保所有输入输出张量都有名称
+        # Ensure all input/output tensors have names
         input_names = []
         for inp in inputs:
             if not hasattr(inp, 'onnx_name'):
@@ -186,7 +186,7 @@ class SimuONNXGraphBuilder:
                 out.onnx_name = self.get_unique_tensor_name("output")
             output_names.append(out.onnx_name)
         
-        # 记录张量形状信息（简化版，实际需要更复杂的形状推断）
+        # Record tensor shape info (simplified; real shape inference is more complex)
         for out in outputs:
             if hasattr(out, 'shape'):
                 self.graph.value_info[out.onnx_name] = ValueInfo(
@@ -195,7 +195,7 @@ class SimuONNXGraphBuilder:
                     dtype=str(out.dtype) if hasattr(out, 'dtype') else "float32"
                 )
         
-        # 创建并添加节点
+        # Create and add the node
         node = Node(
             name=node_name,
             op = op,
@@ -223,18 +223,18 @@ class SimuONNXGraphBuilder:
 def export_onnx_style_graph(model, input_tensor: FakeTensor, 
                            output_path: str = "model_graph.json"):
     """
-    导出类似ONNX的计算图
-    
+    Export an ONNX-like computation graph.
+
     Args:
-        model: 要导出的模型
-        input_tensor: 输入张量（用于推断形状）
-        output_path: 输出JSON文件路径
+        model: The model to export
+        input_tensor: Input tensor (used for shape inference)
+        output_path: Output JSON file path
     """
-    # 重置图构建器
+    # Reset the graph builder
     graph_builder = SimuONNXGraphBuilder()
     graph_builder.reset()
-    
-    # 设置输入张量的ONNX名称和形状信息
+
+    # Set the ONNX name and shape info for the input tensor
     input_tensor.onnx_name = "input"
     if hasattr(input_tensor.data, 'shape'):
         graph_builder.graph.inputs.append(
@@ -243,10 +243,10 @@ def export_onnx_style_graph(model, input_tensor: FakeTensor,
                      dtype=str(input_tensor.data.dtype))
         )
     
-    # 执行前向传播（这会自动构建计算图）
+    # Run the forward pass (this automatically builds the computation graph)
     output_tensor = model(input_tensor)
-    
-    # 设置输出张量的信息
+
+    # Set output tensor info
     output_tensor.onnx_name = "output"
     if hasattr(output_tensor.data, 'shape'):
         graph_builder.graph.outputs.append(
@@ -255,15 +255,15 @@ def export_onnx_style_graph(model, input_tensor: FakeTensor,
                      dtype=str(output_tensor.data.dtype))
         )
     
-    # 添加模型参数到初始izer
+    # Add model parameters to initializers
     for name, param in model._parameters.items():
         if not hasattr(param, 'onnx_name'):
             param.onnx_name = name
         graph_builder.graph.initializers[param.onnx_name] = param.data
     
-    # 导出为JSON
+    # Export as JSON
     graph_builder.graph.export_json(output_path)
-    print(f"计算图已导出到: {output_path}")
+    print(f"Computation graph exported to: {output_path}")
     
     return graph_builder.graph
 
@@ -277,34 +277,34 @@ def visualize_with_graphviz(json_path, output_path="computational_graph"):
             return f"{size / 1024 / 1024:.0f} MB"
         else:
             return f"{size / 1024 / 1024 / 1024:.0f} GB"
-    """使用Graphviz进行可视化"""
+    """Visualize with Graphviz."""
     graph_data = json.load(open(json_path, 'r'))
-    # 创建有向图
+    # Create a directed graph
     dot = Digraph(comment=graph_data['name'])
-    dot.attr(rankdir='TB')  # 从上到下布局
+    dot.attr(rankdir='TB')  # Top-to-bottom layout
     dot.attr('node', shape='rectangle', style='filled')
-    
-    # 添加输入节点
+
+    # Add input nodes
     with dot.subgraph(name='cluster_inputs') as c:
         c.attr(color='blue', label='Inputs')
         for inp in graph_data['inputs']:
             c.node(inp['name'], f"Input: {inp['name']}\nShape: {inp['shape']}", 
                    fillcolor='lightgreen')
     
-    # 添加输出节点
+    # Add output nodes
     with dot.subgraph(name='cluster_outputs') as c:
         c.attr(color='red', label='Outputs')
         for out in graph_data['outputs']:
             c.node(out['name'], f"Output: {out['name']}\nShape: {out['shape']}", 
                    fillcolor='lightcoral')
     
-    # 添加参数节点
+    # Add parameter nodes
     with dot.subgraph(name='cluster_params') as c:
         c.attr(color='orange', label='Parameters')
         for param in graph_data['initializers']:
             c.node(param, f"Param: {param}", fillcolor='gold')
     
-    # 添加操作节点
+    # Add operation nodes
     for node in graph_data['nodes']:
         attrs_str = '\n'.join([f"{k}: {v}" for k, v in node['attributes'].items()])
         label = f"{node['op_type']}\n{node['name']}\ncall_idx:{node['call_idx']}"
@@ -320,7 +320,7 @@ def visualize_with_graphviz(json_path, output_path="computational_graph"):
             style = 'filled,solid'
         dot.node(node['name'], label, fillcolor=color, style=style)
     
-    # 添加中间张量节点
+    # Add intermediate tensor nodes
     for tensor_name, info in graph_data['value_info'].items():
         # dot.node(tensor_name, f"Tensor: {tensor_name}\nShape: {info['shape']}", 
         #         fillcolor='lightgray', shape='ellipse')
@@ -331,16 +331,16 @@ def visualize_with_graphviz(json_path, output_path="computational_graph"):
         dot.node(tensor_name, f"Tensor: {tensor_name}\nShape: {shape}, {dtype}\nMem:{mem}", 
                 fillcolor='lightgray', shape='ellipse')
     
-    # 添加边
+    # Add edges
     for node in graph_data['nodes']:
         for input_tensor in node['inputs']:
             dot.edge(input_tensor, node['name'])
         for output_tensor in node['outputs']:
             dot.edge(node['name'], output_tensor)
     
-    # 保存和渲染
+    # Save and render
     dot.render(output_path, format='png', cleanup=True)
-    print(f"Graphviz图已保存到: {output_path}.png")
+    print(f"Graphviz graph saved to: {output_path}.png")
     
     return dot
 

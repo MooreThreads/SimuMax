@@ -582,7 +582,7 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         self.offload_inputs = False
 
         self.children_ordered_module:List[MetaModule] = []
-        self.children_modules:List[MetaModule] = [] # children modules是所有子模块的列表（无序）
+        self.children_modules:List[MetaModule] = [] # children_modules is the (unordered) list of all child modules
         self.children_modules_names:Dict[MetaModule, str] = {}
         self.default_dtype = strategy.dtype 
         self._init_strategy = False
@@ -714,7 +714,7 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
 
     def register_module(self, sub_module):
         self.children_ordered_module.append(sub_module)
-        # TODO(sherry): 支持register hook
+        # TODO(sherry): support register hook
         self.call_add_ordered_module_hooks(sub_module)
     
     def set_dtype(self, dtype: str):
@@ -1381,19 +1381,19 @@ class SimuSystem:
         n = len(self.threads)
         processes = []
         def worker(thread):
-            """每个进程的工作函数，负责执行 thread.step()"""
+            """Per-process worker function; runs thread.step()."""
             while True:
-                if thread.step(manager):  # 如果 step() 返回 True，表示任务完成
+                if thread.step(manager):  # If step() returns True, the task is done
                     break
                 # time.sleep(1)
 
-        # 创建并启动多个进程
+        # Create and start multiple processes
         for i in range(n):
             p = multiprocessing.Process(target=worker, args=(self.threads[i],))
             processes.append(p)
             p.start()
 
-        # 等待所有进程完成
+        # Wait for all processes to finish
         for p in processes:
             p.join()
 
@@ -1513,9 +1513,9 @@ class Com(LeafModel):
         if not id in self.com_buff:
             self.com_buff[id] = {'is_ready': [0]*self.group_size, 'ready_time': 0}
             # nested_dict = manager.dict()
-            # nested_dict['is_ready'] = manager.list([0] * self.group_size)  # 使用 Manager().list() 共享列表
+            # nested_dict['is_ready'] = manager.list([0] * self.group_size)  # Use Manager().list() as a shared list
             # nested_dict['ready_time'] = 0
-            # self.com_buff[id] = nested_dict  # 将嵌套的共享对象赋值给 self.com_buff[id]
+            # self.com_buff[id] = nested_dict  # Assign the nested shared object to self.com_buff[id]
         self.com_buff[id]['is_ready'][self.rank]=1
         self.com_buff[id]['ready_time'] = max(t[0], self.com_buff[id]['ready_time'])
         if sum(self.com_buff[id]['is_ready'])==self.group_size:
@@ -1548,7 +1548,7 @@ class Com(LeafModel):
     
         if not id in self.com_buff:
             # nested_dict = manager.dict()
-            # nested_dict['is_ready'] = manager.list([0] * self.group_size)  # 使用 Manager().list() 共享列表
+            # nested_dict['is_ready'] = manager.list([0] * self.group_size)  # Use Manager().list() as a shared list
             # nested_dict['ready_time'] = 0
             # self.com_buff[id] = nested_dict
             self.com_buff[id] = {'is_ready': [0]*self.group_size, 'ready_time': 0}

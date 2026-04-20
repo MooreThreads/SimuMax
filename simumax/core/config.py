@@ -39,37 +39,37 @@ def get_capture_graph_only():
 
 class ParameterExtractor:
     def __init__(self, param_patterns: Dict[str, Any]):
-        # 定义参数模式及其默认值
+        # Define parameter patterns and their default values
         self.param_patterns = param_patterns
-    
+
     def extract_parameters(self, input_string):
-        """从字符串中提取所有参数，缺失的使用默认值"""
+        """Extract all parameters from the string, using defaults when missing."""
         parameters = {}
-        
+
         for param_name, (pattern, default_value) in self.param_patterns.items():
             match = re.search(pattern, input_string)
             if match:
                 parameters[param_name] = int(match.group(1))
             elif default_value is not None:
                 parameters[param_name] = default_value
-                print(f"警告: 未找到参数 {param_name}, 使用默认值 {default_value}")
+                print(f"Warning: parameter {param_name} not found, using default value {default_value}")
 
         return parameters
-    
+
     def extract_single_parameter(self, input_string, param_name, default_value=None):
-        """提取单个参数"""
+        """Extract a single parameter."""
         if param_name not in self.param_patterns:
-            raise ValueError(f"未知参数: {param_name}")
-        
+            raise ValueError(f"Unknown parameter: {param_name}")
+
         pattern, default = self.param_patterns[param_name]
         if default_value is not None:
             default = default_value
-        
+
         match = re.search(pattern, input_string)
         if match:
             return int(match.group(1))
         else:
-            print(f"警告: 未找到参数 {param_name}, 使用默认值 {default}")
+            print(f"Warning: parameter {param_name} not found, using default value {default}")
             return default
 @dataclass
 class Config:
@@ -259,7 +259,6 @@ class StrategyConfig(Config):
         """
         Docstring for init_from_format_strings
         parse format like:
-        查找
         seq{self.seq_len}.mbs{self.micro_batch_size}.mbc{self.micro_batch_num}.gbs{self.global_batch_size} tp{self.tp_size}.ep{self.ep_size}.pp{self.pp_size}.dp{self.dp_size}.etp{self.etp_size}.edp{self.edp_size}, world_size:{self.world_size}
 
         :param cls: Description

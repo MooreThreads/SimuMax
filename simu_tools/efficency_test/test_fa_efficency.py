@@ -3,10 +3,10 @@ import torch
 from flash_attn.flash_attn_interface import _flash_attn_forward, _flash_attn_backward
 from simu_tools.efficency_test.utils import get_system_name, sync_device, get_torch_profiler, get_all_test_model_configs, get_test_seq_len_list, get_test_mbs_list, get_test_tp_list
 
-# 1. 构造测试输入数据
+# 1. Build test input data
 def generate_test_inputs(device, batch_size, seq_len,  num_q_heads, num_kv_heads, k_head_dim, v_head_dim, qkv_contiguous):
     # batch_size, seq_len, num_heads, head_dim = 4096, 1, 4, 128
-    # 生成随机输入张量 (使用BF16格式以测试FlashAttention)
+    # Generate random input tensors (BF16 to test FlashAttention)
     
     query = torch.randn((batch_size, seq_len, num_q_heads,  k_head_dim), 
                 dtype=torch.bfloat16, device=device)
@@ -17,7 +17,7 @@ def generate_test_inputs(device, batch_size, seq_len,  num_q_heads, num_kv_heads
     
     return query, key, value
 
-# 4. 基准测试函数
+# 4. Benchmark function
 def benchmark_flashattention(q, k, v, warmup=10, repeat=100, device='cuda'):
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -55,10 +55,10 @@ def benchmark_flashattention(q, k, v, warmup=10, repeat=100, device='cuda'):
     sync_device(device)
     fwd_elapsed_time = (time.time() - fwd_start_time) / (repeat-warmup) * 1000
 
-    # print(f"=== FlashAttention输出: {attn_output}")
+    # print(f"=== FlashAttention output: {attn_output}")
     # for i, o in enumerate(attn_output):
-    #     print(f"=== 输出{i}: {type(o)}")
-    # 测试反向传播
+    #     print(f"=== output{i}: {type(o)}")
+    # Test backward pass
 
     sync_device(device)
     for i in range(repeat):
@@ -105,25 +105,25 @@ def test(model, all_efficiency, qkv_contiguous, batch, seq_len, num_q_heads, num
     if shape_key  in all_efficiency['sdp_fwd']['accurate_efficient_factor']:
         return
     query, key, value = generate_test_inputs(device, batch, seq_len,  num_q_heads, num_kv_heads, qk_head_dim, v_head_dim, qkv_contiguous)
-    print(f"- 输入形状: query={query.shape}, key={key.shape}, value={value.shape}")
+    print(f"- Input shapes: query={query.shape}, key={key.shape}, value={value.shape}")
     print(f'batch: {batch}, seq_len: {seq_len}, num_heads: {num_q_heads}&{num_kv_heads}, head_dim: {qk_head_dim}')
-    # 初始化配置和模块
-    # 运行基准测试
+    # Initialize config and modules
+    # Run the benchmark
     fwd_latency, bwd_latency = benchmark_flashattention(query, key, value, device = device)
-    
-    # 计算理论FLOPs (公式: 2 * batch * seq_len^2 * num_heads * head_dim)
-    base_flops = batch * (seq_len ** 2) * max(num_q_heads, num_kv_heads)  * (qk_head_dim + v_head_dim)   
+
+    # Compute theoretical FLOPs (formula: 2 * batch * seq_len^2 * num_heads * head_dim)
+    base_flops = batch * (seq_len ** 2) * max(num_q_heads, num_kv_heads)  * (qk_head_dim + v_head_dim)
     fwd_flops = 2 * base_flops
-    fwd_tflops = (fwd_flops / (fwd_latency * 1e-3+ 1e-12)) / 1e12  # 转换为TFLOPs
+    fwd_tflops = (fwd_flops / (fwd_latency * 1e-3+ 1e-12)) / 1e12  # Convert to TFLOPs
 
     bwd_flops = 5 * base_flops
-    bwd_tflops = (bwd_flops / (bwd_latency * 1e-3+ 1e-12)) / 1e12  # 转换为TFLOPs
-    
-    print(f"=== {model} FlashAttention性能结果(TP={TP}):")
-    print(f"- 延迟: {fwd_latency:.3f} ms/iteration, backward: {bwd_latency:.3f} ms/iteration")
-    print(f"- fwd吞吐量: {fwd_tflops:.2f} TFLOPs, flops={fwd_flops} latency={fwd_latency:.2f} ms, 计算效率={fwd_tflops/MAX_TFLOPS:.2f}") 
-    print(f"- bwd吞吐量: {bwd_tflops:.2f} TFLOPs, flops={bwd_flops} latency={bwd_latency:.2f} ms, 计算效率={bwd_tflops/MAX_TFLOPS:.2f}")
-    print(f"- 输入形状: query={query.shape}, key={key.shape}, value={value.shape}")
+    bwd_tflops = (bwd_flops / (bwd_latency * 1e-3+ 1e-12)) / 1e12  # Convert to TFLOPs
+
+    print(f"=== {model} FlashAttention performance (TP={TP}):")
+    print(f"- Latency: {fwd_latency:.3f} ms/iteration, backward: {bwd_latency:.3f} ms/iteration")
+    print(f"- fwd throughput: {fwd_tflops:.2f} TFLOPs, flops={fwd_flops} latency={fwd_latency:.2f} ms, efficiency={fwd_tflops/MAX_TFLOPS:.2f}")
+    print(f"- bwd throughput: {bwd_tflops:.2f} TFLOPs, flops={bwd_flops} latency={bwd_latency:.2f} ms, efficiency={bwd_tflops/MAX_TFLOPS:.2f}")
+    print(f"- Input shapes: query={query.shape}, key={key.shape}, value={value.shape}")
     res['model'].append(model)
     res['TP'].append(TP)
     res['batch'].append(batch)
@@ -147,9 +147,9 @@ def test(model, all_efficiency, qkv_contiguous, batch, seq_len, num_q_heads, num
 
 
 
-# 5. 主测试流程
+# 5. Main test flow
 if __name__ == "__main__":
-    # 准备输入数据
+    # Prepare input data
     system, device, MAX_TFLOPS = get_system_name()
     save_root =  f'{system}_fa_efficency'
     os.makedirs(save_root, exist_ok=True)
