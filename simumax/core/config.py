@@ -209,6 +209,9 @@ class StrategyConfig(Config):
     interleaving_size: int = 1
     zero_state: int = 1
 
+    # pipeline-parallel scheduling algorithm: "1f1b" or "zb_h2"
+    pp_schedule: str = "1f1b"
+
     attention_sparse_ratio: float = (
         0.0  # 0.0 means dense attention; 0.5 means compute optimize for causal attention
     )
@@ -433,6 +436,10 @@ class StrategyConfig(Config):
             "all2all",
             "all2all-seq",
         ], "moe_dispatcher_policy must be in ['all2all', 'all2all-seq']"
+        assert self.pp_schedule in [
+            "1f1b",
+            "zb_h2",
+        ], f"pp_schedule must be in ['1f1b', 'zb_h2'], got {self.pp_schedule}"
         if self.interleaving_size == 1:
             warnings.warn(
                 "interleaving_size is not supported yet, the configuration will be ignored."

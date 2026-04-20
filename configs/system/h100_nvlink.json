@@ -1,0 +1,110 @@
+{
+    "sys_name": "h100_nvlink_ib_bf16",
+    "num_per_node": 8,
+    "_notes": "Spec-based starter config for DGX-class nodes: 8x H100 SXM5 + NVLink4/NVSwitch intra + NDR400 InfiniBand inter. Compute efficiencies are population averages, NOT shape-calibrated. Network efficiencies are typical NCCL ranges on well-tuned fabrics. Run simu_tools/efficency_test/ to replace these with measured values. Expect 10-20% error on iter time vs. calibrated A100 config.",
+    "accelerator": {
+        "backend": "cuda",
+        "mem_gbs": 80,
+        "op": {
+            "default": {
+                "tflops": 989,
+                "efficient_factor": 0.68
+            },
+            "matmul": {
+                "tflops": 989,
+                "efficient_factor": 0.70
+            },
+            "fp8_matmul": {
+                "tflops": 1979,
+                "efficient_factor": 0.65
+            },
+            "sdp_fwd": {
+                "tflops": 989,
+                "efficient_factor": 0.72
+            },
+            "sdp_bwd": {
+                "tflops": 989,
+                "efficient_factor": 0.55
+            },
+            "group_matmul": {
+                "tflops": 989,
+                "efficient_factor": 0.60
+            },
+            "fp8_group_matmul": {
+                "tflops": 1979,
+                "efficient_factor": 0.58
+            }
+        },
+        "bandwidth": {
+            "default": {
+                "efficient_factor": 0.85,
+                "gbps": 3350,
+                "latency_us": 20
+            },
+            "permute_fwd": {
+                "efficient_factor": 0.25,
+                "gbps": 3350,
+                "latency_us": 20
+            },
+            "permute_bwd": {
+                "efficient_factor": 0.25,
+                "gbps": 3350,
+                "latency_us": 20
+            },
+            "ce": {
+                "efficient_factor": 0.80,
+                "gbps": 3350,
+                "latency_us": 20
+            }
+        },
+        "mode": "roofline"
+    },
+    "networks": {
+        "intra_with_pcie": false,
+        "low_intra_node": {
+            "processor_usage": 0.0,
+            "bandwidth": {
+                "efficient_factor": 1.0,
+                "gbps": 900,
+                "latency_us": 8
+            },
+            "op": {
+                "all_reduce":     { "scale": 2, "offset": -1, "efficient_factor": 0.55, "latency_us": 8 },
+                "all_gather":     { "scale": 1, "offset": -1, "efficient_factor": 0.60, "latency_us": 6 },
+                "reduce_scatter": { "scale": 1, "offset": -1, "efficient_factor": 0.60, "latency_us": 6 },
+                "p2p":            { "scale": 1, "offset":  0 },
+                "all2all":        { "scale": 1, "offset": -1, "efficient_factor": 0.50, "latency_us": 12 }
+            }
+        },
+        "high_intra_node": {
+            "processor_usage": 0.0,
+            "bandwidth": {
+                "efficient_factor": 1.0,
+                "gbps": 900,
+                "latency_us": 8
+            },
+            "op": {
+                "all_reduce":     { "scale": 2, "offset": -1, "efficient_factor": 0.55, "latency_us": 8 },
+                "all_gather":     { "scale": 1, "offset": -1, "efficient_factor": 0.60, "latency_us": 6 },
+                "reduce_scatter": { "scale": 1, "offset": -1, "efficient_factor": 0.60, "latency_us": 6 },
+                "p2p":            { "scale": 1, "offset":  0 },
+                "all2all":        { "scale": 1, "offset": -1, "efficient_factor": 0.50, "latency_us": 12 }
+            }
+        },
+        "inter_node": {
+            "processor_usage": 0.0,
+            "bandwidth": {
+                "efficient_factor": 0.7,
+                "gbps": 50,
+                "latency_us": 35
+            },
+            "op": {
+                "all_reduce":     { "scale": 2, "offset": -1 },
+                "all_gather":     { "scale": 1, "offset": -1 },
+                "reduce_scatter": { "scale": 1, "offset": -1 },
+                "p2p":            { "scale": 1, "offset":  0 },
+                "all2all":        { "scale": 1, "offset": -1 }
+            }
+        }
+    }
+}

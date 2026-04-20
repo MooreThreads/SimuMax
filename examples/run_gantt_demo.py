@@ -1,20 +1,25 @@
-"""Render the 1F1B pipeline Gantt for Llama3-70B on the shipped A100-PCIe system.
+"""Render the pipeline Gantt chart for a chosen strategy.
 
-Writes two things:
-  - ./llama3_70b_a100_pcie_bf16/  (standard SimuMax JSON outputs)
-  - ./corrected_1F1B_pipeline.png (Gantt chart of the 1F1B schedule)
+Dispatches on the strategy's ``pp_schedule`` field (e.g. ``1f1b``, ``zb_h2``)
+and writes the appropriate Gantt chart plus the standard SimuMax JSON
+outputs.
+
+Examples
+--------
+    python examples/run_gantt_demo.py
+    python examples/run_gantt_demo.py --strategy llama70b_tp8_pp4_dp100_zbh2
+    python examples/run_gantt_demo.py --strategy llama70b_tp8_pp4_dp100 \\
+        --model llama3-70b --system h100_nvlink --output my_chart.png
 """
 
+import argparse
+
 import matplotlib
+
 matplotlib.use("Agg")  # headless backend; no GUI window pops up
 
 from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
-from simumax.core.perf_llm import (
-    PerfLLM,
-    FIRST_CHUNK,
-    MIDDLE_CHUNK,
-    LAST_CHUNK,
-)
+from simumax.core.perf_llm import PerfLLM
 from simumax.utils import (
     get_simu_model_config,
     get_simu_strategy_config,
@@ -22,10 +27,26 @@ from simumax.utils import (
 )
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--strategy", default="llama70b_tp8_pp4_dp100",
+                        help="Strategy config name (without .json).")
+    parser.add_argument("--model", default="llama3-70b",
+                        help="Model config name (without .json).")
+    parser.add_argument("--system", default="h100_nvlink",
+                        help="System config name (without .json).")
+    parser.add_argument("--output", default=None,
+                        help="Output PNG path for the Gantt chart. "
+                             "Defaults to a schedule-specific filename.")
+    return parser.parse_args()
+
+
 def main():
-    strategy_path = get_simu_strategy_config("llama70b_tp8_pp4_dp1")
-    model_path    = get_simu_model_config("llama3-70b")
-    system_path   = get_simu_system_config("a100_pcie")
+    args = parse_args()
+
+    strategy_path = get_simu_strategy_config(args.strategy)
+    model_path = get_simu_model_config(args.model)
+    system_path = get_simu_system_config(args.system)
 
     perf_model = PerfLLM()
     perf_model.configure(
@@ -33,43 +54,27 @@ def main():
         model_config=ModelConfig.init_from_config_file(model_path),
         system_config=SystemConfig.init_from_config_file(system_path),
     )
-
     perf_model.run_estimate()
 
     save_dir = f"{perf_model.model_config.model_name}_{perf_model.system.sys_name}"
     perf_model.analysis(save_dir)
 
+    schedule = perf_model.strategy.pp_schedule
+    iter_time = perf_model.draw_pp_gantt(output_path=args.output)
+
     pp = perf_model.strategy.pp_size
     mbc = perf_model.strategy.micro_batch_num
-
-    fwd_first, bwd_first = perf_model._compute_single_batch_fwd_bwd_time(FIRST_CHUNK)
-
-    if pp == 1:
-        forward_times, backward_times = [fwd_first], [bwd_first]
-    else:
-        fwd_last, bwd_last = perf_model._compute_single_batch_fwd_bwd_time(LAST_CHUNK)
-        if pp == 2:
-            forward_times  = [fwd_first, fwd_last]
-            backward_times = [bwd_first, bwd_last]
-        else:
-            fwd_mid, bwd_mid = perf_model._compute_single_batch_fwd_bwd_time(MIDDLE_CHUNK)
-            forward_times  = [fwd_first] + [fwd_mid] * (pp - 2) + [fwd_last]
-            backward_times = [bwd_first] + [bwd_mid] * (pp - 2) + [bwd_last]
-
-    iter_time = perf_model.calculate_1f1b_bubble(
-        pp=pp,
-        mbc=mbc,
-        forward_times=forward_times,
-        backward_times=backward_times,
-        draw=True,
-    )
+    default_path = {
+        "1f1b": "corrected_1F1B_pipeline.png",
+        "zb_h2": "zb_h2_pipeline.png",
+    }.get(schedule, "pp_pipeline.png")
+    out_path = args.output or default_path
 
     print()
-    print(f"pp={pp}, mbc={mbc}")
-    print(f"forward_times  (s) = {forward_times}")
-    print(f"backward_times (s) = {backward_times}")
-    print(f"simulated iter time from 1F1B scheduler = {iter_time:.6f} s")
-    print("Gantt saved to ./corrected_1F1B_pipeline.png")
+    print(f"schedule = {schedule}")
+    print(f"pp = {pp}, mbc = {mbc}")
+    print(f"simulated iter time = {iter_time:.6f} s")
+    print(f"Gantt saved to {out_path}")
 
 
 if __name__ == "__main__":

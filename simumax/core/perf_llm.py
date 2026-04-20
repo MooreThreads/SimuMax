@@ -800,7 +800,7 @@ class PerfLLM(PerfBase):
         }
         return result
     
-    def calculate_1f1b_bubble(self, pp, mbc, forward_times, backward_times, draw=False):
+    def calculate_1f1b_bubble(self, pp, mbc, forward_times, backward_times, draw=False, output_path=None):
         schedules = [[] for _ in range(pp)]
         fwd_ready = [[0]  for _ in range(pp)]
         bwd_ready = [[0]  for _ in range(pp)]
@@ -853,13 +853,13 @@ class PerfLLM(PerfBase):
         if draw:
             # 可视化调度图
             fig, ax = plt.subplots(figsize=(12, 5))
-            colors = {'F': 'skyblue', 'B': 'salmon'}
+            colors = {'F': '#6b8ec9', 'B': '#6db5b5'}
 
             for rank, tasks in enumerate(schedules):
                 for task_type, mb, start, duration, end in tasks:
                     ax.barh(y=pp - 1 - rank, width=duration, left=start,
                             height=0.6, color=colors[task_type], edgecolor='black')
-                    ax.text(start + duration / 2, pp - 1 - rank, f'{task_type}{mb}',
+                    ax.text(start + duration / 2, pp - 1 - rank, f'{task_type}{mb + 1}',
                             va='center', ha='center', fontsize=9, color='black')
 
             ax.set_yticks(range(pp))
@@ -868,11 +868,11 @@ class PerfLLM(PerfBase):
             ax.set_title(f"Corrected 1F1B Pipeline Execution Timeline (pp={pp}, mbc={mbc})")
             plt.grid(True, axis='x', linestyle='--', alpha=0.6)
             plt.tight_layout()
-            plt.show()
-            plt.savefig("corrected_1F1B_pipeline.png")
+            plt.savefig(output_path or "corrected_1F1B_pipeline.png")
+            plt.close(fig)
 
         return max_time
-    
+
     def _compute_single_batch_fwd_bwd_time(self, model_name, chunk = False):
             if self.strategy.pp_size > 1:
                 pp_comm_size = (
@@ -889,36 +889,280 @@ class PerfLLM(PerfBase):
                 )  # 2 p2p, fwd/bwd each
             else:
                 pp_time = 0
-    
+
             cost_info = self.model_chunk_dict[model_name].get_cost_info()
-            
-            fwd_chunk_time = (cost_info.fwd_compute_time + 
-                                cost_info.fwd_net_time + 
+
+            fwd_chunk_time = (cost_info.fwd_compute_time +
+                                cost_info.fwd_net_time +
                                 pp_time)
-            bwd_chunk_time = (cost_info.bwd_compute_time + 
-                                cost_info.bwd_net_time + 
-                                cost_info.recompute_compute_time + 
-                                cost_info.recompute_net_time + 
+            bwd_chunk_time = (cost_info.bwd_compute_time +
+                                cost_info.bwd_net_time +
+                                cost_info.recompute_compute_time +
+                                cost_info.recompute_net_time +
                                 pp_time)
             return (fwd_chunk_time, bwd_chunk_time) if not chunk else fwd_chunk_time + bwd_chunk_time
-    
-    def _compute_pp_total_time(self):
+
+    def _compute_single_batch_fwd_b_w_time(self, model_name):
+        """Return per-chunk (F, B-for-input, B-for-weight) times for ZB-style
+        schedules. B covers the activation-gradient path (on the critical path,
+        drives the next rank's B) plus recompute; W covers the weight-gradient
+        path (deferrable). F+B+W equals the fused (F, B) sum."""
+        if self.strategy.pp_size > 1:
+            pp_comm_size = (
+                self.micro_hidden_states_size
+                * self.dtype_to_element_size[self.strategy.dtype]
+            )
+            pp_comm_size = (
+                pp_comm_size / self.strategy.tp_size
+                if self.strategy.enable_sequence_parallel
+                else pp_comm_size
+            )
+            pp_time = 2 * self.system.compute_net_op_time(
+                "p2p", pp_comm_size, 2, net=self.strategy.pp_net
+            )
+        else:
+            pp_time = 0
+
+        cost_info = self.model_chunk_dict[model_name].get_cost_info()
+
+        fwd_chunk_time = (cost_info.fwd_compute_time +
+                          cost_info.fwd_net_time +
+                          pp_time)
+        b_input_chunk_time = (cost_info.bwd_grad_act_time +
+                              cost_info.bwd_grad_act_net_time +
+                              cost_info.recompute_compute_time +
+                              cost_info.recompute_net_time +
+                              pp_time)
+        w_chunk_time = (cost_info.bwd_grad_w_time +
+                        cost_info.bwd_grad_w_net_time)
+        return fwd_chunk_time, b_input_chunk_time, w_chunk_time
+
+    def calculate_zb_h2_bubble(self, pp, mbc, forward_times, b_times, w_times, draw=False, output_path=None):
+        """Zero-Bubble H2 pipeline schedule (Qi et al., ICLR 2024).
+
+        Backward is split into B (activation gradient, critical path) and W
+        (weight gradient, deferrable). Each rank has a two-track schedule:
+
+        - Primary track: an F/B sequence with deeper warmup
+          ``min(2*(pp-g)-1, m)`` Fs, then ``(B,F)`` steady-state pairs, then
+          a B-drain. W tasks are forced into this track only when the live
+          count would exceed ``2*pp-1`` before an F (memory-driven).
+        - Fill track: the remaining W tasks, deferred as long as possible.
+
+        At run-time, each rank prefers its primary track; when all Fs on a
+        rank are done, a fill W is pulled ahead of the next primary B
+        whenever ``b_mb - w_mb >= 2*g + 1``. If primary is blocked waiting
+        on a cross-rank dependency, the rank falls back to the next fill W.
+        """
+        mem_limit = 2 * pp - 1
+
+        # 1) Build per-rank primary and fill tracks.
+        primary_tracks = []
+        fill_tracks = []
+        f_total_per_rank = [mbc] * pp
+
+        for g in range(pp):
+            # Build the F/B sequence with deeper warmup.
+            fb_seq = []
+            n_warmup = min(2 * (pp - g) - 1, mbc)
+            for i in range(n_warmup):
+                fb_seq.append(("F", i))
+            next_b = 0
+            next_f = n_warmup
+            while next_f < mbc:
+                fb_seq.append(("B", next_b)); next_b += 1
+                fb_seq.append(("F", next_f)); next_f += 1
+            while next_b < mbc:
+                fb_seq.append(("B", next_b)); next_b += 1
+
+            # Walk the F/B sequence, inserting W only when memory forces it.
+            order = []
+            live = 0
+            next_w = 0
+            b_done = [False] * mbc
+            for op, mb in fb_seq:
+                if op == "F":
+                    while live >= mem_limit and next_w < mbc and b_done[next_w]:
+                        order.append(("W", next_w))
+                        live -= 1
+                        next_w += 1
+                    order.append(("F", mb))
+                    live += 1
+                else:  # "B"
+                    order.append(("B", mb))
+                    b_done[mb] = True
+
+            primary_tracks.append(order)
+            fill_tracks.append([("W", i) for i in range(next_w, mbc)])
+
+        # 2) Resolve timings with iterative event-pass scheduler.
+        schedules = [[] for _ in range(pp)]
+        fwd_done = [dict() for _ in range(pp)]
+        bwd_done = [dict() for _ in range(pp)]
+        primary_cursor = [0] * pp
+        fill_cursor = [0] * pp
+        f_done_count = [0] * pp
+        rank_t = [0.0] * pp
+
+        def try_schedule(r, kind, mb):
+            if kind == "F":
+                if r > 0 and mb not in fwd_done[r - 1]:
+                    return None
+                dep = fwd_done[r - 1][mb] if r > 0 else 0.0
+                dur = forward_times[r]
+                start = max(rank_t[r], dep)
+                return start, dur, start + dur
+            if kind == "B":
+                if mb not in fwd_done[r]:
+                    return None
+                if r < pp - 1 and mb not in bwd_done[r + 1]:
+                    return None
+                dep_f = fwd_done[r][mb]
+                dep_b = bwd_done[r + 1][mb] if r < pp - 1 else 0.0
+                dur = b_times[r]
+                start = max(rank_t[r], dep_f, dep_b)
+                return start, dur, start + dur
+            # "W"
+            if mb not in bwd_done[r]:
+                return None
+            dep_b = bwd_done[r][mb]
+            dur = w_times[r]
+            start = max(rank_t[r], dep_b)
+            return start, dur, start + dur
+
+        def commit(r, kind, mb, start, dur, end):
+            schedules[r].append((kind, mb, start, dur, end))
+            if kind == "F":
+                fwd_done[r][mb] = end
+            elif kind == "B":
+                bwd_done[r][mb] = end
+            rank_t[r] = end
+
+        while any(
+            primary_cursor[r] < len(primary_tracks[r])
+            or fill_cursor[r] < len(fill_tracks[r])
+            for r in range(pp)
+        ):
+            progressed = False
+            for r in range(pp):
+                primary_remaining = primary_cursor[r] < len(primary_tracks[r])
+                fill_remaining = fill_cursor[r] < len(fill_tracks[r])
+                if not primary_remaining and not fill_remaining:
+                    continue
+
+                all_f_done = f_done_count[r] >= f_total_per_rank[r]
+                w_threshold = 2 * r + 1
+
+                if primary_remaining:
+                    kind, mb = primary_tracks[r][primary_cursor[r]]
+                    result = try_schedule(r, kind, mb)
+                    if result is not None:
+                        # After all F ops done, prefer fill W over next B
+                        # when b_mb - w_mb >= 2*g + 1.
+                        if all_f_done and fill_remaining and kind == "B":
+                            fkind, fmb = fill_tracks[r][fill_cursor[r]]
+                            if fkind == "W" and mb - fmb >= w_threshold:
+                                fresult = try_schedule(r, fkind, fmb)
+                                if fresult is not None:
+                                    fstart, fdur, fend = fresult
+                                    commit(r, fkind, fmb, fstart, fdur, fend)
+                                    fill_cursor[r] += 1
+                                    progressed = True
+                                    continue
+                        start, dur, end = result
+                        commit(r, kind, mb, start, dur, end)
+                        primary_cursor[r] += 1
+                        if kind == "F":
+                            f_done_count[r] += 1
+                        progressed = True
+                        continue
+
+                # Primary blocked or exhausted — fall back to fill W.
+                if fill_remaining:
+                    fkind, fmb = fill_tracks[r][fill_cursor[r]]
+                    fresult = try_schedule(r, fkind, fmb)
+                    if fresult is not None:
+                        fstart, fdur, fend = fresult
+                        commit(r, fkind, fmb, fstart, fdur, fend)
+                        fill_cursor[r] += 1
+                        progressed = True
+
+            if not progressed:
+                raise RuntimeError(
+                    "ZB-H2 scheduler deadlock; check event ordering / deps."
+                )
+
+        max_time = max(s[-1][4] for s in schedules)
+
+        if draw:
+            fig, ax = plt.subplots(figsize=(14, 5))
+            colors = {"F": "#6b8ec9", "B": "#6db5b5", "W": "#5fa75f"}
+            for rank, tasks in enumerate(schedules):
+                for task_type, mb, start, duration, end in tasks:
+                    ax.barh(y=pp - 1 - rank, width=duration, left=start,
+                            height=0.6, color=colors[task_type], edgecolor="black")
+                    ax.text(start + duration / 2, pp - 1 - rank, f"{task_type}{mb + 1}",
+                            va="center", ha="center", fontsize=8, color="black")
+            ax.set_yticks(range(pp))
+            ax.set_yticklabels([f"Stage {i}" for i in reversed(range(pp))])
+            ax.set_xlabel("Time")
+            ax.set_title(f"ZB-H2 Pipeline Execution Timeline (pp={pp}, mbc={mbc})")
+            plt.grid(True, axis="x", linestyle="--", alpha=0.6)
+            plt.tight_layout()
+            plt.savefig(output_path or "zb_h2_pipeline.png")
+            plt.close(fig)
+
+        return max_time
+
+    def _compute_pp_total_time(self, draw=False, output_path=None):
+        pp = self.strategy.pp_size
+        mbc = self.strategy.micro_batch_num
+
+        if self.strategy.pp_schedule == "zb_h2":
+            fwd_times, b_times, w_times = [], [], []
+            fwd, b, w = self._compute_single_batch_fwd_b_w_time(FIRST_CHUNK)
+            fwd_times.append(fwd); b_times.append(b); w_times.append(w)
+            if pp > 2:
+                fwd, b, w = self._compute_single_batch_fwd_b_w_time(MIDDLE_CHUNK)
+                fwd_times.extend([fwd] * (pp - 2))
+                b_times.extend([b] * (pp - 2))
+                w_times.extend([w] * (pp - 2))
+            if pp > 1:
+                fwd, b, w = self._compute_single_batch_fwd_b_w_time(LAST_CHUNK)
+                fwd_times.append(fwd); b_times.append(b); w_times.append(w)
+            return self.calculate_zb_h2_bubble(
+                pp, mbc, fwd_times, b_times, w_times,
+                draw=draw, output_path=output_path,
+            )
+
         fwd_chunk_time, bwd_chunk_time = self._compute_single_batch_fwd_bwd_time(FIRST_CHUNK)
         forward_times = [fwd_chunk_time]
         backward_times = [bwd_chunk_time]
-        has_middle_chunks = self.strategy.pp_size > 2
-        has_last_chunk = self.strategy.pp_size > 1
+        has_middle_chunks = pp > 2
+        has_last_chunk = pp > 1
         if has_middle_chunks:
             fwd_chunk_time, bwd_chunk_time = self._compute_single_batch_fwd_bwd_time(MIDDLE_CHUNK)
-            forward_times.extend([fwd_chunk_time]*(self.strategy.pp_size - 2))
-            backward_times.extend([bwd_chunk_time]*(self.strategy.pp_size - 2))
+            forward_times.extend([fwd_chunk_time]*(pp - 2))
+            backward_times.extend([bwd_chunk_time]*(pp - 2))
         if has_last_chunk:
             fwd_chunk_time, bwd_chunk_time = self._compute_single_batch_fwd_bwd_time(LAST_CHUNK)
             forward_times.append(fwd_chunk_time)
             backward_times.append(bwd_chunk_time)
 
-        single_iter_time = self.calculate_1f1b_bubble(self.strategy.pp_size, self.strategy.micro_batch_num, forward_times, backward_times, draw = False)
+        single_iter_time = self.calculate_1f1b_bubble(
+            pp, mbc, forward_times, backward_times,
+            draw=draw, output_path=output_path,
+        )
         return single_iter_time
+
+    def draw_pp_gantt(self, output_path=None):
+        """Render the Gantt chart for the configured PP schedule.
+
+        Dispatches on ``strategy.pp_schedule`` and returns the simulated
+        iteration time. Honours the chosen schedule's per-rank timing
+        decomposition (fused B for 1F1B, split B/W for ZB-H2).
+        """
+        return self._compute_pp_total_time(draw=True, output_path=output_path)
     
     def _analysis_single_iter_cost_impl(self):
         # we construct the result in the following hierarchy:
