@@ -652,6 +652,7 @@ class MetaModule(BaseModel, metaclass = PostInitMeta):
         self._model_info = ModuleMemoryInfo()
         self._compute_info = ModuleComputeInfo()
         self._cost_info = ModuleCostInfo()
+        self.output_info_ = None
         self.path_debug_context = None
         self.parent = None
         self.current = None

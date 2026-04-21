@@ -8,6 +8,7 @@ from copy import deepcopy
 from typing import List, Union, Dict
 from sympy import divisors
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 from simumax.core.base_struct import PathDebugContext
 from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, set_capture_graph_only, TMP_PATH, SIMU_CHECK, SIMU_DEBUG, ENABLE_SIMU_GRAPH
@@ -214,6 +215,11 @@ class PerfBase(ABC):
         if capture_graph:
             self.graph = self.capture(save_path)
 
+        # Sample per-microbatch seq_lens exactly once per simulation.
+        # Constant array when seq_len_std == 0 (current behaviour).
+        if hasattr(self, "_sample_seq_lens"):
+            self.seq_lens = self._sample_seq_lens()
+
         self._run()
 class PerfLLM(PerfBase):
 
@@ -229,6 +235,13 @@ class PerfLLM(PerfBase):
             middle_stage_chunk=dict(),
             last_stage_chunk=dict()
         )
+        # Per-microbatch sampled sequence lengths (np.int64 array, len == micro_batch_num).
+        # Populated in run_estimate via _sample_seq_lens(). Constant-valued when
+        # strategy.seq_len_std == 0 (default).
+        self.seq_lens: np.ndarray = None
+        # Cache for per-(chunk, seq_len_int) timing tuples.
+        # Keys: (chunk_name, s_int). Values: (fwd_time, b_time, w_time).
+        self._chunk_cost_cache: Dict[tuple, tuple] = {}
         os.makedirs(TMP_PATH, exist_ok=True)
 
     def __del__(self):
@@ -239,6 +252,44 @@ class PerfLLM(PerfBase):
                     shutil.rmtree(TMP_PATH)
         except Exception as e:
             print(f"Error deleting file: {e}")
+
+    def _sample_seq_lens(self) -> np.ndarray:
+        """Sample one sequence length per microbatch.
+
+        Returns a length-``micro_batch_num`` int64 array. When
+        ``strategy.seq_len_std == 0`` (default) the array is constant and the
+        simulation degenerates to the original single-seq_len behaviour.
+
+        With non-zero std the values are drawn from
+        ``Normal(seq_len_mean, seq_len_std)``, rounded to int, clipped to
+        ``[seq_len_min, seq_len_max]`` (``seq_len_max`` defaults to
+        ``10 * seq_len_mean`` if unset), and when sequence parallelism is on
+        snapped *down* to a multiple of ``tp_size`` (bumped up to ``tp_size``
+        if rounding would yield 0).
+        """
+        strategy = self.strategy
+        mbc = strategy.micro_batch_num
+        mean = strategy.seq_len_mean if strategy.seq_len_mean is not None else strategy.seq_len
+        std = strategy.seq_len_std
+        if std == 0.0:
+            return np.full(mbc, int(mean), dtype=np.int64)
+
+        rng = np.random.default_rng(strategy.seq_len_seed)
+        raw = rng.normal(mean, std, size=mbc)
+        lo = strategy.seq_len_min if strategy.seq_len_min is not None else 1
+        hi = strategy.seq_len_max if strategy.seq_len_max is not None else int(10 * mean)
+        clipped = np.clip(np.rint(raw), lo, hi).astype(np.int64)
+        if strategy.enable_sequence_parallel and strategy.tp_size > 1:
+            tp = strategy.tp_size
+            clipped = np.maximum(tp, (clipped // tp) * tp)
+        print(
+            f"[SimuMax] Variable seq_len: N(mean={mean}, std={std}), "
+            f"seed={strategy.seq_len_seed}, mbc={mbc} -> "
+            f"min={int(clipped.min())}, "
+            f"mean={float(clipped.mean()):.1f}, "
+            f"max={int(clipped.max())}; values={clipped.tolist()}"
+        )
+        return clipped
             
     def get_num_layers_to_build(self, config: StrategyConfig, model_conf: ModelConfig, parallel_stage="first") -> int:
         """
@@ -801,6 +852,7 @@ class PerfLLM(PerfBase):
         return result
     
     def calculate_1f1b_bubble(self, pp, mbc, forward_times, backward_times, draw=False, output_path=None):
+        # forward_times / backward_times are [pp][mbc] 2-D lists.
         schedules = [[] for _ in range(pp)]
         fwd_ready = [[0]  for _ in range(pp)]
         bwd_ready = [[0]  for _ in range(pp)]
@@ -813,23 +865,26 @@ class PerfLLM(PerfBase):
                     current_time = schedules[rank][-1][4] if schedules[rank] else 0
                     prev_fwd = fwd_ready[rank - 1][-1] if rank > 0 else 0
                     start_time = max(current_time, prev_fwd)
-                    duration = forward_times[rank]
-                    schedules[rank].append(('F', len(fwd_ready[rank]), start_time, duration, start_time+duration))
+                    fwd_mb = len(fwd_ready[rank]) - 1
+                    duration = forward_times[rank][fwd_mb]
+                    schedules[rank].append(('F', fwd_mb, start_time, duration, start_time+duration))
                     fwd_ready[rank].append(start_time + duration)
                 else:
                     "F-B"
                     current_time = schedules[rank][-1][4] if schedules[rank] else 0
                     prev_fwd = fwd_ready[rank - 1][-1] if rank > 0 else 0
                     start_time = max(current_time, prev_fwd)
-                    duration = forward_times[rank]
-                    schedules[rank].append(('F', len(fwd_ready[rank]), start_time, duration, start_time+duration))
+                    fwd_mb = len(fwd_ready[rank]) - 1
+                    duration = forward_times[rank][fwd_mb]
+                    schedules[rank].append(('F', fwd_mb, start_time, duration, start_time+duration))
                     fwd_ready[rank].append(start_time + duration)
 
                     current_time = schedules[rank][-1][4]
                     next_bwd = bwd_ready[rank + 1][-1] if rank < pp - 1 else 0
                     start_time = max(current_time, next_bwd)
-                    duration = backward_times[rank]
-                    schedules[rank].append(('B', len(bwd_ready[rank]), start_time, duration, start_time+duration))
+                    bwd_mb = len(bwd_ready[rank]) - 1
+                    duration = backward_times[rank][bwd_mb]
+                    schedules[rank].append(('B', bwd_mb, start_time, duration, start_time+duration))
                     bwd_ready[rank].append(start_time + duration)
 
 
@@ -839,8 +894,9 @@ class PerfLLM(PerfBase):
                 current_time = schedules[rank][-1][4]
                 next_bwd = bwd_ready[rank + 1][-1] if rank < pp - 1 else 0
                 start_time = max(current_time, next_bwd)
-                duration = backward_times[rank]
-                schedules[rank].append(('B', len(bwd_ready[rank]), start_time, duration, start_time+duration))
+                bwd_mb = len(bwd_ready[rank]) - 1
+                duration = backward_times[rank][bwd_mb]
+                schedules[rank].append(('B', bwd_mb, start_time, duration, start_time+duration))
                 bwd_ready[rank].append(start_time + duration)
 
         max_time = max([s[-1][4] for s in schedules])
@@ -937,6 +993,111 @@ class PerfLLM(PerfBase):
                         cost_info.bwd_grad_w_net_time)
         return fwd_chunk_time, b_input_chunk_time, w_chunk_time
 
+    # ------------------------------------------------------------------
+    # Per-(chunk, seq_len) timing cache (variable sequence-length support)
+    # ------------------------------------------------------------------
+
+    def _pp_time_for(self, s: int) -> float:
+        """PP p2p send/recv time (fwd+bwd, 2 hops) for a microbatch of seq_len ``s``."""
+        if self.strategy.pp_size <= 1:
+            return 0.0
+        pp_comm_size = (
+            self.strategy.micro_batch_size
+            * int(s)
+            * self.model_config.hidden_size
+            * self.dtype_to_element_size[self.strategy.dtype]
+        )
+        if self.strategy.enable_sequence_parallel:
+            pp_comm_size = pp_comm_size / self.strategy.tp_size
+        return 2 * self.system.compute_net_op_time(
+            "p2p", pp_comm_size, 2, net=self.strategy.pp_net
+        )
+
+    def _populate_chunk_cost_cache(self, chunks, seq_lens) -> None:
+        """Populate ``self._chunk_cost_cache`` with one entry per
+        ``(chunk_name, s_int)`` in ``chunks x set(seq_lens)``.
+
+        Each entry is a dict of compute/net time components pulled from the
+        chunk's ``_cost_info`` after invoking it with the given seq_len. After
+        populating all entries for a chunk, the chunk is re-invoked once at
+        ``_nominal_seq_len_for_mem()`` so subsequent analysis paths that read
+        the chunk state directly (not via the cache) see the nominal state.
+        """
+        unique_s = sorted({int(s) for s in seq_lens})
+        nominal = self._nominal_seq_len_for_mem()
+        for chunk_name in chunks:
+            ctx = PathDebugContext(
+                point_datas={}, point_datas_with_recomp={}, path_list=[]
+            )
+            for s in unique_s:
+                key = (chunk_name, s)
+                if key in self._chunk_cost_cache:
+                    continue
+                if s != nominal:
+                    self._invoke_chunk(chunk_name, s, ctx)
+                # else: chunk state is already at nominal (set by _run).
+                ci = self.model_chunk_dict[chunk_name].get_cost_info()
+                self._chunk_cost_cache[key] = {
+                    "fwd_compute_time": ci.fwd_compute_time,
+                    "fwd_net_time": ci.fwd_net_time,
+                    "bwd_compute_time": ci.bwd_compute_time,
+                    "bwd_net_time": ci.bwd_net_time,
+                    "bwd_grad_act_time": ci.bwd_grad_act_time,
+                    "bwd_grad_act_net_time": ci.bwd_grad_act_net_time,
+                    "bwd_grad_w_time": ci.bwd_grad_w_time,
+                    "bwd_grad_w_net_time": ci.bwd_grad_w_net_time,
+                    "recompute_compute_time": ci.recompute_compute_time,
+                    "recompute_net_time": ci.recompute_net_time,
+                }
+            # Restore the chunk to nominal seq_len so later analysis reads
+            # the expected state.
+            if unique_s and unique_s[-1] != nominal or (len(unique_s) > 1):
+                self._invoke_chunk(chunk_name, nominal, ctx)
+
+    def _chunk_fwd_bwd_at(self, chunk_name: str, s: int):
+        """Return (fwd_time, bwd_time) for a microbatch of seq_len ``s`` on ``chunk_name``."""
+        entry = self._chunk_cost_cache[(chunk_name, int(s))]
+        pp_time = self._pp_time_for(s)
+        fwd = entry["fwd_compute_time"] + entry["fwd_net_time"] + pp_time
+        bwd = (
+            entry["bwd_compute_time"]
+            + entry["bwd_net_time"]
+            + entry["recompute_compute_time"]
+            + entry["recompute_net_time"]
+            + pp_time
+        )
+        return fwd, bwd
+
+    def _chunk_fwd_b_w_at(self, chunk_name: str, s: int):
+        """Return (fwd, B, W) for a microbatch of seq_len ``s`` on ``chunk_name``.
+
+        B covers the activation-gradient critical path + recompute; W covers
+        the deferrable weight-gradient path. Sum equals fwd+bwd from
+        :meth:`_chunk_fwd_bwd_at`.
+        """
+        entry = self._chunk_cost_cache[(chunk_name, int(s))]
+        pp_time = self._pp_time_for(s)
+        fwd = entry["fwd_compute_time"] + entry["fwd_net_time"] + pp_time
+        b = (
+            entry["bwd_grad_act_time"]
+            + entry["bwd_grad_act_net_time"]
+            + entry["recompute_compute_time"]
+            + entry["recompute_net_time"]
+            + pp_time
+        )
+        w = entry["bwd_grad_w_time"] + entry["bwd_grad_w_net_time"]
+        return fwd, b, w
+
+    def _chunk_names_for_pp(self):
+        """The set of chunk names that actually exist for the current PP size."""
+        pp = self.strategy.pp_size
+        chunks = [FIRST_CHUNK]
+        if pp > 2:
+            chunks.append(MIDDLE_CHUNK)
+        if pp > 1:
+            chunks.append(LAST_CHUNK)
+        return chunks
+
     def _calculate_zb_bubble(self, pp, mbc, forward_times, b_times, w_times,
                              n_warmup_fn, mem_limit, schedule_name,
                              draw=False, output_path=None):
@@ -1000,7 +1161,7 @@ class PerfLLM(PerfBase):
                 if r > 0 and mb not in fwd_done[r - 1]:
                     return None
                 dep = fwd_done[r - 1][mb] if r > 0 else 0.0
-                dur = forward_times[r]
+                dur = forward_times[r][mb]
                 start = max(rank_t[r], dep)
                 return start, dur, start + dur
             if kind == "B":
@@ -1010,14 +1171,14 @@ class PerfLLM(PerfBase):
                     return None
                 dep_f = fwd_done[r][mb]
                 dep_b = bwd_done[r + 1][mb] if r < pp - 1 else 0.0
-                dur = b_times[r]
+                dur = b_times[r][mb]
                 start = max(rank_t[r], dep_f, dep_b)
                 return start, dur, start + dur
             # "W"
             if mb not in bwd_done[r]:
                 return None
             dep_b = bwd_done[r][mb]
-            dur = w_times[r]
+            dur = w_times[r][mb]
             start = max(rank_t[r], dep_b)
             return start, dur, start + dur
 
@@ -1168,7 +1329,7 @@ class PerfLLM(PerfBase):
                     if r > 0 and mb not in fwd_done[r - 1]:
                         continue
                     dep = fwd_done[r - 1][mb] if r > 0 else 0.0
-                    dur = forward_times[r]
+                    dur = forward_times[r][mb]
                     start = max(rank_t[r], dep)
                     end = start + dur
                     schedules[r].append(("F", mb, start, dur, end))
@@ -1181,7 +1342,7 @@ class PerfLLM(PerfBase):
                         continue
                     dep_f = fwd_done[r][mb]
                     dep_b = bwd_done[r + 1][mb] if r < pp - 1 else 0.0
-                    dur = backward_times[r]
+                    dur = backward_times[r][mb]
                     start = max(rank_t[r], dep_f, dep_b)
                     end = start + dur
                     schedules[r].append(("B", mb, start, dur, end))
@@ -1273,7 +1434,7 @@ class PerfLLM(PerfBase):
                     dep = fwd_done[pr][(mb, pv)]
                 else:
                     dep = 0.0
-                dur = fwd_times_vs[gvs]
+                dur = fwd_times_vs[gvs][mb]
                 start = max(rank_t[r], dep)
                 return start, dur, start + dur
             if kind == "B":
@@ -1289,14 +1450,14 @@ class PerfLLM(PerfBase):
                     dep_b = b_done[nr][(mb, nv)]
                 else:
                     dep_b = 0.0
-                dur = (b_times_vs[gvs] if split else bwd_times_vs[gvs])
+                dur = (b_times_vs[gvs][mb] if split else bwd_times_vs[gvs][mb])
                 start = max(rank_t[r], dep_f, dep_b)
                 return start, dur, start + dur
             # W
             if (mb, vs_local) not in b_done[r]:
                 return None
             dep = b_done[r][(mb, vs_local)]
-            dur = w_times_vs[gvs]
+            dur = w_times_vs[gvs][mb]
             start = max(rank_t[r], dep)
             return start, dur, start + dur
 
@@ -1495,7 +1656,7 @@ class PerfLLM(PerfBase):
                 dep = fwd_done[pr][(mb, pv)]
             else:
                 dep = 0.0
-            dur = fwd_times_vs[gvs]
+            dur = fwd_times_vs[gvs][mb]
             start = max(rank_t[r], dep)
             return start, dur, start + dur
 
@@ -1513,7 +1674,7 @@ class PerfLLM(PerfBase):
                 dep_b = b_done[nr][(mb, nv)]
             else:
                 dep_b = 0.0
-            dur = b_times_vs[gvs]
+            dur = b_times_vs[gvs][mb]
             start = max(rank_t[r], dep_f, dep_b)
             return start, dur, start + dur
 
@@ -1522,7 +1683,7 @@ class PerfLLM(PerfBase):
                 return None
             gvs = gvs_of(r, vs_local)
             dep = b_done[r][(mb, vs_local)]
-            dur = w_times_vs[gvs]
+            dur = w_times_vs[gvs][mb]
             start = max(rank_t[r], dep)
             return start, dur, start + dur
 
@@ -1677,7 +1838,7 @@ class PerfLLM(PerfBase):
                 dep = fwd_done[pr][(mb, pv)]
             else:
                 dep = 0.0
-            dur = fwd_times_vs[gvs]
+            dur = fwd_times_vs[gvs][mb]
             start = max(rank_t[r], dep)
             return start, dur, start + dur
 
@@ -1695,7 +1856,7 @@ class PerfLLM(PerfBase):
                 dep_b = b_done[nr][(mb, nv)]
             else:
                 dep_b = 0.0
-            dur = b_times_vs[gvs]
+            dur = b_times_vs[gvs][mb]
             start = max(rank_t[r], dep_f, dep_b)
             return start, dur, start + dur
 
@@ -1704,7 +1865,7 @@ class PerfLLM(PerfBase):
                 return None
             gvs = gvs_of(r, vs_local)
             dep = b_done[r][(mb, vs_local)]
-            dur = w_times_vs[gvs]
+            dur = w_times_vs[gvs][mb]
             start = max(rank_t[r], dep)
             return start, dur, start + dur
 
@@ -1927,68 +2088,104 @@ class PerfLLM(PerfBase):
         }
         return mapping.get(key, "pp_pipeline.png")
 
-    def _per_rank_fwd_bwd_times(self):
-        """Return ``(forward_times, backward_times)`` lists of length ``pp``,
-        filled from the first/middle/last chunk cost info (fused B)."""
+    def _rank_to_chunk_name(self):
+        """Map pipeline rank -> chunk name (first / middle / last).
+
+        Used to look up per-(chunk, seq_len) cached timings for a given rank.
+        """
         pp = self.strategy.pp_size
-        fwd, bwd = self._compute_single_batch_fwd_bwd_time(FIRST_CHUNK)
-        forward_times, backward_times = [fwd], [bwd]
+        if pp == 1:
+            return [FIRST_CHUNK]
+        result = [FIRST_CHUNK]
         if pp > 2:
-            fwd, bwd = self._compute_single_batch_fwd_bwd_time(MIDDLE_CHUNK)
-            forward_times.extend([fwd] * (pp - 2))
-            backward_times.extend([bwd] * (pp - 2))
-        if pp > 1:
-            fwd, bwd = self._compute_single_batch_fwd_bwd_time(LAST_CHUNK)
-            forward_times.append(fwd)
-            backward_times.append(bwd)
+            result.extend([MIDDLE_CHUNK] * (pp - 2))
+        result.append(LAST_CHUNK)
+        return result
+
+    def _ensure_seq_lens(self):
+        """Guard: populate self.seq_lens with a constant array if unset."""
+        if self.seq_lens is None:
+            self.seq_lens = np.full(
+                self.strategy.micro_batch_num,
+                int(self.strategy.seq_len),
+                dtype=np.int64,
+            )
+
+    def _per_rank_fwd_bwd_times(self):
+        """Return ``(forward_times, backward_times)``, each a ``pp x mbc``
+        2-D list indexed as ``arr[rank][microbatch]``. When
+        ``seq_len_std == 0`` all rows are constant, matching prior behaviour.
+        """
+        self._ensure_seq_lens()
+        pp = self.strategy.pp_size
+        mbc = self.strategy.micro_batch_num
+        self._populate_chunk_cost_cache(self._chunk_names_for_pp(), self.seq_lens)
+        rank_chunk = self._rank_to_chunk_name()
+
+        forward_times = [[0.0] * mbc for _ in range(pp)]
+        backward_times = [[0.0] * mbc for _ in range(pp)]
+        for r in range(pp):
+            chunk_name = rank_chunk[r]
+            for m in range(mbc):
+                s = int(self.seq_lens[m])
+                fwd, bwd = self._chunk_fwd_bwd_at(chunk_name, s)
+                forward_times[r][m] = fwd
+                backward_times[r][m] = bwd
         return forward_times, backward_times
 
     def _per_rank_fwd_b_w_times(self):
-        """Return ``(forward_times, b_times, w_times)`` of length ``pp`` for
-        schedules that split backward into B (activation) + W (weight)."""
+        """Return ``(forward_times, b_times, w_times)``, each a ``pp x mbc``
+        2-D list indexed as ``arr[rank][microbatch]`` (ZB-style B/W split).
+        """
+        self._ensure_seq_lens()
         pp = self.strategy.pp_size
-        fwd, b, w = self._compute_single_batch_fwd_b_w_time(FIRST_CHUNK)
-        forward_times, b_times, w_times = [fwd], [b], [w]
-        if pp > 2:
-            fwd, b, w = self._compute_single_batch_fwd_b_w_time(MIDDLE_CHUNK)
-            forward_times.extend([fwd] * (pp - 2))
-            b_times.extend([b] * (pp - 2))
-            w_times.extend([w] * (pp - 2))
-        if pp > 1:
-            fwd, b, w = self._compute_single_batch_fwd_b_w_time(LAST_CHUNK)
-            forward_times.append(fwd)
-            b_times.append(b)
-            w_times.append(w)
+        mbc = self.strategy.micro_batch_num
+        self._populate_chunk_cost_cache(self._chunk_names_for_pp(), self.seq_lens)
+        rank_chunk = self._rank_to_chunk_name()
+
+        forward_times = [[0.0] * mbc for _ in range(pp)]
+        b_times = [[0.0] * mbc for _ in range(pp)]
+        w_times = [[0.0] * mbc for _ in range(pp)]
+        for r in range(pp):
+            chunk_name = rank_chunk[r]
+            for m in range(mbc):
+                s = int(self.seq_lens[m])
+                fwd, b, w = self._chunk_fwd_b_w_at(chunk_name, s)
+                forward_times[r][m] = fwd
+                b_times[r][m] = b
+                w_times[r][m] = w
         return forward_times, b_times, w_times
 
     def _per_virtual_stage_times(self, V, vs_to_rank, split_bw=False):
-        """Per-virtual-stage timing arrays of length ``V * pp``.
+        """Per-virtual-stage timing arrays, each a ``(V*pp) x mbc`` 2-D list.
 
         ``vs_to_rank(gvs)`` maps a global virtual-stage index to the rank
-        that owns it. Each virtual stage inherits its rank's single-batch
-        compute time divided by ``V`` (uniform layer split). Returns
-        ``(fwd, bwd)`` if ``split_bw`` is False, else ``(fwd, b, w)``.
+        that owns it. Each virtual stage inherits its rank's compute time
+        (for the relevant microbatch) divided by ``V`` (uniform layer split).
         """
+        self._ensure_seq_lens()
         pp = self.strategy.pp_size
+        mbc = self.strategy.micro_batch_num
         if split_bw:
             fwd_r, b_r, w_r = self._per_rank_fwd_b_w_times()
         else:
             fwd_r, bwd_r = self._per_rank_fwd_bwd_times()
         total_vs = V * pp
-        fwd_vs = [0.0] * total_vs
+        fwd_vs = [[0.0] * mbc for _ in range(total_vs)]
         if split_bw:
-            b_vs = [0.0] * total_vs
-            w_vs = [0.0] * total_vs
+            b_vs = [[0.0] * mbc for _ in range(total_vs)]
+            w_vs = [[0.0] * mbc for _ in range(total_vs)]
         else:
-            bwd_vs = [0.0] * total_vs
+            bwd_vs = [[0.0] * mbc for _ in range(total_vs)]
         for gvs in range(total_vs):
             r = vs_to_rank(gvs)
-            fwd_vs[gvs] = fwd_r[r] / V
-            if split_bw:
-                b_vs[gvs] = b_r[r] / V
-                w_vs[gvs] = w_r[r] / V
-            else:
-                bwd_vs[gvs] = bwd_r[r] / V
+            for m in range(mbc):
+                fwd_vs[gvs][m] = fwd_r[r][m] / V
+                if split_bw:
+                    b_vs[gvs][m] = b_r[r][m] / V
+                    w_vs[gvs][m] = w_r[r][m] / V
+                else:
+                    bwd_vs[gvs][m] = bwd_r[r][m] / V
         if split_bw:
             return fwd_vs, b_vs, w_vs
         return fwd_vs, bwd_vs
@@ -2147,8 +2344,14 @@ class PerfLLM(PerfBase):
         duration_times.append(single_iter_time_no_dp_opim + get_dp_and_optim(LAST_CHUNK)) if self.strategy.pp_size > 1 else 0
 
         final_duration_time_per_iter = max(duration_times)
-        all_tokens_per_iter = self.strategy.seq_len * self.strategy.global_batch_size
-        
+        # When seq_len_std > 0, total tokens per iter is the sum across
+        # sampled microbatches rather than nominal seq_len * global_batch.
+        if self.seq_lens is not None and self.strategy.seq_len_std > 0.0:
+            tokens_per_mb_slot = int(self.seq_lens.sum()) * self.strategy.micro_batch_size
+            all_tokens_per_iter = tokens_per_mb_slot * self.strategy.dp_size
+        else:
+            all_tokens_per_iter = self.strategy.seq_len * self.strategy.global_batch_size
+
         theory_flops_per_token = self.model_config.flops_per_token(context_seq_len=self.strategy.seq_len, with_attn=True)
         theory_flops = self.model_config.flops_per_token(context_seq_len=self.strategy.seq_len, with_attn=True) * all_tokens_per_iter //  self.strategy.world_size
         TGS = all_tokens_per_iter/(final_duration_time_per_iter/1000)/self.strategy.world_size
@@ -2237,80 +2440,86 @@ class PerfLLM(PerfBase):
             op_infos[key] = self.model_chunk_dict[key].get_all_gemm_cost_info()
         return op_infos
     
-    def _run(self):
-        # Fake first stage input
+    def _build_input_info(self, chunk_name: str, seq_len: int) -> InputOutputInfo:
+        """Build the ``InputOutputInfo`` fed to a model chunk for a given seq_len.
 
-        input_info_first_stage = InputOutputInfo(
+        The first chunk receives a 2-D ``(mbs, seq_len)`` token-id tensor; the
+        middle and last chunks receive ``(mbs, seq_len_after_sp, hidden)``
+        activation tensors, where ``seq_len_after_sp = seq_len // tp_size`` when
+        sequence parallelism is enabled.
+        """
+        mbs = self.strategy.micro_batch_size
+        if chunk_name == FIRST_CHUNK:
+            return InputOutputInfo(tensors=[TensorSize(shape=(mbs, seq_len))])
+        sp_seq_len = (
+            seq_len // self.strategy.tp_size
+            if self.strategy.enable_sequence_parallel
+            else seq_len
+        )
+        return InputOutputInfo(
             tensors=[
                 TensorSize(
-                    shape=(self.strategy.micro_batch_size, self.strategy.seq_len)
+                    shape=(mbs, sp_seq_len, self.model_config.hidden_size)
                 )
             ]
         )
+
+    def _invoke_chunk(self, chunk_name: str, seq_len: int, path_ctx: PathDebugContext):
+        """Invoke a chunk with a seq_len-specific input; returns nothing.
+
+        Side effect: refreshes ``self.model_chunk_dict[chunk_name]._cost_info``
+        and activation info to reflect the given seq_len.
+        """
+        input_info = self._build_input_info(chunk_name, seq_len)
+        _ = self.model_chunk_dict[chunk_name](input_info, path_ctx)
+
+    def _run(self):
+        # Use the nominal seq_len for the primary pass (memory/activation info).
+        # For variable seq_len simulations the per-microbatch *timing* is
+        # recomputed on demand via _chunk_fwd_b_w_at(); memory uses the
+        # conservative max(seq_lens) substitution (see _nominal_seq_len_for_mem).
+        nominal_seq_len = self._nominal_seq_len_for_mem()
+
         self.path_debug_context = PathDebugContext(
             point_datas={},
             point_datas_with_recomp={},
             target_point=self.debug_points,
             path_list=[],
         )
-        _ = self.model_chunk_dict[FIRST_CHUNK](
-            input_info_first_stage, self.path_debug_context
-        )
+        self._invoke_chunk(FIRST_CHUNK, nominal_seq_len, self.path_debug_context)
         self.pp_state_peak_point[FIRST_CHUNK] = self.model_chunk_dict[FIRST_CHUNK].compute_activations()
+
         if self.strategy.pp_size > 2:
-            seq_len = (
-                self.strategy.seq_len // self.strategy.tp_size
-                if self.strategy.enable_sequence_parallel
-                else self.strategy.seq_len
-            )
-            input_info_last_stage = InputOutputInfo(
-                tensors=[
-                    TensorSize(
-                        shape=(
-                            self.strategy.micro_batch_size,
-                            seq_len,
-                            self.model_config.hidden_size,
-                        )
-                    )
-                ]
-            )
             self.path_debug_context_last_stage = PathDebugContext(
                 point_datas={},
                 point_datas_with_recomp={},
-                # target_point=self.debug_points_last_stage,
                 path_list=[],
             )
-            _ = self.model_chunk_dict[MIDDLE_CHUNK](
-                input_info_last_stage, self.path_debug_context_last_stage
-            )    
+            self._invoke_chunk(MIDDLE_CHUNK, nominal_seq_len,
+                               self.path_debug_context_last_stage)
             self.pp_state_peak_point[MIDDLE_CHUNK] = self.model_chunk_dict[MIDDLE_CHUNK].compute_activations()
+
         if self.strategy.pp_size > 1:
-            seq_len = (
-                self.strategy.seq_len // self.strategy.tp_size
-                if self.strategy.enable_sequence_parallel
-                else self.strategy.seq_len
-            )
-            input_info_last_stage = InputOutputInfo(
-                tensors=[
-                    TensorSize(
-                        shape=(
-                            self.strategy.micro_batch_size,
-                            seq_len,
-                            self.model_config.hidden_size,
-                        )
-                    )
-                ]
-            )
             self.path_debug_context_last_stage = PathDebugContext(
                 point_datas={},
                 point_datas_with_recomp={},
                 target_point=self.debug_points_last_stage,
                 path_list=[],
             )
-            _ = self.model_chunk_dict[LAST_CHUNK](
-                input_info_last_stage, self.path_debug_context_last_stage
-            )    
+            self._invoke_chunk(LAST_CHUNK, nominal_seq_len,
+                               self.path_debug_context_last_stage)
             self.pp_state_peak_point[LAST_CHUNK] = self.model_chunk_dict[LAST_CHUNK].compute_activations()
+
+    def _nominal_seq_len_for_mem(self) -> int:
+        """Seq_len used for the memory/activation pass.
+
+        When seq_len_std == 0 this is just strategy.seq_len. When std > 0 we
+        use ``max(self.seq_lens)`` so the memory peak is conservative w.r.t.
+        the worst microbatch in the simulation.
+        """
+        if self.seq_lens is not None and self.strategy.seq_len_std > 0.0:
+            return int(self.seq_lens.max())
+        return self.strategy.seq_len
 
     def get_pp_stage_peak_mem(self, mem_result, peak_mem_key, toG:bool = False):
         assert peak_mem_key in ["peak_mem_with_reserved", "peak_mem"], f"peak_mem_key should be in ['peak_mem_with_reserved', 'peak_mem'] but got {peak_mem_key}"
@@ -2875,7 +3084,23 @@ class PerfLLM(PerfBase):
 
             with open(f"{save_path}/model_config.json", "w") as f:
                 f.write(str(self.model_config))
-            
+
+            if self.seq_lens is not None:
+                seq_lens_info = {
+                    "values": self.seq_lens.tolist(),
+                    "mean": float(self.seq_lens.mean()),
+                    "std": float(self.seq_lens.std()),
+                    "min": int(self.seq_lens.min()),
+                    "max": int(self.seq_lens.max()),
+                    "configured_mean": self.strategy.seq_len_mean if self.strategy.seq_len_mean is not None else self.strategy.seq_len,
+                    "configured_std": self.strategy.seq_len_std,
+                    "seed": self.strategy.seq_len_seed,
+                    "seq_len_min": self.strategy.seq_len_min,
+                    "seq_len_max": self.strategy.seq_len_max,
+                }
+                with open(f"{save_path}/seq_lens.json", "w") as f:
+                    json.dump(seq_lens_info, f, indent=2)
+
         # print mfu/tflops/peak_mem
         peak_mem = mem_result.data["peak_mem"] if 'peak_mem' in mem_result.data else (({s:r['peak_mem'] for s, r in mem_result.data.items()}))
         peak_mem_with_reserved = mem_result.data["peak_mem_with_reserved"] if 'peak_mem_with_reserved' in mem_result.data else (({s:r['peak_mem_with_reserved'] for s, r in mem_result.data.items()}))

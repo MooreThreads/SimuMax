@@ -178,6 +178,13 @@ class StrategyConfig(Config):
     """
 
     seq_len: Optional[int] = None
+    # Variable sequence length sampling (Gaussian per microbatch).
+    # If seq_len_std == 0 (default), behaviour is identical to a constant seq_len.
+    seq_len_mean: Optional[float] = None  # defaults to seq_len when None
+    seq_len_std: float = 0.0
+    seq_len_seed: Optional[int] = None
+    seq_len_min: Optional[int] = 1
+    seq_len_max: Optional[int] = None
     micro_batch_size: Optional[int] = None
     micro_batch_num: Optional[int] = None
     dtype: Optional[int] = 'bf16'
@@ -476,6 +483,22 @@ class StrategyConfig(Config):
 
         if self.recompute_granularity == "full_block":
             self.recompute_variance = False # megatron-LM's full recompute does not support variance
+
+        assert self.seq_len_std >= 0.0, (
+            f"seq_len_std must be >= 0, got {self.seq_len_std}"
+        )
+        if self.seq_len_std > 0.0:
+            mean = self.seq_len_mean if self.seq_len_mean is not None else self.seq_len
+            assert mean is not None and mean > 0, (
+                "seq_len_std > 0 requires a positive seq_len_mean (or seq_len) to be set"
+            )
+            assert self.seq_len_min is None or self.seq_len_min >= 1, (
+                f"seq_len_min must be >= 1, got {self.seq_len_min}"
+            )
+            if self.seq_len_max is not None and self.seq_len_min is not None:
+                assert self.seq_len_max >= self.seq_len_min, (
+                    f"seq_len_max ({self.seq_len_max}) must be >= seq_len_min ({self.seq_len_min})"
+                )
     def reset_global_batch_size(self, global_batch_size):
         assert global_batch_size % (self.dp_size * self.micro_batch_size)==0, f"global_batch_size {global_batch_size} must be divisible by dp_size*miro_batch_size(dp_size={self.dp_size}, micro_batch_size={self.micro_batch_size})"
         self.micro_batch_num = global_batch_size // (self.dp_size * self.micro_batch_size)
