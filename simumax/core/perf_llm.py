@@ -2365,18 +2365,55 @@ class PerfLLM(PerfBase):
         all_result["breakdown_result"] = breakdown_result
         all_result["all_tokens_per_iter"] = all_tokens_per_iter
 
-        def format_chunk_time(model_chunk, chunk_time, duration_time):
+        def chunk_total_work(model_chunk):
+            t = 0.0
+            for m in range(mbc):
+                s = int(self.seq_lens[m])
+                fwd_m, bwd_m = self._chunk_fwd_bwd_at(model_chunk, s)
+                t += fwd_m + bwd_m
+            return t
+
+        # Cache per-chunk totals so we can both populate format_chunk_time and
+        # aggregate across ranks for pp_utilization without recomputing.
+        chunk_work = {FIRST_CHUNK: chunk_total_work(FIRST_CHUNK)}
+        if pp_size > 2:
+            chunk_work[MIDDLE_CHUNK] = chunk_total_work(MIDDLE_CHUNK)
+        if pp_size > 1:
+            chunk_work[LAST_CHUNK] = chunk_total_work(LAST_CHUNK)
+
+        def format_chunk_time(model_chunk, max_chunk_time, duration_time):
+            # max_chunk_time: F+B at the nominal (== max(seq_lens) when seq_len_std > 0)
+            # seq_len — an upper bound per microbatch used for memory sizing.
+            # avg_chunk_time: sum_m (F+B at actual seq_lens[m]) / mbc. Equal to
+            # max_chunk_time under constant seq_lens; strictly smaller when seq_lens vary.
+            # bubble_time uses the sum of per-microbatch work so it reflects the true idle
+            # on that rank (max_iter_time − actual useful work), avoiding the over-estimate
+            # that mbc × max_chunk_time would produce under variable seq_lens.
+            total_work = chunk_work[model_chunk]
+            avg_chunk_time = total_work / mbc if mbc > 0 else 0.0
             return {
                 model_chunk:{
-                    'duration_time(chunk_timexmbc+dp_optim+bubble)': duration_time,
-                    'chunk_time(fwd+bwd)':chunk_time,
+                    'duration_time(avg_chunk_timexmbc+dp_optim+bubble)': duration_time,
+                    'avg_chunk_time(fwd+bwd)': avg_chunk_time,
+                    'max_chunk_time(fwd+bwd)': max_chunk_time,
                     'dp_and_optim_time': get_dp_and_optim(model_chunk),
-                    'bubble_time': single_iter_time_no_dp_opim - mbc*(chunk_time)
+                    'bubble_time': single_iter_time_no_dp_opim - total_work
                 }
             }
         all_result['all_chunk_times'] = format_chunk_time(FIRST_CHUNK, chunk_time, duration_times[0])
         all_result['all_chunk_times'].update(format_chunk_time(MIDDLE_CHUNK, chunk_time_middle_stage, duration_times[1]) if pp_size > 2 else {})
         all_result['all_chunk_times'].update(format_chunk_time(LAST_CHUNK, chunk_time_lstage, duration_times[-1]) if pp_size > 1 else {})
+
+        # pp_utilization = Σ_r work_r / (pp × max_iter_time). 1.0 means every rank is
+        # busy for the whole iteration (zero bubble); lower values mean more idle time
+        # distributed across ranks. Complement is the bubble fraction.
+        total_work_all_ranks = chunk_work[FIRST_CHUNK]
+        if pp_size > 2:
+            total_work_all_ranks += (pp_size - 2) * chunk_work[MIDDLE_CHUNK]
+        if pp_size > 1:
+            total_work_all_ranks += chunk_work[LAST_CHUNK]
+        pp_utilization = (total_work_all_ranks / (pp_size * single_iter_time_no_dp_opim)
+                          if single_iter_time_no_dp_opim > 0 else 1.0)
 
         all_result.update({
             'duration_time_per_iter': final_duration_time_per_iter,
@@ -2385,6 +2422,7 @@ class PerfLLM(PerfBase):
             'throughput per GPU per token (TFLOP/s/GPU/token)': TFLOPS_PER_TOKEN,
             'mfu_6nd_with_attn': new_mfu_6nd_with_attn,
             'mfu':new_mfu_6nd_with_attn,
+            'pp_utilization': pp_utilization,
             'moe_param_numel': f'{moe_param_numel/1e9:.2f}B',
         })
         all_result['flops_info'] = {
