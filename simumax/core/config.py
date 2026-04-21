@@ -185,6 +185,39 @@ class StrategyConfig(Config):
     seq_len_seed: Optional[int] = None
     seq_len_min: Optional[int] = 1
     seq_len_max: Optional[int] = None
+
+    # -------------------- Disturbance injection --------------------
+    # All three families default to "off" and reduce to nominal behaviour when
+    # their primary knob (std / count / prob) is zero.
+    #
+    # Feature A: per-task Gaussian duration noise. Every scheduled task
+    # (F / B / W for a given rank+microbatch) draws an independent multiplier
+    # from N(1, op_duration_std), clipped to [op_duration_min_factor,
+    # op_duration_max_factor].
+    op_duration_std: float = 0.0
+    op_duration_seed: Optional[int] = None
+    op_duration_min_factor: float = 0.1
+    op_duration_max_factor: float = 10.0
+
+    # Feature B: GPU run-length slowdown. For each of gpu_slowdown_count
+    # events, pick a physical rank uniformly and pick a start index into its
+    # execution-order task list (rejection-sampled so a full task_count run
+    # fits), then multiply those gpu_slowdown_task_count consecutive tasks'
+    # durations by gpu_slowdown_k. Overlapping events compound multiplicatively.
+    gpu_slowdown_count: int = 0
+    gpu_slowdown_k: float = 1.0
+    gpu_slowdown_task_count: int = 0
+    gpu_slowdown_seed: Optional[int] = None
+
+    # Feature C: random per-task slowdown. Each scheduled task independently
+    # draws a Bernoulli(op_slowdown_prob); triggered tasks get K multiplier.
+    # op_slowdown_max_count caps the total number of triggers (first-N in
+    # row-major (kind, rank, mb) order).
+    op_slowdown_prob: float = 0.0
+    op_slowdown_k: float = 1.0
+    op_slowdown_max_count: Optional[int] = None
+    op_slowdown_seed: Optional[int] = None
+
     micro_batch_size: Optional[int] = None
     micro_batch_num: Optional[int] = None
     dtype: Optional[int] = 'bf16'
@@ -499,6 +532,45 @@ class StrategyConfig(Config):
                 assert self.seq_len_max >= self.seq_len_min, (
                     f"seq_len_max ({self.seq_len_max}) must be >= seq_len_min ({self.seq_len_min})"
                 )
+
+        # ---------- Disturbance sanity checks ----------
+        assert self.op_duration_std >= 0.0, (
+            f"op_duration_std must be >= 0, got {self.op_duration_std}"
+        )
+        assert self.op_duration_min_factor > 0.0, (
+            f"op_duration_min_factor must be > 0, got {self.op_duration_min_factor}"
+        )
+        assert self.op_duration_max_factor >= self.op_duration_min_factor, (
+            f"op_duration_max_factor ({self.op_duration_max_factor}) must be "
+            f">= op_duration_min_factor ({self.op_duration_min_factor})"
+        )
+
+        assert self.gpu_slowdown_count >= 0, (
+            f"gpu_slowdown_count must be >= 0, got {self.gpu_slowdown_count}"
+        )
+        if self.gpu_slowdown_count > 0:
+            assert self.gpu_slowdown_k >= 1.0, (
+                f"gpu_slowdown_k must be >= 1.0, got {self.gpu_slowdown_k}"
+            )
+            assert self.gpu_slowdown_task_count >= 1, (
+                "gpu_slowdown_count > 0 requires gpu_slowdown_task_count >= 1, "
+                f"got {self.gpu_slowdown_task_count}"
+            )
+            # Tight upper bound on task_count (depends on schedule) is checked
+            # at runtime in PerfLLM once the per-rank execution order is known.
+
+        assert 0.0 <= self.op_slowdown_prob <= 1.0, (
+            f"op_slowdown_prob must be in [0, 1], got {self.op_slowdown_prob}"
+        )
+        if self.op_slowdown_prob > 0.0:
+            assert self.op_slowdown_k >= 1.0, (
+                f"op_slowdown_k must be >= 1.0, got {self.op_slowdown_k}"
+            )
+        if self.op_slowdown_max_count is not None:
+            assert self.op_slowdown_max_count >= 0, (
+                f"op_slowdown_max_count must be >= 0, got {self.op_slowdown_max_count}"
+            )
+
     def reset_global_batch_size(self, global_batch_size):
         assert global_batch_size % (self.dp_size * self.micro_batch_size)==0, f"global_batch_size {global_batch_size} must be divisible by dp_size*miro_batch_size(dp_size={self.dp_size}, micro_batch_size={self.micro_batch_size})"
         self.micro_batch_num = global_batch_size // (self.dp_size * self.micro_batch_size)

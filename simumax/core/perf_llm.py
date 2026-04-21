@@ -221,6 +221,16 @@ class PerfBase(ABC):
             self.seq_lens = self._sample_seq_lens()
 
         self._run()
+
+        # Sample per-task disturbance multipliers. All three features
+        # degrade to no-ops when their primary knob is 0 (default), so
+        # this block is invisible for un-configured simulations.
+        # Ordering matters: A and C are independent of the scheduler and
+        # must be sampled before Feature B's dry run applies them.
+        if hasattr(self, "_sample_op_disturbance"):
+            self._sample_op_disturbance()
+        if hasattr(self, "_sample_gpu_disturbance"):
+            self._sample_gpu_disturbance()
 class PerfLLM(PerfBase):
 
     """Performance model for LLM"""
@@ -242,6 +252,20 @@ class PerfLLM(PerfBase):
         # Cache for per-(chunk, seq_len_int) timing tuples.
         # Keys: (chunk_name, s_int). Values: (fwd_time, b_time, w_time).
         self._chunk_cost_cache: Dict[tuple, tuple] = {}
+        # Disturbance tables (None when disabled). Each is a dict keyed by
+        # kind ("F" / "B" / "W") whose value is a 2D ndarray of shape
+        # (n_rank_units, mbc) where n_rank_units is pp for physical-rank
+        # schedules and V*pp for virtual-stage schedules.
+        self.op_noise_mult = None          # Feature A multipliers (float)
+        self.op_slowdown_mask = None       # Feature C triggered mask (bool)
+        self.gpu_slowdown_mult = None      # Feature B multipliers (float)
+        # Sampled-event records for auditing (populated alongside the tables).
+        self.op_slowdown_records = []
+        self.gpu_slowdown_records = []
+        # Most recent scheduler output, stashed by each calculate_*_bubble
+        # method. Used by _sample_gpu_disturbance to read execution-order
+        # task lists after a dry run.
+        self._last_schedules = None
         os.makedirs(TMP_PATH, exist_ok=True)
 
     def __del__(self):
@@ -290,7 +314,238 @@ class PerfLLM(PerfBase):
             f"max={int(clipped.max())}; values={clipped.tolist()}"
         )
         return clipped
-            
+
+    # ------------------------------------------------------------------
+    # Disturbance injection (Features A / B / C)
+    # ------------------------------------------------------------------
+
+    def _disturbance_shape(self):
+        """Return ``(n_rank_units, kinds)`` matching the per-task timing
+        tables consumed by the scheduler for the current ``pp_schedule``.
+
+        ``n_rank_units`` is ``pp`` for physical-rank schedules (1f1b,
+        gpipe, zb_h1, zb_h2) and ``V*pp`` for virtual-stage schedules
+        (interleaved_1f1b, zb_v). ``kinds`` includes ``"W"`` only for
+        schedules that split the backward into B / W (zb_h1, zb_h2, zb_v).
+        """
+        schedule = self.strategy.pp_schedule
+        pp = self.strategy.pp_size
+        if schedule == "interleaved_1f1b":
+            return self.strategy.interleaving_size * pp, ("F", "B")
+        if schedule == "zb_v":
+            return 2 * pp, ("F", "B", "W")
+        if schedule in ("zb_h1", "zb_h2"):
+            return pp, ("F", "B", "W")
+        # 1f1b, gpipe
+        return pp, ("F", "B")
+
+    def _is_virtual_stage_schedule(self):
+        return self.strategy.pp_schedule in ("interleaved_1f1b", "zb_v")
+
+    def _vs_to_rank_owned(self):
+        """Return ``(V, vs_to_rank_fn, owned_vs)``.
+
+        ``owned_vs[r]`` is the ordered list of global-vs indices assigned
+        to physical rank ``r``. For physical-rank schedules ``V == 1`` and
+        ``owned_vs[r] == [r]``.
+        """
+        schedule = self.strategy.pp_schedule
+        pp = self.strategy.pp_size
+        if schedule == "interleaved_1f1b":
+            V = self.strategy.interleaving_size
+            vs_to_rank = lambda gvs: gvs % pp
+        elif schedule == "zb_v":
+            V = 2
+            vs_to_rank = lambda gvs: gvs if gvs < pp else (2 * pp - 1 - gvs)
+        else:
+            V = 1
+            vs_to_rank = lambda gvs: gvs
+        owned_vs = [[] for _ in range(pp)]
+        for gvs in range(V * pp):
+            owned_vs[vs_to_rank(gvs)].append(gvs)
+        return V, vs_to_rank, owned_vs
+
+    def _compose_mult(self, kind, idx, m):
+        """Composed (A × B × C) multiplier for a single task.
+
+        ``idx`` is the row index into the multiplier tables: physical rank
+        for 1f1b/gpipe/zb_h1/zb_h2, or global vs index for
+        interleaved_1f1b/zb_v.
+        """
+        mult = 1.0
+        if self.op_noise_mult is not None and kind in self.op_noise_mult:
+            mult *= float(self.op_noise_mult[kind][idx, m])
+        if self.op_slowdown_mask is not None and kind in self.op_slowdown_mask:
+            if self.op_slowdown_mask[kind][idx, m]:
+                mult *= self.strategy.op_slowdown_k
+        if self.gpu_slowdown_mult is not None and kind in self.gpu_slowdown_mult:
+            mult *= float(self.gpu_slowdown_mult[kind][idx, m])
+        return mult
+
+    def _sample_op_disturbance(self):
+        """Populate ``op_noise_mult`` (Feature A) and ``op_slowdown_mask``
+        (Feature C). Both default to ``None`` when disabled so the timing
+        application code can short-circuit.
+        """
+        strategy = self.strategy
+        n_rank_units, kinds = self._disturbance_shape()
+        mbc = strategy.micro_batch_num
+
+        # Feature A — per-task Gaussian multiplier.
+        if strategy.op_duration_std > 0.0:
+            rng_a = np.random.default_rng(strategy.op_duration_seed)
+            mult = {}
+            for kind in kinds:
+                raw = rng_a.normal(
+                    loc=1.0,
+                    scale=strategy.op_duration_std,
+                    size=(n_rank_units, mbc),
+                )
+                mult[kind] = np.clip(
+                    raw,
+                    strategy.op_duration_min_factor,
+                    strategy.op_duration_max_factor,
+                )
+            self.op_noise_mult = mult
+            flat = np.concatenate([m.ravel() for m in mult.values()])
+            print(
+                f"[SimuMax] Op-duration noise: N(1, {strategy.op_duration_std}), "
+                f"seed={strategy.op_duration_seed}, "
+                f"shape=({len(kinds)}, {n_rank_units}, {mbc}) -> "
+                f"min={float(flat.min()):.3f}, "
+                f"mean={float(flat.mean()):.3f}, "
+                f"max={float(flat.max()):.3f}"
+            )
+        else:
+            self.op_noise_mult = None
+
+        # Feature C — independent Bernoulli per task.
+        self.op_slowdown_records = []
+        if strategy.op_slowdown_prob > 0.0:
+            rng_c = np.random.default_rng(strategy.op_slowdown_seed)
+            mask = {}
+            for kind in kinds:
+                mask[kind] = rng_c.random(size=(n_rank_units, mbc)) < strategy.op_slowdown_prob
+            # Enforce global cap across (kind, rank_unit, mb) in row-major order:
+            # stack kinds in declared order, flatten, keep first N True entries.
+            if strategy.op_slowdown_max_count is not None:
+                stacked = np.stack([mask[k] for k in kinds], axis=0)
+                flat = stacked.reshape(-1)
+                kept = 0
+                for i in range(flat.size):
+                    if flat[i]:
+                        if kept < strategy.op_slowdown_max_count:
+                            kept += 1
+                        else:
+                            flat[i] = False
+                stacked = flat.reshape(stacked.shape)
+                for i, k in enumerate(kinds):
+                    mask[k] = stacked[i]
+            self.op_slowdown_mask = mask
+            # Record triggered events for logging.
+            for k in kinds:
+                idxs = np.argwhere(mask[k])
+                for (idx, mb) in idxs:
+                    self.op_slowdown_records.append(
+                        {"kind": k, "rank_unit": int(idx), "mb": int(mb)}
+                    )
+            print(
+                f"[SimuMax] Op-slowdown: p={strategy.op_slowdown_prob}, "
+                f"K={strategy.op_slowdown_k}, seed={strategy.op_slowdown_seed}, "
+                f"triggered={len(self.op_slowdown_records)}"
+                + (f" (cap={strategy.op_slowdown_max_count})"
+                   if strategy.op_slowdown_max_count is not None else "")
+            )
+        else:
+            self.op_slowdown_mask = None
+
+    def _sample_gpu_disturbance(self):
+        """Populate ``gpu_slowdown_mult`` (Feature B) by running the
+        scheduler once with Features A and C already applied, extracting
+        per-physical-rank task orders, and sampling ``gpu_slowdown_count``
+        events with rejection-sampled start indices.
+        """
+        strategy = self.strategy
+        self.gpu_slowdown_records = []
+        # Reset so _compose_mult returns 1.0 for B during the dry run and
+        # so repeated run_estimate() calls on the same instance are idempotent.
+        self.gpu_slowdown_mult = None
+        if strategy.gpu_slowdown_count == 0:
+            return
+
+        pp = strategy.pp_size
+        mbc = strategy.micro_batch_num
+        n_rank_units, kinds = self._disturbance_shape()
+
+        # Dry run (A+C applied, B still None) to capture execution-order
+        # task lists per physical rank.
+        self._last_schedules = None
+        _ = self._compute_pp_total_time(draw=False)
+        schedules = self._last_schedules
+        assert schedules is not None and len(schedules) == pp, (
+            "Dry run did not produce per-rank schedules; scheduler may be "
+            "missing the _last_schedules stash."
+        )
+
+        is_vs = self._is_virtual_stage_schedule()
+        _V, _vs_to_rank, owned_vs = self._vs_to_rank_owned()
+
+        # Extract per-physical-rank task order as (kind, mb, rank_unit_idx).
+        # rank_unit_idx is the row into the multiplier table:
+        #   - physical-rank schedule: idx = r
+        #   - virtual-stage schedule: idx = owned_vs[r][vs_local]
+        task_order = [[] for _ in range(pp)]
+        for r in range(pp):
+            for entry in schedules[r]:
+                if is_vs:
+                    # (kind, mb, vs_local, start, dur, end)
+                    kind, mb, vs_local = entry[0], entry[1], entry[2]
+                    idx = owned_vs[r][vs_local]
+                else:
+                    # (kind, mb, start, dur, end)
+                    kind, mb = entry[0], entry[1]
+                    idx = r
+                task_order[r].append((kind, int(mb), idx))
+
+        # Tight check on task_count vs shortest rank's task list.
+        shortest = min(len(t) for t in task_order)
+        N = strategy.gpu_slowdown_task_count
+        assert N <= shortest, (
+            f"gpu_slowdown_task_count ({N}) exceeds shortest rank's task list "
+            f"length ({shortest}) for schedule={strategy.pp_schedule}, "
+            f"pp_size={pp}, micro_batch_num={mbc}. Reduce gpu_slowdown_task_count "
+            f"or increase micro_batch_num."
+        )
+
+        rng_b = np.random.default_rng(strategy.gpu_slowdown_seed)
+        K = strategy.gpu_slowdown_k
+        mult = {k: np.ones((n_rank_units, mbc), dtype=np.float64) for k in kinds}
+        for _e in range(strategy.gpu_slowdown_count):
+            r = int(rng_b.integers(0, pp))
+            tasks = task_order[r]
+            # Rejection-sample start so a full N-task run fits.
+            first = int(rng_b.integers(0, len(tasks) - N + 1))
+            affected = tasks[first : first + N]
+            for (kind, mb, idx) in affected:
+                if kind in mult:
+                    mult[kind][idx, mb] *= K
+            self.gpu_slowdown_records.append({
+                "rank": r,
+                "first_task_index": first,
+                "task_count": N,
+                "k": K,
+                "affected": [
+                    {"kind": k, "mb": mb, "rank_unit": idx}
+                    for (k, mb, idx) in affected
+                ],
+            })
+        self.gpu_slowdown_mult = mult
+        print(
+            f"[SimuMax] GPU-slowdown: count={strategy.gpu_slowdown_count}, "
+            f"K={K}, task_count={N}, seed={strategy.gpu_slowdown_seed}, "
+            f"events_logged={len(self.gpu_slowdown_records)}"
+        )
+
     def get_num_layers_to_build(self, config: StrategyConfig, model_conf: ModelConfig, parallel_stage="first") -> int:
         """
         Determine the number of transformer layers to build for the current pipeline stage.
@@ -900,6 +1155,7 @@ class PerfLLM(PerfBase):
                 bwd_ready[rank].append(start_time + duration)
 
         max_time = max([s[-1][4] for s in schedules])
+        self._last_schedules = schedules
 
         # f_b_time = [x+y for x,y in zip(forward_times, backward_times)]
 
@@ -1245,6 +1501,7 @@ class PerfLLM(PerfBase):
                 )
 
         max_time = max(s[-1][4] for s in schedules)
+        self._last_schedules = schedules
 
         if draw:
             fig, ax = plt.subplots(figsize=(14, 5))
@@ -1356,6 +1613,7 @@ class PerfLLM(PerfBase):
                 )
 
         max_time = max(s[-1][4] for s in schedules)
+        self._last_schedules = schedules
 
         if draw:
             fig, ax = plt.subplots(figsize=(14, 5))
@@ -1506,6 +1764,7 @@ class PerfLLM(PerfBase):
                 )
 
         max_time = max(s[-1][5] for s in schedules)
+        self._last_schedules = schedules
 
         if draw:
             fig, ax = plt.subplots(figsize=(16, 5))
@@ -1762,6 +2021,7 @@ class PerfLLM(PerfBase):
                 )
 
         max_time = max(s[-1][5] for s in schedules)
+        self._last_schedules = schedules
 
         if draw:
             fig, ax = plt.subplots(figsize=(16, 5))
@@ -1934,6 +2194,7 @@ class PerfLLM(PerfBase):
                 )
 
         max_time = max(s[-1][5] for s in schedules)
+        self._last_schedules = schedules
 
         if draw:
             fig, ax = plt.subplots(figsize=(16, 5))
@@ -2111,10 +2372,15 @@ class PerfLLM(PerfBase):
                 dtype=np.int64,
             )
 
-    def _per_rank_fwd_bwd_times(self):
+    def _per_rank_fwd_bwd_times(self, apply_disturbance=True):
         """Return ``(forward_times, backward_times)``, each a ``pp x mbc``
         2-D list indexed as ``arr[rank][microbatch]``. When
         ``seq_len_std == 0`` all rows are constant, matching prior behaviour.
+
+        When ``apply_disturbance`` is True (the default) and the active
+        pp_schedule is a physical-rank schedule, the composed A/B/C
+        multipliers are applied here. ``_per_virtual_stage_times`` sets
+        this to False so multipliers are applied at the gvs level instead.
         """
         self._ensure_seq_lens()
         pp = self.strategy.pp_size
@@ -2129,13 +2395,18 @@ class PerfLLM(PerfBase):
             for m in range(mbc):
                 s = int(self.seq_lens[m])
                 fwd, bwd = self._chunk_fwd_bwd_at(chunk_name, s)
+                if apply_disturbance:
+                    fwd *= self._compose_mult("F", r, m)
+                    bwd *= self._compose_mult("B", r, m)
                 forward_times[r][m] = fwd
                 backward_times[r][m] = bwd
         return forward_times, backward_times
 
-    def _per_rank_fwd_b_w_times(self):
+    def _per_rank_fwd_b_w_times(self, apply_disturbance=True):
         """Return ``(forward_times, b_times, w_times)``, each a ``pp x mbc``
         2-D list indexed as ``arr[rank][microbatch]`` (ZB-style B/W split).
+
+        ``apply_disturbance`` as in :meth:`_per_rank_fwd_bwd_times`.
         """
         self._ensure_seq_lens()
         pp = self.strategy.pp_size
@@ -2151,6 +2422,10 @@ class PerfLLM(PerfBase):
             for m in range(mbc):
                 s = int(self.seq_lens[m])
                 fwd, b, w = self._chunk_fwd_b_w_at(chunk_name, s)
+                if apply_disturbance:
+                    fwd *= self._compose_mult("F", r, m)
+                    b *= self._compose_mult("B", r, m)
+                    w *= self._compose_mult("W", r, m)
                 forward_times[r][m] = fwd
                 b_times[r][m] = b
                 w_times[r][m] = w
@@ -2162,14 +2437,18 @@ class PerfLLM(PerfBase):
         ``vs_to_rank(gvs)`` maps a global virtual-stage index to the rank
         that owns it. Each virtual stage inherits its rank's compute time
         (for the relevant microbatch) divided by ``V`` (uniform layer split).
+        Disturbance multipliers are applied per-gvs here (A, B and C all
+        use virtual-stage indexing for these schedules).
         """
         self._ensure_seq_lens()
         pp = self.strategy.pp_size
         mbc = self.strategy.micro_batch_num
+        # Fetch clean per-rank times; we'll compose the multipliers at the
+        # gvs level below so each virtual stage gets its own sampled noise.
         if split_bw:
-            fwd_r, b_r, w_r = self._per_rank_fwd_b_w_times()
+            fwd_r, b_r, w_r = self._per_rank_fwd_b_w_times(apply_disturbance=False)
         else:
-            fwd_r, bwd_r = self._per_rank_fwd_bwd_times()
+            fwd_r, bwd_r = self._per_rank_fwd_bwd_times(apply_disturbance=False)
         total_vs = V * pp
         fwd_vs = [[0.0] * mbc for _ in range(total_vs)]
         if split_bw:
@@ -2180,12 +2459,12 @@ class PerfLLM(PerfBase):
         for gvs in range(total_vs):
             r = vs_to_rank(gvs)
             for m in range(mbc):
-                fwd_vs[gvs][m] = fwd_r[r][m] / V
+                fwd_vs[gvs][m] = (fwd_r[r][m] / V) * self._compose_mult("F", gvs, m)
                 if split_bw:
-                    b_vs[gvs][m] = b_r[r][m] / V
-                    w_vs[gvs][m] = w_r[r][m] / V
+                    b_vs[gvs][m] = (b_r[r][m] / V) * self._compose_mult("B", gvs, m)
+                    w_vs[gvs][m] = (w_r[r][m] / V) * self._compose_mult("W", gvs, m)
                 else:
-                    bwd_vs[gvs][m] = bwd_r[r][m] / V
+                    bwd_vs[gvs][m] = (bwd_r[r][m] / V) * self._compose_mult("B", gvs, m)
         if split_bw:
             return fwd_vs, b_vs, w_vs
         return fwd_vs, bwd_vs
@@ -3138,6 +3417,50 @@ class PerfLLM(PerfBase):
                 }
                 with open(f"{save_path}/seq_lens.json", "w") as f:
                     json.dump(seq_lens_info, f, indent=2)
+
+            # Disturbance audit log: features A / B / C in one file.
+            # Only emitted when at least one feature was active.
+            disturbance_log = {}
+            if self.op_noise_mult is not None:
+                mult_summary = {}
+                all_vals = []
+                for k, arr in self.op_noise_mult.items():
+                    mult_summary[k] = arr.tolist()
+                    all_vals.append(arr.ravel())
+                flat = np.concatenate(all_vals)
+                disturbance_log["op_duration_noise"] = {
+                    "configured_std": self.strategy.op_duration_std,
+                    "seed": self.strategy.op_duration_seed,
+                    "min_factor": self.strategy.op_duration_min_factor,
+                    "max_factor": self.strategy.op_duration_max_factor,
+                    "summary": {
+                        "mean": float(flat.mean()),
+                        "std": float(flat.std()),
+                        "min": float(flat.min()),
+                        "max": float(flat.max()),
+                    },
+                    "multipliers_per_kind": mult_summary,
+                }
+            if self.op_slowdown_mask is not None:
+                disturbance_log["op_slowdown"] = {
+                    "configured_prob": self.strategy.op_slowdown_prob,
+                    "k": self.strategy.op_slowdown_k,
+                    "max_count": self.strategy.op_slowdown_max_count,
+                    "seed": self.strategy.op_slowdown_seed,
+                    "triggered_count": len(self.op_slowdown_records),
+                    "triggered": self.op_slowdown_records,
+                }
+            if self.gpu_slowdown_mult is not None:
+                disturbance_log["gpu_slowdown"] = {
+                    "configured_count": self.strategy.gpu_slowdown_count,
+                    "k": self.strategy.gpu_slowdown_k,
+                    "task_count": self.strategy.gpu_slowdown_task_count,
+                    "seed": self.strategy.gpu_slowdown_seed,
+                    "events": self.gpu_slowdown_records,
+                }
+            if disturbance_log:
+                with open(f"{save_path}/disturbance_log.json", "w") as f:
+                    json.dump(disturbance_log, f, indent=2)
 
         # print mfu/tflops/peak_mem
         peak_mem = mem_result.data["peak_mem"] if 'peak_mem' in mem_result.data else (({s:r['peak_mem'] for s, r in mem_result.data.items()}))
