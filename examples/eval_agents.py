@@ -16,7 +16,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.config import (
+    DisturbanceConfig,
+    ModelConfig,
+    StrategyConfig,
+    SystemConfig,
+)
 from simumax.rl.agents import AGENT_REGISTRY
 from simumax.rl.env.env import RLEnvConfig
 from simumax.rl.env.types import RewardMode
@@ -50,44 +55,75 @@ def _parse_ppo_checkpoint(value: str) -> tuple[str, str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--strategy", default="tp1_pp2_dp4_mbs1",
-                        help="Strategy config name (without .json)")
-    parser.add_argument("--model", default="llama3-8b",
-                        help="Model config name (without .json)")
-    parser.add_argument("--system", default="a100_pcie",
-                        help="System config name (without .json)")
-    parser.add_argument("--disturbance", default=None,
-                        help="Disturbance config name (without .json); "
-                             "omit for no disturbance")
     parser.add_argument(
-        "--agents", nargs="+",
+        "--strategy",
+        default="tp1_pp2_dp4_mbs1",
+        help="Strategy config name (without .json)",
+    )
+    parser.add_argument(
+        "--model", default="llama3-8b", help="Model config name (without .json)"
+    )
+    parser.add_argument(
+        "--system", default="a100_pcie", help="System config name (without .json)"
+    )
+    parser.add_argument(
+        "--disturbance",
+        default=None,
+        help="Disturbance config name (without .json); omit for no disturbance",
+    )
+    parser.add_argument(
+        "--agents",
+        nargs="+",
         default=sorted(AGENT_REGISTRY),
-        help=("Agents to evaluate. Names default to the static registry "
-              f"({sorted(AGENT_REGISTRY)}); any name you also pass via "
-              "--ppo-checkpoint is loaded as a PPO checkpoint instead."),
+        help=(
+            "Agents to evaluate. Names default to the static registry "
+            f"({sorted(AGENT_REGISTRY)}); any name you also pass via "
+            "--ppo-checkpoint is loaded as a PPO checkpoint instead."
+        ),
     )
     parser.add_argument(
-        "--ppo-checkpoint", action="append", default=[],
-        type=_parse_ppo_checkpoint, metavar="LABEL=PATH",
-        help=("Load a trained MaskablePPO checkpoint under LABEL. Repeatable. "
-              "LABEL must also appear in --agents to be evaluated."),
+        "--ppo-checkpoint",
+        action="append",
+        default=[],
+        type=_parse_ppo_checkpoint,
+        metavar="LABEL=PATH",
+        help=(
+            "Load a trained MaskablePPO checkpoint under LABEL. Repeatable. "
+            "LABEL must also appear in --agents to be evaluated."
+        ),
     )
-    parser.add_argument("--n-episodes", type=int, default=1,
-                        help="Number of episodes per agent (default 1)")
-    parser.add_argument("--seed", type=int, default=0,
-                        help="Base seed — all agents replay identical episodes")
-    parser.add_argument("--render-dir", default=None,
-                        help="If set, dump a Gantt PNG per (agent, episode)")
-    parser.add_argument("--display", action="store_true",
-                        help="Open a blocking matplotlib window per episode "
-                             "(combine with --render-dir to also save PNGs).")
+    parser.add_argument(
+        "--n-episodes",
+        type=int,
+        default=1,
+        help="Number of episodes per agent (default 1)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Base seed — all agents replay identical episodes",
+    )
+    parser.add_argument(
+        "--render-dir",
+        default=None,
+        help="If set, dump a Gantt PNG per (agent, episode)",
+    )
+    parser.add_argument(
+        "--display",
+        action="store_true",
+        help="Open a blocking matplotlib window per episode "
+        "(combine with --render-dir to also save PNGs).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    strategy = StrategyConfig.init_from_config_file(get_simu_strategy_config(args.strategy))
+    strategy = StrategyConfig.init_from_config_file(
+        get_simu_strategy_config(args.strategy)
+    )
     model = ModelConfig.init_from_config_file(get_simu_model_config(args.model))
     system = SystemConfig.init_from_config_file(get_simu_system_config(args.system))
     disturbance = None
@@ -117,8 +153,9 @@ def main() -> None:
             f"Add them to --agents or drop the checkpoint."
         )
     # Catch unknown names — anything not in the registry and not a PPO label.
-    unknown = [n for n in agent_names
-               if n not in AGENT_REGISTRY and n not in ppo_checkpoints]
+    unknown = [
+        n for n in agent_names if n not in AGENT_REGISTRY and n not in ppo_checkpoints
+    ]
     if unknown:
         raise SystemExit(
             f"Unknown agent name(s): {unknown}. "
