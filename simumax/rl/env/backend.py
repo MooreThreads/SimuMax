@@ -8,8 +8,7 @@ returns a frozen per-task duration table.
 
 Phase 1 scope: only the physical-rank schedules
 (``1f1b`` / ``gpipe`` / ``zb_h1`` / ``zb_h2``). Interleaved / zb_v
-would need :meth:`PerfLLM._per_virtual_stage_times` instead (see
-``RL_ENV_ASSESSMENT.md`` §5.4).
+would need :meth:`PerfLLM._per_virtual_stage_times` instead.
 """
 
 from __future__ import annotations
@@ -75,7 +74,7 @@ class SimuMaxBackend:
             raise NotImplementedError(
                 f"Phase 1 supports only {_PHYSICAL_RANK_SCHEDULES}; "
                 f"strategy.pp_schedule = {schedule!r}. Interleaved / zb_v "
-                f"need virtual-stage timing (see RL_ENV_ASSESSMENT.md §5.4)."
+                f"need virtual-stage timing."
             )
 
         self._perf = perf

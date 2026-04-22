@@ -43,7 +43,7 @@ def _resample_episode(perf: PerfLLM, seed: int) -> None:
     """Re-seed and re-sample all four stochastic inputs for one episode.
 
     Uses the same single-seed convention as
-    ``simumax.rl_env.backend.SimuMaxBackend.sample_episode`` so baseline
+    ``simumax.rl.env.backend.SimuMaxBackend.sample_episode`` so baseline
     draws line up exactly with RL-env draws under the same base seed.
     """
     perf.disturbance.seed = seed

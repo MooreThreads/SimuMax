@@ -1,7 +1,7 @@
 """Gymnasium environment for SimuMax-driven pipeline-parallel scheduling.
 
 Direct port of ``rlpp/environment/core.py`` with the duration backend
-swapped for :class:`~simumax.rl_env.backend.SimuMaxBackend`. Step
+swapped for :class:`~simumax.rl.env.backend.SimuMaxBackend`. Step
 semantics, action masking, and the MaskablePPO contract are identical
 to rlpp so we can reuse the existing training harness unchanged.
 """
@@ -18,11 +18,11 @@ from numpy.typing import NDArray
 
 from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
 from simumax.core.gantt import GanttBar, plot_gantt
-from simumax.rl_env.backend import ConfigLike, EpisodeData, SimuMaxBackend
-from simumax.rl_env.event_queue import CompletionEvent, EventQueue
-from simumax.rl_env.stage_mapping import StageMapping
-from simumax.rl_env.task_graph import TaskGraph
-from simumax.rl_env.types import OpType, RewardMode, TaskState
+from simumax.rl.env.backend import ConfigLike, EpisodeData, SimuMaxBackend
+from simumax.rl.env.event_queue import CompletionEvent, EventQueue
+from simumax.rl.env.stage_mapping import StageMapping
+from simumax.rl.env.task_graph import TaskGraph
+from simumax.rl.env.types import OpType, RewardMode, TaskState
 
 _INVALID_ACTION_PENALTY = -1e6
 
@@ -384,12 +384,16 @@ class PipelineSchedulingEnv(gymnasium.Env):
 
     def render(
         self,
-        output_path: str,
+        output_path: Optional[str] = None,
         *,
         mode: str = "projected",
         title: Optional[str] = None,
+        display: bool = False,
     ) -> None:
-        """Save a Gantt chart of the episode so far to ``output_path``.
+        """Render a Gantt chart of the episode so far.
+
+        At least one of ``output_path`` (save PNG) or ``display`` (open a
+        blocking matplotlib window) must be set; both may be combined.
 
         ``mode="committed"`` draws only completed tasks. ``mode="projected"``
         (the default) also draws in-flight tasks at their scheduled
@@ -401,6 +405,8 @@ class PipelineSchedulingEnv(gymnasium.Env):
             raise ValueError(
                 f"mode must be 'committed' or 'projected'; got {mode!r}"
             )
+        if output_path is None and not display:
+            raise ValueError("render() needs output_path, display=True, or both.")
         if self._task_graph is None:
             _require_reset("render()")
 
@@ -432,6 +438,7 @@ class PipelineSchedulingEnv(gymnasium.Env):
             schedules, pp,
             title=title if title is not None else default_title,
             output_path=output_path,
+            display=display,
             now=self._current_time if mode == "projected" else None,
         )
 

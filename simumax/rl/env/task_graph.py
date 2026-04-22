@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 import numpy.typing as npt
 
-from simumax.rl_env.types import OpType, TaskState
+from simumax.rl.env.types import OpType, TaskState
 
 
 class TaskGraph:

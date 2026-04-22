@@ -20,8 +20,8 @@ from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
-from simumax.rl_env.env import PipelineSchedulingEnv, RLEnvConfig
-from simumax.rl_env.feature_extractor import PipelineFeatureExtractor
+from simumax.rl.env.env import PipelineSchedulingEnv, RLEnvConfig
+from simumax.rl.feature_extractor import PipelineFeatureExtractor
 
 
 def _linear_schedule(initial: float, final: float) -> Callable[[float], float]:

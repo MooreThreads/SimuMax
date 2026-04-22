@@ -48,19 +48,27 @@ def plot_gantt(
     pp: int,
     *,
     title: str,
-    output_path: str,
+    output_path: Optional[str] = None,
+    display: bool = False,
     y_label_prefix: str = "Stage",
     figsize: tuple[float, float] = (14, 5),
     colors: Optional[dict[str, str]] = None,
     now: Optional[float] = None,
     label_fontsize: int = 8,
 ) -> None:
-    """Render ``schedules`` as a Gantt chart and save to ``output_path``.
+    """Render ``schedules`` as a Gantt chart.
 
     ``schedules[rank]`` is the list of bars to draw on rank's row.
     Rows are laid out top-to-bottom (rank 0 at top) via ``y = pp - 1 - rank``
     to match the existing SimuMax convention.
+
+    At least one of ``output_path`` (save to disk) or ``display`` (open a
+    GUI window via ``plt.show()``) must be truthy. Both may be combined —
+    e.g. live-view while also dumping a PNG.
     """
+    if output_path is None and not display:
+        msg = "plot_gantt needs output_path, display=True, or both."
+        raise ValueError(msg)
     palette = colors if colors is not None else DEFAULT_COLORS
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -95,5 +103,11 @@ def plot_gantt(
     ax.set_title(title)
     plt.grid(True, axis="x", linestyle="--", alpha=0.6)
     plt.tight_layout()
-    plt.savefig(output_path)
+    if output_path is not None:
+        plt.savefig(output_path)
+    if display:
+        # Blocks until the user closes the window. Use a non-Agg backend
+        # (the default when importing matplotlib.pyplot without prior
+        # ``matplotlib.use("Agg")``) for this to actually pop up.
+        plt.show()
     plt.close(fig)

@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import argparse
 
-from simumax.rl_env.env import RLEnvConfig
-from simumax.rl_env.train import PPOTrainingConfig, train
-from simumax.rl_env.types import RewardMode
+from simumax.rl.env.env import RLEnvConfig
+from simumax.rl.train import PPOTrainingConfig, train
+from simumax.rl.env.types import RewardMode
 from simumax.utils import (
     get_simu_disturbance_config,
     get_simu_model_config,
