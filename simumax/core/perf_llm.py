@@ -5,7 +5,7 @@ import os
 import math
 import json
 from copy import deepcopy
-from typing import List, Union, Dict
+from typing import List, Union, Dict, Optional
 from sympy import divisors
 import matplotlib.pyplot as plt
 import numpy as np
@@ -259,12 +259,12 @@ class PerfLLM(PerfBase):
         self.op_noise_mult = None          # Feature A multipliers (float)
         self.op_slowdown_mask = None       # Feature C triggered mask (bool)
         self.gpu_slowdown_mult = None      # Feature B multipliers (float)
+        # Physical rank selected by Feature B (None when no slowdown fired).
+        self._slowed_rank: Optional[int] = None
         # Sampled-event records for auditing (populated alongside the tables).
         self.op_slowdown_records = []
-        self.gpu_slowdown_records = []
         # Most recent scheduler output, stashed by each calculate_*_bubble
-        # method. Used by _sample_gpu_disturbance to read execution-order
-        # task lists after a dry run.
+        # method. Retained for downstream inspection.
         self._last_schedules = None
         os.makedirs(TMP_PATH, exist_ok=True)
 
@@ -460,90 +460,52 @@ class PerfLLM(PerfBase):
             self.op_slowdown_mask = None
 
     def _sample_gpu_disturbance(self):
-        """Populate ``gpu_slowdown_mult`` (Feature B) by running the
-        scheduler once with Features A and C already applied, extracting
-        per-physical-rank task orders, and sampling ``gpu_slowdown_count``
-        events with rejection-sampled start indices.
+        """Populate ``gpu_slowdown_mult`` (Feature B) with the whole-GPU
+        slowdown semantics.
+
+        With probability ``gpu_slowdown_prob`` a single physical rank is
+        picked uniformly at iteration start and every task mapped onto it
+        (all F / B / W across every microbatch, and every virtual stage
+        mapped onto that rank for interleaved / zb_v schedules) gets
+        multiplied by ``gpu_slowdown_k``. At most one slowed rank per
+        iteration. Schedule-independent: no dry-run required.
         """
         strategy = self.strategy
-        self.gpu_slowdown_records = []
-        # Reset so _compose_mult returns 1.0 for B during the dry run and
-        # so repeated run_estimate() calls on the same instance are idempotent.
+        self._slowed_rank = None
         self.gpu_slowdown_mult = None
-        if strategy.gpu_slowdown_count == 0:
+        if strategy.gpu_slowdown_prob <= 0.0:
             return
 
         pp = strategy.pp_size
         mbc = strategy.micro_batch_num
         n_rank_units, kinds = self._disturbance_shape()
-
-        # Dry run (A+C applied, B still None) to capture execution-order
-        # task lists per physical rank.
-        self._last_schedules = None
-        _ = self._compute_pp_total_time(draw=False)
-        schedules = self._last_schedules
-        assert schedules is not None and len(schedules) == pp, (
-            "Dry run did not produce per-rank schedules; scheduler may be "
-            "missing the _last_schedules stash."
-        )
-
-        is_vs = self._is_virtual_stage_schedule()
-        _V, _vs_to_rank, owned_vs = self._vs_to_rank_owned()
-
-        # Extract per-physical-rank task order as (kind, mb, rank_unit_idx).
-        # rank_unit_idx is the row into the multiplier table:
-        #   - physical-rank schedule: idx = r
-        #   - virtual-stage schedule: idx = owned_vs[r][vs_local]
-        task_order = [[] for _ in range(pp)]
-        for r in range(pp):
-            for entry in schedules[r]:
-                if is_vs:
-                    # (kind, mb, vs_local, start, dur, end)
-                    kind, mb, vs_local = entry[0], entry[1], entry[2]
-                    idx = owned_vs[r][vs_local]
-                else:
-                    # (kind, mb, start, dur, end)
-                    kind, mb = entry[0], entry[1]
-                    idx = r
-                task_order[r].append((kind, int(mb), idx))
-
-        # Tight check on task_count vs shortest rank's task list.
-        shortest = min(len(t) for t in task_order)
-        N = strategy.gpu_slowdown_task_count
-        assert N <= shortest, (
-            f"gpu_slowdown_task_count ({N}) exceeds shortest rank's task list "
-            f"length ({shortest}) for schedule={strategy.pp_schedule}, "
-            f"pp_size={pp}, micro_batch_num={mbc}. Reduce gpu_slowdown_task_count "
-            f"or increase micro_batch_num."
-        )
+        K = strategy.gpu_slowdown_k
 
         rng_b = np.random.default_rng(strategy.gpu_slowdown_seed)
-        K = strategy.gpu_slowdown_k
+        if float(rng_b.random()) >= strategy.gpu_slowdown_prob:
+            print(
+                f"[SimuMax] GPU-slowdown: prob={strategy.gpu_slowdown_prob}, "
+                f"K={K}, seed={strategy.gpu_slowdown_seed} -> no rank slowed"
+            )
+            return
+
+        slowed_rank = int(rng_b.integers(0, pp))
+        self._slowed_rank = slowed_rank
+
+        # Rows of the multiplier table that correspond to the slowed physical
+        # rank. For physical-rank schedules that's just [r]; for virtual-stage
+        # schedules it's every vs owned by r.
+        _V, _vs_to_rank, owned_vs = self._vs_to_rank_owned()
+        affected_idx = owned_vs[slowed_rank]
+
         mult = {k: np.ones((n_rank_units, mbc), dtype=np.float64) for k in kinds}
-        for _e in range(strategy.gpu_slowdown_count):
-            r = int(rng_b.integers(0, pp))
-            tasks = task_order[r]
-            # Rejection-sample start so a full N-task run fits.
-            first = int(rng_b.integers(0, len(tasks) - N + 1))
-            affected = tasks[first : first + N]
-            for (kind, mb, idx) in affected:
-                if kind in mult:
-                    mult[kind][idx, mb] *= K
-            self.gpu_slowdown_records.append({
-                "rank": r,
-                "first_task_index": first,
-                "task_count": N,
-                "k": K,
-                "affected": [
-                    {"kind": k, "mb": mb, "rank_unit": idx}
-                    for (k, mb, idx) in affected
-                ],
-            })
+        for kind in kinds:
+            for idx in affected_idx:
+                mult[kind][idx, :] = K
         self.gpu_slowdown_mult = mult
         print(
-            f"[SimuMax] GPU-slowdown: count={strategy.gpu_slowdown_count}, "
-            f"K={K}, task_count={N}, seed={strategy.gpu_slowdown_seed}, "
-            f"events_logged={len(self.gpu_slowdown_records)}"
+            f"[SimuMax] GPU-slowdown: prob={strategy.gpu_slowdown_prob}, "
+            f"K={K}, seed={strategy.gpu_slowdown_seed} -> slowed_rank={slowed_rank}"
         )
 
     def get_num_layers_to_build(self, config: StrategyConfig, model_conf: ModelConfig, parallel_stage="first") -> int:
@@ -3450,13 +3412,12 @@ class PerfLLM(PerfBase):
                     "triggered_count": len(self.op_slowdown_records),
                     "triggered": self.op_slowdown_records,
                 }
-            if self.gpu_slowdown_mult is not None:
+            if self.strategy.gpu_slowdown_prob > 0.0:
                 disturbance_log["gpu_slowdown"] = {
-                    "configured_count": self.strategy.gpu_slowdown_count,
+                    "configured_prob": self.strategy.gpu_slowdown_prob,
                     "k": self.strategy.gpu_slowdown_k,
-                    "task_count": self.strategy.gpu_slowdown_task_count,
                     "seed": self.strategy.gpu_slowdown_seed,
-                    "events": self.gpu_slowdown_records,
+                    "slowed_rank": self._slowed_rank,
                 }
             if disturbance_log:
                 with open(f"{save_path}/disturbance_log.json", "w") as f:
@@ -3477,6 +3438,7 @@ class PerfLLM(PerfBase):
             print(f"- system = {self.system.sys_name}")
             print(f"- model_type = {self.model_config.model_type}")
             print(f"· \033[32mmfu = {compute_result.data['mfu_6nd_with_attn']:.2f}\033[0m")
+            print(f"· \033[32mpp_utilization = {compute_result.data['pp_utilization']:.4f}\033[0m")
             print(f"· \033[32mTFLOPS = {compute_result.data['throughput per GPU (TFLOP/s/GPU)']:.2f}T (tflops={compute_result.data['flops_info']['theory_flops']}, duration={compute_result.data['duration_time_per_iter']})\033[0m")
             print(f"· \033[32mTFLOPS_PER_TOKEN = {compute_result.data['throughput per GPU per token (TFLOP/s/GPU/token)']:.2f}T, duration={compute_result.data['duration_time_per_iter']})\033[0m")
             print(f"· \033[31mpeak_alloc_mem = {peak_mem}\033[0m")

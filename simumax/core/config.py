@@ -199,14 +199,14 @@ class StrategyConfig(Config):
     op_duration_min_factor: float = 0.1
     op_duration_max_factor: float = 10.0
 
-    # Feature B: GPU run-length slowdown. For each of gpu_slowdown_count
-    # events, pick a physical rank uniformly and pick a start index into its
-    # execution-order task list (rejection-sampled so a full task_count run
-    # fits), then multiply those gpu_slowdown_task_count consecutive tasks'
-    # durations by gpu_slowdown_k. Overlapping events compound multiplicatively.
-    gpu_slowdown_count: int = 0
+    # Feature B: whole-GPU slowdown. With probability gpu_slowdown_prob, one
+    # physical rank is picked uniformly at iteration start and every task
+    # that runs on it (all F / B / W across every microbatch, and every
+    # virtual stage mapped onto it for interleaved / zb_v) gets multiplied
+    # by gpu_slowdown_k. At most one slowed rank per iteration.
+    # Schedule-independent: no dry-run required.
+    gpu_slowdown_prob: float = 0.0
     gpu_slowdown_k: float = 1.0
-    gpu_slowdown_task_count: int = 0
     gpu_slowdown_seed: Optional[int] = None
 
     # Feature C: random per-task slowdown. Each scheduled task independently
@@ -545,19 +545,13 @@ class StrategyConfig(Config):
             f">= op_duration_min_factor ({self.op_duration_min_factor})"
         )
 
-        assert self.gpu_slowdown_count >= 0, (
-            f"gpu_slowdown_count must be >= 0, got {self.gpu_slowdown_count}"
+        assert 0.0 <= self.gpu_slowdown_prob <= 1.0, (
+            f"gpu_slowdown_prob must be in [0, 1], got {self.gpu_slowdown_prob}"
         )
-        if self.gpu_slowdown_count > 0:
+        if self.gpu_slowdown_prob > 0.0:
             assert self.gpu_slowdown_k >= 1.0, (
                 f"gpu_slowdown_k must be >= 1.0, got {self.gpu_slowdown_k}"
             )
-            assert self.gpu_slowdown_task_count >= 1, (
-                "gpu_slowdown_count > 0 requires gpu_slowdown_task_count >= 1, "
-                f"got {self.gpu_slowdown_task_count}"
-            )
-            # Tight upper bound on task_count (depends on schedule) is checked
-            # at runtime in PerfLLM once the per-rank execution order is known.
 
         assert 0.0 <= self.op_slowdown_prob <= 1.0, (
             f"op_slowdown_prob must be in [0, 1], got {self.op_slowdown_prob}"
