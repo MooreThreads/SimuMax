@@ -19,9 +19,10 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless backend; no GUI window pops up
 
-from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
 from simumax.core.perf_llm import PerfLLM
 from simumax.utils import (
+    get_simu_disturbance_config,
     get_simu_model_config,
     get_simu_strategy_config,
     get_simu_system_config,
@@ -39,6 +40,9 @@ def parse_args():
                         help="Model config name (without .json).")
     parser.add_argument("--system", default="h100_nvlink",
                         help="System config name (without .json).")
+    parser.add_argument("--disturbance", default=None,
+                        help="Disturbance config name (without .json), "
+                             "e.g. 'default'. Omit to run with no disturbance.")
     parser.add_argument("--output", default=None,
                         help="Output PNG path for the Gantt chart. "
                              "Defaults to a schedule-specific filename.")
@@ -60,12 +64,18 @@ def main():
     strategy_path = get_simu_strategy_config(args.strategy)
     model_path = get_simu_model_config(args.model)
     system_path = get_simu_system_config(args.system)
+    disturbance_config = None
+    if args.disturbance is not None:
+        disturbance_config = DisturbanceConfig.init_from_config_file(
+            get_simu_disturbance_config(args.disturbance)
+        )
 
     perf_model = PerfLLM()
     perf_model.configure(
         strategy_config=StrategyConfig.init_from_config_file(strategy_path),
         model_config=ModelConfig.init_from_config_file(model_path),
         system_config=SystemConfig.init_from_config_file(system_path),
+        disturbance_config=disturbance_config,
     )
     perf_model.run_estimate()
 

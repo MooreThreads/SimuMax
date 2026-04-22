@@ -172,52 +172,120 @@ class MLPRecomputeConfig(Config):
                 self.router_recompute and 
                 self.permutation_recompute)
 @dataclass
+class DisturbanceConfig(Config):
+    """Disturbance injection knobs.
+
+    Four independent stochastic families, each disabled by default so a config
+    with all defaults reduces to nominal (no-disturbance) behaviour.
+
+    A single ``seed`` drives all four streams; substreams are derived at
+    sampling time via ``np.random.SeedSequence(seed).spawn(4)`` so the streams
+    are independent. ``seed = None`` gives fresh entropy per run.
+
+    Feature 0 — variable sequence length. When ``seq_len_std > 0`` each of
+    the ``micro_batch_num`` microbatches draws its seq_len from
+    ``N(seq_len_mean, seq_len_std)`` (``seq_len_mean`` falls back to
+    ``strategy.seq_len`` when unset), rounded and clipped to
+    ``[seq_len_min, seq_len_max]`` (``seq_len_max`` defaults to
+    ``10 * seq_len_mean`` if unset).
+
+    Feature A — per-task Gaussian duration noise. Every scheduled task
+    (F / B / W for a given rank+microbatch) draws an independent multiplier
+    from ``N(1, op_duration_std)``, clipped to
+    ``[op_duration_min_factor, op_duration_max_factor]``.
+
+    Feature B — stage-wide slowdown. With probability ``stage_slowdown_prob``
+    one physical PP rank (i.e. an entire TP/EP group — typically a whole
+    node) is picked uniformly at iteration start and every task that runs on
+    it (all F / B / W across every microbatch, and every virtual stage mapped
+    onto it for interleaved / zb_v) gets multiplied by ``stage_slowdown_k``.
+    At most one slowed stage per iteration. Schedule-independent: no dry-run
+    required.
+
+    Feature C — random per-task slowdown. Each scheduled task independently
+    draws a ``Bernoulli(op_slowdown_prob)``; triggered tasks get the
+    ``op_slowdown_k`` multiplier. ``op_slowdown_max_count`` caps the total
+    number of triggers (first-N in row-major (kind, rank, mb) order).
+    """
+
+    seed: Optional[int] = None
+
+    # Feature 0 — variable sequence length.
+    seq_len_mean: Optional[float] = None  # defaults to strategy.seq_len when None
+    seq_len_std: float = 0.0
+    seq_len_min: Optional[int] = 1
+    seq_len_max: Optional[int] = None
+
+    # Feature A — per-task Gaussian duration noise.
+    op_duration_std: float = 0.0
+    op_duration_min_factor: float = 0.1
+    op_duration_max_factor: float = 10.0
+
+    # Feature B — stage-wide slowdown.
+    stage_slowdown_prob: float = 0.0
+    stage_slowdown_k: float = 1.0
+
+    # Feature C — random per-task slowdown.
+    op_slowdown_prob: float = 0.0
+    op_slowdown_k: float = 1.0
+    op_slowdown_max_count: Optional[int] = None
+
+    def sanity_check(self) -> None:
+        assert self.seq_len_std >= 0.0, (
+            f"seq_len_std must be >= 0, got {self.seq_len_std}"
+        )
+        if self.seq_len_std > 0.0:
+            if self.seq_len_mean is not None:
+                assert self.seq_len_mean > 0, (
+                    f"seq_len_mean must be > 0 when set, got {self.seq_len_mean}"
+                )
+            assert self.seq_len_min is None or self.seq_len_min >= 1, (
+                f"seq_len_min must be >= 1, got {self.seq_len_min}"
+            )
+            if self.seq_len_max is not None and self.seq_len_min is not None:
+                assert self.seq_len_max >= self.seq_len_min, (
+                    f"seq_len_max ({self.seq_len_max}) must be >= seq_len_min ({self.seq_len_min})"
+                )
+
+        assert self.op_duration_std >= 0.0, (
+            f"op_duration_std must be >= 0, got {self.op_duration_std}"
+        )
+        assert self.op_duration_min_factor > 0.0, (
+            f"op_duration_min_factor must be > 0, got {self.op_duration_min_factor}"
+        )
+        assert self.op_duration_max_factor >= self.op_duration_min_factor, (
+            f"op_duration_max_factor ({self.op_duration_max_factor}) must be "
+            f">= op_duration_min_factor ({self.op_duration_min_factor})"
+        )
+
+        assert 0.0 <= self.stage_slowdown_prob <= 1.0, (
+            f"stage_slowdown_prob must be in [0, 1], got {self.stage_slowdown_prob}"
+        )
+        if self.stage_slowdown_prob > 0.0:
+            assert self.stage_slowdown_k >= 1.0, (
+                f"stage_slowdown_k must be >= 1.0, got {self.stage_slowdown_k}"
+            )
+
+        assert 0.0 <= self.op_slowdown_prob <= 1.0, (
+            f"op_slowdown_prob must be in [0, 1], got {self.op_slowdown_prob}"
+        )
+        if self.op_slowdown_prob > 0.0:
+            assert self.op_slowdown_k >= 1.0, (
+                f"op_slowdown_k must be >= 1.0, got {self.op_slowdown_k}"
+            )
+        if self.op_slowdown_max_count is not None:
+            assert self.op_slowdown_max_count >= 0, (
+                f"op_slowdown_max_count must be >= 0, got {self.op_slowdown_max_count}"
+            )
+
+
+@dataclass
 class StrategyConfig(Config):
     """
     Training strategy configuration
     """
 
     seq_len: Optional[int] = None
-    # Variable sequence length sampling (Gaussian per microbatch).
-    # If seq_len_std == 0 (default), behaviour is identical to a constant seq_len.
-    seq_len_mean: Optional[float] = None  # defaults to seq_len when None
-    seq_len_std: float = 0.0
-    seq_len_seed: Optional[int] = None
-    seq_len_min: Optional[int] = 1
-    seq_len_max: Optional[int] = None
-
-    # -------------------- Disturbance injection --------------------
-    # All three families default to "off" and reduce to nominal behaviour when
-    # their primary knob (std / count / prob) is zero.
-    #
-    # Feature A: per-task Gaussian duration noise. Every scheduled task
-    # (F / B / W for a given rank+microbatch) draws an independent multiplier
-    # from N(1, op_duration_std), clipped to [op_duration_min_factor,
-    # op_duration_max_factor].
-    op_duration_std: float = 0.0
-    op_duration_seed: Optional[int] = None
-    op_duration_min_factor: float = 0.1
-    op_duration_max_factor: float = 10.0
-
-    # Feature B: stage-wide slowdown. With probability stage_slowdown_prob,
-    # one physical PP rank (i.e. an entire TP/EP group — typically a whole
-    # node) is picked uniformly at iteration start and every task that runs
-    # on it (all F / B / W across every microbatch, and every virtual stage
-    # mapped onto it for interleaved / zb_v) gets multiplied by
-    # stage_slowdown_k. At most one slowed stage per iteration.
-    # Schedule-independent: no dry-run required.
-    stage_slowdown_prob: float = 0.0
-    stage_slowdown_k: float = 1.0
-    stage_slowdown_seed: Optional[int] = None
-
-    # Feature C: random per-task slowdown. Each scheduled task independently
-    # draws a Bernoulli(op_slowdown_prob); triggered tasks get K multiplier.
-    # op_slowdown_max_count caps the total number of triggers (first-N in
-    # row-major (kind, rank, mb) order).
-    op_slowdown_prob: float = 0.0
-    op_slowdown_k: float = 1.0
-    op_slowdown_max_count: Optional[int] = None
-    op_slowdown_seed: Optional[int] = None
 
     micro_batch_size: Optional[int] = None
     micro_batch_num: Optional[int] = None
@@ -517,54 +585,6 @@ class StrategyConfig(Config):
 
         if self.recompute_granularity == "full_block":
             self.recompute_variance = False # megatron-LM's full recompute does not support variance
-
-        assert self.seq_len_std >= 0.0, (
-            f"seq_len_std must be >= 0, got {self.seq_len_std}"
-        )
-        if self.seq_len_std > 0.0:
-            mean = self.seq_len_mean if self.seq_len_mean is not None else self.seq_len
-            assert mean is not None and mean > 0, (
-                "seq_len_std > 0 requires a positive seq_len_mean (or seq_len) to be set"
-            )
-            assert self.seq_len_min is None or self.seq_len_min >= 1, (
-                f"seq_len_min must be >= 1, got {self.seq_len_min}"
-            )
-            if self.seq_len_max is not None and self.seq_len_min is not None:
-                assert self.seq_len_max >= self.seq_len_min, (
-                    f"seq_len_max ({self.seq_len_max}) must be >= seq_len_min ({self.seq_len_min})"
-                )
-
-        # ---------- Disturbance sanity checks ----------
-        assert self.op_duration_std >= 0.0, (
-            f"op_duration_std must be >= 0, got {self.op_duration_std}"
-        )
-        assert self.op_duration_min_factor > 0.0, (
-            f"op_duration_min_factor must be > 0, got {self.op_duration_min_factor}"
-        )
-        assert self.op_duration_max_factor >= self.op_duration_min_factor, (
-            f"op_duration_max_factor ({self.op_duration_max_factor}) must be "
-            f">= op_duration_min_factor ({self.op_duration_min_factor})"
-        )
-
-        assert 0.0 <= self.stage_slowdown_prob <= 1.0, (
-            f"stage_slowdown_prob must be in [0, 1], got {self.stage_slowdown_prob}"
-        )
-        if self.stage_slowdown_prob > 0.0:
-            assert self.stage_slowdown_k >= 1.0, (
-                f"stage_slowdown_k must be >= 1.0, got {self.stage_slowdown_k}"
-            )
-
-        assert 0.0 <= self.op_slowdown_prob <= 1.0, (
-            f"op_slowdown_prob must be in [0, 1], got {self.op_slowdown_prob}"
-        )
-        if self.op_slowdown_prob > 0.0:
-            assert self.op_slowdown_k >= 1.0, (
-                f"op_slowdown_k must be >= 1.0, got {self.op_slowdown_k}"
-            )
-        if self.op_slowdown_max_count is not None:
-            assert self.op_slowdown_max_count >= 0, (
-                f"op_slowdown_max_count must be >= 0, got {self.op_slowdown_max_count}"
-            )
 
     def reset_global_batch_size(self, global_batch_size):
         assert global_batch_size % (self.dp_size * self.micro_batch_size)==0, f"global_batch_size {global_batch_size} must be divisible by dp_size*miro_batch_size(dp_size={self.dp_size}, micro_batch_size={self.micro_batch_size})"

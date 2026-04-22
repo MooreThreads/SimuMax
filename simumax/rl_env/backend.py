@@ -19,7 +19,7 @@ from typing import Optional, Union
 
 import numpy as np
 
-from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
 from simumax.core.perf_llm import PerfLLM
 
 
@@ -45,7 +45,7 @@ class EpisodeData:
     seq_lens: np.ndarray
 
 
-ConfigLike = Union[StrategyConfig, ModelConfig, SystemConfig, str]
+ConfigLike = Union[StrategyConfig, ModelConfig, SystemConfig, DisturbanceConfig, str]
 
 
 class SimuMaxBackend:
@@ -56,12 +56,14 @@ class SimuMaxBackend:
         strategy_config: ConfigLike,
         model_config: ConfigLike,
         system_config: ConfigLike,
+        disturbance_config: Optional[ConfigLike] = None,
     ) -> None:
         perf = PerfLLM()
         perf.configure(
             strategy_config=strategy_config,
             model_config=model_config,
             system_config=system_config,
+            disturbance_config=disturbance_config,
         )
         # run_estimate does build() + sample_seq_lens + _run() + initial
         # disturbance samples. We pay this once; sample_episode() then only
@@ -104,13 +106,11 @@ class SimuMaxBackend:
         ``seed``.
         """
         perf = self._perf
-        strategy = perf.strategy
+        disturbance = perf.disturbance
         if seed is not None:
-            # Offset per feature so the four RNG streams are independent.
-            strategy.seq_len_seed = int(seed)
-            strategy.op_duration_seed = int(seed) + 1
-            strategy.op_slowdown_seed = int(seed) + 2
-            strategy.stage_slowdown_seed = int(seed) + 3
+            # Single base seed — independent substreams are derived internally
+            # via np.random.SeedSequence(seed).spawn(4).
+            disturbance.seed = int(seed)
 
         perf.seq_lens = perf._sample_seq_lens()
         perf._sample_op_disturbance()

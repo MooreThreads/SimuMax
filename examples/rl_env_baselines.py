@@ -5,12 +5,13 @@ RL env trains against. Trained agent is expected to reach (or beat)
 these makespans on the fixed-seq / no-disturbance setting, and to beat
 them under Phase 2 stochasticity.
 
-Under disturbance (``seq_len_std > 0`` or any ``*_slowdown_prob > 0``
-in the strategy config), each call to ``_compute_pp_total_time``
-samples a fresh disturbance draw. Passing ``--n-episodes N`` replays
-each schedule against N independent draws and reports mean / std /
-min / max — that's the distribution the trained policy should beat.
-When all stochasticity is disabled, all N draws coincide and std == 0.
+Under disturbance (``seq_len_std > 0`` in the strategy or any
+``*_slowdown_prob > 0`` in the disturbance config), each call to
+``_compute_pp_total_time`` samples a fresh disturbance draw. Passing
+``--n-episodes N`` replays each schedule against N independent draws and
+reports mean / std / min / max — that's the distribution the trained
+policy should beat. When all stochasticity is disabled, all N draws
+coincide and std == 0.
 """
 
 from __future__ import annotations
@@ -18,12 +19,14 @@ from __future__ import annotations
 import argparse
 import statistics
 from dataclasses import replace
+from typing import Optional
 
 import numpy as np
 
-from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
 from simumax.core.perf_llm import PerfLLM
 from simumax.utils import (
+    get_simu_disturbance_config,
     get_simu_model_config,
     get_simu_strategy_config,
     get_simu_system_config,
@@ -39,15 +42,11 @@ def _load_strategy(name: str) -> StrategyConfig:
 def _resample_episode(perf: PerfLLM, seed: int) -> None:
     """Re-seed and re-sample all four stochastic inputs for one episode.
 
-    Same offsets as ``simumax.rl_env.backend.SimuMaxBackend.sample_episode``
-    so baseline draws line up exactly with RL-env draws under the same
-    base seed.
+    Uses the same single-seed convention as
+    ``simumax.rl_env.backend.SimuMaxBackend.sample_episode`` so baseline
+    draws line up exactly with RL-env draws under the same base seed.
     """
-    strategy = perf.strategy
-    strategy.seq_len_seed = seed
-    strategy.op_duration_seed = seed + 1
-    strategy.op_slowdown_seed = seed + 2
-    strategy.stage_slowdown_seed = seed + 3
+    perf.disturbance.seed = seed
     perf.seq_lens = perf._sample_seq_lens()
     perf._sample_op_disturbance()
     perf._sample_stage_disturbance()
@@ -59,11 +58,17 @@ def run_baseline(
     system_name: str,
     n_episodes: int = 1,
     base_seed: int = 0,
+    disturbance_name: Optional[str] = None,
 ) -> dict[str, list[float]]:
     """Return ``{schedule: [iter_time_seconds, ...]}`` with ``n_episodes`` entries each."""
     base_strategy = _load_strategy(strategy_name)
     model_cfg = ModelConfig.init_from_config_file(get_simu_model_config(model_name))
     system_cfg = SystemConfig.init_from_config_file(get_simu_system_config(system_name))
+    base_disturbance = None
+    if disturbance_name is not None:
+        base_disturbance = DisturbanceConfig.init_from_config_file(
+            get_simu_disturbance_config(disturbance_name)
+        )
 
     # Draw ep_seeds from the same BitGenerator chain gymnasium's
     # Env.reset(seed=base_seed) uses (SeedSequence -> PCG64 -> Generator).
@@ -76,9 +81,13 @@ def run_baseline(
     out: dict[str, list[float]] = {}
     for schedule in _SCHEDULES:
         strategy = replace(base_strategy, pp_schedule=schedule)
+        disturbance = replace(base_disturbance) if base_disturbance is not None else None
         perf = PerfLLM()
         perf.configure(
-            strategy_config=strategy, model_config=model_cfg, system_config=system_cfg
+            strategy_config=strategy,
+            model_config=model_cfg,
+            system_config=system_cfg,
+            disturbance_config=disturbance,
         )
         perf.run_estimate()
 
@@ -109,6 +118,11 @@ def main() -> None:
     parser.add_argument("--model", default="llama3-8b")
     parser.add_argument("--system", default="a100_pcie")
     parser.add_argument(
+        "--disturbance",
+        default=None,
+        help="Disturbance config name (without .json); omit for no disturbance",
+    )
+    parser.add_argument(
         "--n-episodes",
         type=int,
         default=1,
@@ -123,7 +137,12 @@ def main() -> None:
     args = parser.parse_args()
 
     results = run_baseline(
-        args.strategy, args.model, args.system, args.n_episodes, args.seed
+        args.strategy,
+        args.model,
+        args.system,
+        args.n_episodes,
+        args.seed,
+        disturbance_name=args.disturbance,
     )
 
     summaries = {s: _summarize(v) for s, v in results.items()}

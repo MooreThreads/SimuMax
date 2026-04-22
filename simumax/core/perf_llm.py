@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from simumax.core.base_struct import PathDebugContext
-from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, set_capture_graph_only, TMP_PATH, SIMU_CHECK, SIMU_DEBUG, ENABLE_SIMU_GRAPH
+from simumax.core.config import DisturbanceConfig, StrategyConfig, SystemConfig, ModelConfig, set_capture_graph_only, TMP_PATH, SIMU_CHECK, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.base_struct import InputOutputInfo, TensorSize, Result
 from simumax.core.transformer.language_model import LLMModel, PeakPoint
 from simumax.core.graph import SimuONNXGraphBuilder, visualize_with_graphviz
@@ -27,6 +27,14 @@ FIRST_CHUNK = "first_stage_chunk"
 MIDDLE_CHUNK = "middle_stage_chunk"
 LAST_CHUNK = "last_stage_chunk"
 
+# Substream indices for the four stochastic features; must stay stable so a
+# given ``DisturbanceConfig.seed`` reproduces identical draws across runs.
+_SEED_SEQ_LEN = 0
+_SEED_OP_DURATION = 1
+_SEED_OP_SLOWDOWN = 2
+_SEED_STAGE_SLOWDOWN = 3
+_NUM_DISTURBANCE_STREAMS = 4
+
 class PerfBase(ABC):
     """
     Abstract class for performance model
@@ -37,6 +45,7 @@ class PerfBase(ABC):
     def __init__(self) -> None:
         self.is_configured = False
         self.strategy = None
+        self.disturbance = None
         self.model_config = None
         self.system = None
         self.graph = None
@@ -56,6 +65,10 @@ class PerfBase(ABC):
         strategy.sanity_check()
         self.strategy = strategy
 
+    def _set_disturbance_config(self, disturbance: DisturbanceConfig):
+        disturbance.sanity_check()
+        self.disturbance = disturbance
+
     def _set_model_config(self, model_config: ModelConfig):
         model_config.sanity_check()
         self.model_config = model_config
@@ -74,26 +87,37 @@ class PerfBase(ABC):
         strategy_config: Union[StrategyConfig, str] = None,
         model_config: Union[ModelConfig, str] = None,
         system_config: Union[SystemConfig, str] = None,
+        disturbance_config: Union[DisturbanceConfig, str, None] = None,
         debug_points: List[str] = None,
         debug_points_last_stage=None,
     ):
         """
         Configure the performance model, including strategy, model and system config.
         And check the sanity of the configuration.
+
+        ``disturbance_config`` is optional: when omitted an all-defaults
+        ``DisturbanceConfig`` is used, which reduces to nominal (no-noise,
+        no-slowdown) behaviour.
         """
         if not isinstance(strategy_config, StrategyConfig):
             strategy_config = StrategyConfig.init_from_config_file(strategy_config)
         self._set_strategy_config(strategy_config)
 
+        if disturbance_config is None:
+            disturbance_config = DisturbanceConfig()
+        elif not isinstance(disturbance_config, DisturbanceConfig):
+            disturbance_config = DisturbanceConfig.init_from_config_file(disturbance_config)
+        self._set_disturbance_config(disturbance_config)
+
         if not isinstance(model_config, ModelConfig):
             model_config = ModelConfig.init_from_config_file(model_config)
         self._set_model_config(model_config)
-        
+
 
         if not isinstance(system_config, SystemConfig):
             system_config = SystemConfig.init_from_config_file(system_config)
         self._set_system_config(system_config)
-        
+
 
         self.debug_points = debug_points if debug_points is not None else []
         self.debug_points_last_stage = (
@@ -247,7 +271,7 @@ class PerfLLM(PerfBase):
         )
         # Per-microbatch sampled sequence lengths (np.int64 array, len == micro_batch_num).
         # Populated in run_estimate via _sample_seq_lens(). Constant-valued when
-        # strategy.seq_len_std == 0 (default).
+        # disturbance.seq_len_std == 0 (default).
         self.seq_lens: np.ndarray = None
         # Cache for per-(chunk, seq_len_int) timing tuples.
         # Keys: (chunk_name, s_int). Values: (fwd_time, b_time, w_time).
@@ -277,38 +301,50 @@ class PerfLLM(PerfBase):
         except Exception as e:
             print(f"Error deleting file: {e}")
 
+    def _disturbance_rng(self, stream_idx: int) -> np.random.Generator:
+        """Return a reproducible RNG for one of the four disturbance substreams.
+
+        ``SeedSequence(seed).spawn(N)`` is deterministic, so callers that only
+        need one substream can call this without pre-spawning.
+        """
+        seed = self.disturbance.seed
+        ss = np.random.SeedSequence(seed).spawn(_NUM_DISTURBANCE_STREAMS)
+        return np.random.default_rng(ss[stream_idx])
+
     def _sample_seq_lens(self) -> np.ndarray:
         """Sample one sequence length per microbatch.
 
         Returns a length-``micro_batch_num`` int64 array. When
-        ``strategy.seq_len_std == 0`` (default) the array is constant and the
-        simulation degenerates to the original single-seq_len behaviour.
+        ``disturbance.seq_len_std == 0`` (default) the array is constant and
+        the simulation degenerates to the original single-seq_len behaviour.
 
         With non-zero std the values are drawn from
         ``Normal(seq_len_mean, seq_len_std)``, rounded to int, clipped to
         ``[seq_len_min, seq_len_max]`` (``seq_len_max`` defaults to
         ``10 * seq_len_mean`` if unset), and when sequence parallelism is on
         snapped *down* to a multiple of ``tp_size`` (bumped up to ``tp_size``
-        if rounding would yield 0).
+        if rounding would yield 0). ``seq_len_mean`` falls back to
+        ``strategy.seq_len`` when unset.
         """
         strategy = self.strategy
+        disturbance = self.disturbance
         mbc = strategy.micro_batch_num
-        mean = strategy.seq_len_mean if strategy.seq_len_mean is not None else strategy.seq_len
-        std = strategy.seq_len_std
+        mean = disturbance.seq_len_mean if disturbance.seq_len_mean is not None else strategy.seq_len
+        std = disturbance.seq_len_std
         if std == 0.0:
             return np.full(mbc, int(mean), dtype=np.int64)
 
-        rng = np.random.default_rng(strategy.seq_len_seed)
+        rng = self._disturbance_rng(_SEED_SEQ_LEN)
         raw = rng.normal(mean, std, size=mbc)
-        lo = strategy.seq_len_min if strategy.seq_len_min is not None else 1
-        hi = strategy.seq_len_max if strategy.seq_len_max is not None else int(10 * mean)
+        lo = disturbance.seq_len_min if disturbance.seq_len_min is not None else 1
+        hi = disturbance.seq_len_max if disturbance.seq_len_max is not None else int(10 * mean)
         clipped = np.clip(np.rint(raw), lo, hi).astype(np.int64)
         if strategy.enable_sequence_parallel and strategy.tp_size > 1:
             tp = strategy.tp_size
             clipped = np.maximum(tp, (clipped // tp) * tp)
         print(
             f"[SimuMax] Variable seq_len: N(mean={mean}, std={std}), "
-            f"seed={strategy.seq_len_seed}, mbc={mbc} -> "
+            f"mbc={mbc} -> "
             f"min={int(clipped.min())}, "
             f"mean={float(clipped.mean()):.1f}, "
             f"max={int(clipped.max())}; values={clipped.tolist()}"
@@ -377,7 +413,7 @@ class PerfLLM(PerfBase):
             mult *= float(self.op_noise_mult[kind][idx, m])
         if self.op_slowdown_mask is not None and kind in self.op_slowdown_mask:
             if self.op_slowdown_mask[kind][idx, m]:
-                mult *= self.strategy.op_slowdown_k
+                mult *= self.disturbance.op_slowdown_k
         if self.stage_slowdown_mult is not None and kind in self.stage_slowdown_mult:
             mult *= float(self.stage_slowdown_mult[kind][idx, m])
         return mult
@@ -388,29 +424,29 @@ class PerfLLM(PerfBase):
         application code can short-circuit.
         """
         strategy = self.strategy
+        disturbance = self.disturbance
         n_rank_units, kinds = self._disturbance_shape()
         mbc = strategy.micro_batch_num
 
         # Feature A — per-task Gaussian multiplier.
-        if strategy.op_duration_std > 0.0:
-            rng_a = np.random.default_rng(strategy.op_duration_seed)
+        if disturbance.op_duration_std > 0.0:
+            rng_a = self._disturbance_rng(_SEED_OP_DURATION)
             mult = {}
             for kind in kinds:
                 raw = rng_a.normal(
                     loc=1.0,
-                    scale=strategy.op_duration_std,
+                    scale=disturbance.op_duration_std,
                     size=(n_rank_units, mbc),
                 )
                 mult[kind] = np.clip(
                     raw,
-                    strategy.op_duration_min_factor,
-                    strategy.op_duration_max_factor,
+                    disturbance.op_duration_min_factor,
+                    disturbance.op_duration_max_factor,
                 )
             self.op_noise_mult = mult
             flat = np.concatenate([m.ravel() for m in mult.values()])
             print(
-                f"[SimuMax] Op-duration noise: N(1, {strategy.op_duration_std}), "
-                f"seed={strategy.op_duration_seed}, "
+                f"[SimuMax] Op-duration noise: N(1, {disturbance.op_duration_std}), "
                 f"shape=({len(kinds)}, {n_rank_units}, {mbc}) -> "
                 f"min={float(flat.min()):.3f}, "
                 f"mean={float(flat.mean()):.3f}, "
@@ -421,20 +457,20 @@ class PerfLLM(PerfBase):
 
         # Feature C — independent Bernoulli per task.
         self.op_slowdown_records = []
-        if strategy.op_slowdown_prob > 0.0:
-            rng_c = np.random.default_rng(strategy.op_slowdown_seed)
+        if disturbance.op_slowdown_prob > 0.0:
+            rng_c = self._disturbance_rng(_SEED_OP_SLOWDOWN)
             mask = {}
             for kind in kinds:
-                mask[kind] = rng_c.random(size=(n_rank_units, mbc)) < strategy.op_slowdown_prob
+                mask[kind] = rng_c.random(size=(n_rank_units, mbc)) < disturbance.op_slowdown_prob
             # Enforce global cap across (kind, rank_unit, mb) in row-major order:
             # stack kinds in declared order, flatten, keep first N True entries.
-            if strategy.op_slowdown_max_count is not None:
+            if disturbance.op_slowdown_max_count is not None:
                 stacked = np.stack([mask[k] for k in kinds], axis=0)
                 flat = stacked.reshape(-1)
                 kept = 0
                 for i in range(flat.size):
                     if flat[i]:
-                        if kept < strategy.op_slowdown_max_count:
+                        if kept < disturbance.op_slowdown_max_count:
                             kept += 1
                         else:
                             flat[i] = False
@@ -450,11 +486,11 @@ class PerfLLM(PerfBase):
                         {"kind": k, "rank_unit": int(idx), "mb": int(mb)}
                     )
             print(
-                f"[SimuMax] Op-slowdown: p={strategy.op_slowdown_prob}, "
-                f"K={strategy.op_slowdown_k}, seed={strategy.op_slowdown_seed}, "
+                f"[SimuMax] Op-slowdown: p={disturbance.op_slowdown_prob}, "
+                f"K={disturbance.op_slowdown_k}, "
                 f"triggered={len(self.op_slowdown_records)}"
-                + (f" (cap={strategy.op_slowdown_max_count})"
-                   if strategy.op_slowdown_max_count is not None else "")
+                + (f" (cap={disturbance.op_slowdown_max_count})"
+                   if disturbance.op_slowdown_max_count is not None else "")
             )
         else:
             self.op_slowdown_mask = None
@@ -472,21 +508,22 @@ class PerfLLM(PerfBase):
         Schedule-independent: no dry-run required.
         """
         strategy = self.strategy
+        disturbance = self.disturbance
         self._slowed_rank = None
         self.stage_slowdown_mult = None
-        if strategy.stage_slowdown_prob <= 0.0:
+        if disturbance.stage_slowdown_prob <= 0.0:
             return
 
         pp = strategy.pp_size
         mbc = strategy.micro_batch_num
         n_rank_units, kinds = self._disturbance_shape()
-        K = strategy.stage_slowdown_k
+        K = disturbance.stage_slowdown_k
 
-        rng_b = np.random.default_rng(strategy.stage_slowdown_seed)
-        if float(rng_b.random()) >= strategy.stage_slowdown_prob:
+        rng_b = self._disturbance_rng(_SEED_STAGE_SLOWDOWN)
+        if float(rng_b.random()) >= disturbance.stage_slowdown_prob:
             print(
-                f"[SimuMax] Stage-slowdown: prob={strategy.stage_slowdown_prob}, "
-                f"K={K}, seed={strategy.stage_slowdown_seed} -> no stage slowed"
+                f"[SimuMax] Stage-slowdown: prob={disturbance.stage_slowdown_prob}, "
+                f"K={K} -> no stage slowed"
             )
             return
 
@@ -505,8 +542,8 @@ class PerfLLM(PerfBase):
                 mult[kind][idx, :] = K
         self.stage_slowdown_mult = mult
         print(
-            f"[SimuMax] Stage-slowdown: prob={strategy.stage_slowdown_prob}, "
-            f"K={K}, seed={strategy.stage_slowdown_seed} -> slowed_rank={slowed_rank}"
+            f"[SimuMax] Stage-slowdown: prob={disturbance.stage_slowdown_prob}, "
+            f"K={K} -> slowed_rank={slowed_rank}"
         )
 
     def get_num_layers_to_build(self, config: StrategyConfig, model_conf: ModelConfig, parallel_stage="first") -> int:
@@ -2588,7 +2625,7 @@ class PerfLLM(PerfBase):
         final_duration_time_per_iter = max(duration_times)
         # When seq_len_std > 0, total tokens per iter is the sum across
         # sampled microbatches rather than nominal seq_len * global_batch.
-        if self.seq_lens is not None and self.strategy.seq_len_std > 0.0:
+        if self.seq_lens is not None and self.disturbance.seq_len_std > 0.0:
             tokens_per_mb_slot = int(self.seq_lens.sum()) * self.strategy.micro_batch_size
             all_tokens_per_iter = tokens_per_mb_slot * self.strategy.dp_size
         else:
@@ -2797,7 +2834,7 @@ class PerfLLM(PerfBase):
         use ``max(self.seq_lens)`` so the memory peak is conservative w.r.t.
         the worst microbatch in the simulation.
         """
-        if self.seq_lens is not None and self.strategy.seq_len_std > 0.0:
+        if self.seq_lens is not None and self.disturbance.seq_len_std > 0.0:
             return int(self.seq_lens.max())
         return self.strategy.seq_len
 
@@ -3325,6 +3362,10 @@ class PerfLLM(PerfBase):
         with open(f"{save_path}/strategy_config.json", "w") as f:
             f.write(str(self.strategy))
 
+        if self.disturbance is not None:
+            with open(f"{save_path}/disturbance_config.json", "w") as f:
+                f.write(str(self.disturbance))
+
         with open(f"{save_path}/system_config.json", "w") as f:
             f.write(str(self.system))
 
@@ -3365,6 +3406,8 @@ class PerfLLM(PerfBase):
             with open(f"{save_path}/model_config.json", "w") as f:
                 f.write(str(self.model_config))
 
+            # disturbance_config dumped below alongside disturbance_log
+
             if self.seq_lens is not None:
                 seq_lens_info = {
                     "values": self.seq_lens.tolist(),
@@ -3372,17 +3415,28 @@ class PerfLLM(PerfBase):
                     "std": float(self.seq_lens.std()),
                     "min": int(self.seq_lens.min()),
                     "max": int(self.seq_lens.max()),
-                    "configured_mean": self.strategy.seq_len_mean if self.strategy.seq_len_mean is not None else self.strategy.seq_len,
-                    "configured_std": self.strategy.seq_len_std,
-                    "seed": self.strategy.seq_len_seed,
-                    "seq_len_min": self.strategy.seq_len_min,
-                    "seq_len_max": self.strategy.seq_len_max,
+                    "configured_mean": (
+                        self.disturbance.seq_len_mean
+                        if self.disturbance.seq_len_mean is not None
+                        else self.strategy.seq_len
+                    ),
+                    "configured_std": self.disturbance.seq_len_std,
+                    "seed": self.disturbance.seed,
+                    "seq_len_min": self.disturbance.seq_len_min,
+                    "seq_len_max": self.disturbance.seq_len_max,
                 }
                 with open(f"{save_path}/seq_lens.json", "w") as f:
                     json.dump(seq_lens_info, f, indent=2)
 
+            if self.disturbance is not None:
+                with open(f"{save_path}/disturbance_config.json", "w") as f:
+                    f.write(str(self.disturbance))
+
             # Disturbance audit log: features A / B / C in one file.
-            # Only emitted when at least one feature was active.
+            # Only emitted when at least one feature was active. The seed is
+            # reported once at the top; each stream is derived via
+            # SeedSequence(seed).spawn(4) at sampling time.
+            disturbance = self.disturbance
             disturbance_log = {}
             if self.op_noise_mult is not None:
                 mult_summary = {}
@@ -3392,10 +3446,9 @@ class PerfLLM(PerfBase):
                     all_vals.append(arr.ravel())
                 flat = np.concatenate(all_vals)
                 disturbance_log["op_duration_noise"] = {
-                    "configured_std": self.strategy.op_duration_std,
-                    "seed": self.strategy.op_duration_seed,
-                    "min_factor": self.strategy.op_duration_min_factor,
-                    "max_factor": self.strategy.op_duration_max_factor,
+                    "configured_std": disturbance.op_duration_std,
+                    "min_factor": disturbance.op_duration_min_factor,
+                    "max_factor": disturbance.op_duration_max_factor,
                     "summary": {
                         "mean": float(flat.mean()),
                         "std": float(flat.std()),
@@ -3406,21 +3459,20 @@ class PerfLLM(PerfBase):
                 }
             if self.op_slowdown_mask is not None:
                 disturbance_log["op_slowdown"] = {
-                    "configured_prob": self.strategy.op_slowdown_prob,
-                    "k": self.strategy.op_slowdown_k,
-                    "max_count": self.strategy.op_slowdown_max_count,
-                    "seed": self.strategy.op_slowdown_seed,
+                    "configured_prob": disturbance.op_slowdown_prob,
+                    "k": disturbance.op_slowdown_k,
+                    "max_count": disturbance.op_slowdown_max_count,
                     "triggered_count": len(self.op_slowdown_records),
                     "triggered": self.op_slowdown_records,
                 }
-            if self.strategy.stage_slowdown_prob > 0.0:
+            if disturbance.stage_slowdown_prob > 0.0:
                 disturbance_log["stage_slowdown"] = {
-                    "configured_prob": self.strategy.stage_slowdown_prob,
-                    "k": self.strategy.stage_slowdown_k,
-                    "seed": self.strategy.stage_slowdown_seed,
+                    "configured_prob": disturbance.stage_slowdown_prob,
+                    "k": disturbance.stage_slowdown_k,
                     "slowed_rank": self._slowed_rank,
                 }
             if disturbance_log:
+                disturbance_log["seed"] = disturbance.seed
                 with open(f"{save_path}/disturbance_log.json", "w") as f:
                     json.dump(disturbance_log, f, indent=2)
 

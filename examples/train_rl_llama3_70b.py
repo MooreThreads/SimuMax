@@ -2,8 +2,8 @@
 
 Fixed-sequence, no-disturbance setting — trains a policy to schedule
 forward/backward/weight tasks on a llama3-8b × tp1_pp2_dp4_mbs1 × a100
-deployment. Flip ``seq_len_std`` / ``op_duration_std`` / etc. in the
-strategy JSON to enable Phase 2 stochasticity.
+deployment. Set ``seq_len_std`` in the strategy JSON or pass a
+``--disturbance`` config to enable Phase 2 stochasticity.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from simumax.rl_env.env import RLEnvConfig
 from simumax.rl_env.train import PPOTrainingConfig, train
 from simumax.rl_env.types import RewardMode
 from simumax.utils import (
+    get_simu_disturbance_config,
     get_simu_model_config,
     get_simu_strategy_config,
     get_simu_system_config,
@@ -25,6 +26,11 @@ def main() -> None:
     parser.add_argument("--strategy", default="llama70b_tp8_pp4_dp100")
     parser.add_argument("--model", default="llama3-70b")
     parser.add_argument("--system", default="h100_nvlink")
+    parser.add_argument(
+        "--disturbance",
+        default=None,
+        help="Disturbance config name (without .json); omit for no disturbance",
+    )
     parser.add_argument("--total-timesteps", type=int, default=500_000)
     parser.add_argument("--n-envs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
@@ -41,6 +47,10 @@ def main() -> None:
         strategy_config=get_simu_strategy_config(args.strategy),
         model_config=get_simu_model_config(args.model),
         system_config=get_simu_system_config(args.system),
+        disturbance_config=(
+            get_simu_disturbance_config(args.disturbance)
+            if args.disturbance is not None else None
+        ),
         reward_mode=RewardMode(args.reward_mode),
         seed=args.seed,
     )

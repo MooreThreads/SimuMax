@@ -16,7 +16,7 @@ import numpy as np
 from gymnasium import spaces
 from numpy.typing import NDArray
 
-from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
 from simumax.rl_env.backend import ConfigLike, EpisodeData, SimuMaxBackend
 from simumax.rl_env.event_queue import CompletionEvent, EventQueue
 from simumax.rl_env.stage_mapping import StageMapping
@@ -38,6 +38,7 @@ class RLEnvConfig:
     strategy_config: ConfigLike
     model_config: ConfigLike
     system_config: ConfigLike
+    disturbance_config: Optional[ConfigLike] = None
     reward_mode: RewardMode = RewardMode.UTILIZATION
     max_time_limit: Optional[float] = None
     seed: Optional[int] = None
@@ -71,6 +72,7 @@ class PipelineSchedulingEnv(gymnasium.Env):
             strategy_config=env_config.strategy_config,
             model_config=env_config.model_config,
             system_config=env_config.system_config,
+            disturbance_config=env_config.disturbance_config,
         )
 
         self._p = self._backend.num_gpus
@@ -81,7 +83,7 @@ class PipelineSchedulingEnv(gymnasium.Env):
         self._stage_mapping = StageMapping(self._p, self._s)
 
         seq_len_nominal = float(self._backend.perf.strategy.seq_len)
-        seq_len_mean = self._backend.perf.strategy.seq_len_mean
+        seq_len_mean = self._backend.perf.disturbance.seq_len_mean
         self._seq_len_scale = (
             float(seq_len_mean) if seq_len_mean else seq_len_nominal
         ) or 1.0

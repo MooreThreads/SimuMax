@@ -1,0 +1,7 @@
+{
+    "seed": 0,
+    "seq_len_mean": 4096,
+    "seq_len_std": 512,
+    "seq_len_min": 512,
+    "seq_len_max": 8192
+}
