@@ -7,3 +7,9 @@ sympy
 tabulate
 graphviz
 streamlit
+
+# RL environment (simumax/rl_env)
+gymnasium
+stable-baselines3>=2.0
+sb3-contrib>=2.0
+tensorboard

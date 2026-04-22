@@ -153,8 +153,15 @@ class PipelineSchedulingEnv(gymnasium.Env):
         seed: Optional[int] = None,
         options: Optional[dict[str, Any]] = None,
     ) -> tuple[dict[str, NDArray[Any]], dict[str, Any]]:
-        effective_seed = seed if seed is not None else self._env_config.seed
-        super().reset(seed=effective_seed)
+        # Seed self.np_random deterministically on the first reset (from the
+        # caller's seed, or the RLEnvConfig fallback). On subsequent resets
+        # with seed=None, super() preserves self.np_random's state so it
+        # advances between episodes — each rollout draws a fresh scalar seed
+        # for the backend from the single RNG stream, giving us both natural
+        # per-episode variability and reproducibility from the initial seed.
+        if seed is None and self._np_random is None:
+            seed = self._env_config.seed
+        super().reset(seed=seed)
 
         self._task_graph = TaskGraph(self._m, self._s)
         self._event_queue = EventQueue()
@@ -163,7 +170,8 @@ class PipelineSchedulingEnv(gymnasium.Env):
         self._current_time = 0.0
         self._execution_log = []
 
-        self._episode = self._backend.sample_episode(seed=effective_seed)
+        ep_seed = int(self.np_random.integers(0, 2**31 - 1))
+        self._episode = self._backend.sample_episode(seed=ep_seed)
 
         self._action_mask = self._compute_action_mask()
         obs = self._build_observation()
