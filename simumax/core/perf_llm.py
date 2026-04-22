@@ -14,6 +14,7 @@ from simumax.core.base_struct import PathDebugContext
 from simumax.core.config import DisturbanceConfig, StrategyConfig, SystemConfig, ModelConfig, set_capture_graph_only, TMP_PATH, SIMU_CHECK, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.base_struct import InputOutputInfo, TensorSize, Result
 from simumax.core.transformer.language_model import LLMModel, PeakPoint
+from simumax.core.gantt import GanttBar, plot_gantt
 from simumax.core.graph import SimuONNXGraphBuilder, visualize_with_graphviz
 from simumax.core.utils import (
     HumanReadableSize,
@@ -1163,25 +1164,17 @@ class PerfLLM(PerfBase):
         # bubble = sum(f_b_time)+sum(forward_times[idx+1:])+sum(backward_times[idx+1:]) - (pp-idx)*(f_b_time[idx])
         # all_time = bubble + mbc*f_b_time[idx]
         if draw:
-            # Visualize the schedule
-            fig, ax = plt.subplots(figsize=(12, 5))
-            colors = {'F': '#6b8ec9', 'B': '#6db5b5'}
-
-            for rank, tasks in enumerate(schedules):
-                for task_type, mb, start, duration, end in tasks:
-                    ax.barh(y=pp - 1 - rank, width=duration, left=start,
-                            height=0.6, color=colors[task_type], edgecolor='black')
-                    ax.text(start + duration / 2, pp - 1 - rank, f'{task_type}{mb + 1}',
-                            va='center', ha='center', fontsize=9, color='black')
-
-            ax.set_yticks(range(pp))
-            ax.set_yticklabels([f"Stage {i}" for i in reversed(range(pp))])
-            ax.set_xlabel("Time")
-            ax.set_title(f"Corrected 1F1B Pipeline Execution Timeline (pp={pp}, mbc={mbc})")
-            plt.grid(True, axis='x', linestyle='--', alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(output_path or self.default_gantt_filename("1f1b"))
-            plt.close(fig)
+            bars = [
+                [GanttBar(op=t[0], mb=t[1], start=t[2], duration=t[3], end=t[4])
+                 for t in rank_tasks]
+                for rank_tasks in schedules
+            ]
+            plot_gantt(
+                bars, pp,
+                title=f"Corrected 1F1B Pipeline Execution Timeline (pp={pp}, mbc={mbc})",
+                output_path=output_path or self.default_gantt_filename("1f1b"),
+                figsize=(12, 5), label_fontsize=9,
+            )
 
         return max_time
 
@@ -1504,24 +1497,16 @@ class PerfLLM(PerfBase):
         self._last_schedules = schedules
 
         if draw:
-            fig, ax = plt.subplots(figsize=(14, 5))
-            colors = {"F": "#6b8ec9", "B": "#6db5b5", "W": "#5fa75f"}
-            for rank, tasks in enumerate(schedules):
-                for task_type, mb, start, duration, end in tasks:
-                    ax.barh(y=pp - 1 - rank, width=duration, left=start,
-                            height=0.6, color=colors[task_type], edgecolor="black")
-                    ax.text(start + duration / 2, pp - 1 - rank, f"{task_type}{mb + 1}",
-                            va="center", ha="center", fontsize=8, color="black")
-            ax.set_yticks(range(pp))
-            ax.set_yticklabels([f"Stage {i}" for i in reversed(range(pp))])
-            ax.set_xlabel("Time")
-            ax.set_title(
-                f"{schedule_name} Pipeline Execution Timeline (pp={pp}, mbc={mbc})"
+            bars = [
+                [GanttBar(op=t[0], mb=t[1], start=t[2], duration=t[3], end=t[4])
+                 for t in rank_tasks]
+                for rank_tasks in schedules
+            ]
+            plot_gantt(
+                bars, pp,
+                title=f"{schedule_name} Pipeline Execution Timeline (pp={pp}, mbc={mbc})",
+                output_path=output_path or self.default_gantt_filename(schedule_name),
             )
-            plt.grid(True, axis="x", linestyle="--", alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(output_path or self.default_gantt_filename(schedule_name))
-            plt.close(fig)
 
         return max_time
 
@@ -1616,23 +1601,16 @@ class PerfLLM(PerfBase):
         self._last_schedules = schedules
 
         if draw:
-            fig, ax = plt.subplots(figsize=(14, 5))
-            colors = {"F": "#6b8ec9", "B": "#6db5b5"}
-            for rank, tasks in enumerate(schedules):
-                for task_type, mb, start, duration, end in tasks:
-                    ax.barh(y=pp - 1 - rank, width=duration, left=start,
-                            height=0.6, color=colors[task_type], edgecolor="black")
-                    ax.text(start + duration / 2, pp - 1 - rank,
-                            f"{task_type}{mb + 1}",
-                            va="center", ha="center", fontsize=8, color="black")
-            ax.set_yticks(range(pp))
-            ax.set_yticklabels([f"Stage {i}" for i in reversed(range(pp))])
-            ax.set_xlabel("Time")
-            ax.set_title(f"GPipe Pipeline Execution Timeline (pp={pp}, mbc={mbc})")
-            plt.grid(True, axis="x", linestyle="--", alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(output_path or self.default_gantt_filename("GPipe"))
-            plt.close(fig)
+            bars = [
+                [GanttBar(op=t[0], mb=t[1], start=t[2], duration=t[3], end=t[4])
+                 for t in rank_tasks]
+                for rank_tasks in schedules
+            ]
+            plot_gantt(
+                bars, pp,
+                title=f"GPipe Pipeline Execution Timeline (pp={pp}, mbc={mbc})",
+                output_path=output_path or self.default_gantt_filename("GPipe"),
+            )
 
         return max_time
 
@@ -1767,28 +1745,19 @@ class PerfLLM(PerfBase):
         self._last_schedules = schedules
 
         if draw:
-            fig, ax = plt.subplots(figsize=(16, 5))
-            colors = {"F": "#6b8ec9", "B": "#6db5b5", "W": "#5fa75f"}
-            for r, tasks in enumerate(schedules):
-                for kind, mb, vs_local, start, dur, end in tasks:
-                    ax.barh(y=pp - 1 - r, width=dur, left=start,
-                            height=0.6, color=colors[kind], edgecolor="black")
-                    txt_color = "black" if vs_local == 0 else "white"
-                    label = f"{kind}{mb + 1}"
-                    ax.text(start + dur / 2, pp - 1 - r, label,
-                            va="center", ha="center", fontsize=7,
-                            color=txt_color)
-            ax.set_yticks(range(pp))
-            ax.set_yticklabels([f"Rank {i}" for i in reversed(range(pp))])
-            ax.set_xlabel("Time")
-            ax.set_title(
-                f"{schedule_name} Pipeline Timeline "
-                f"(pp={pp}, V={V}, total_vs={total_vs})"
+            bars = [
+                [GanttBar(op=t[0], mb=t[1], vs_local=t[2],
+                          start=t[3], duration=t[4], end=t[5])
+                 for t in rank_tasks]
+                for rank_tasks in schedules
+            ]
+            plot_gantt(
+                bars, pp,
+                title=(f"{schedule_name} Pipeline Timeline "
+                       f"(pp={pp}, V={V}, total_vs={total_vs})"),
+                output_path=output_path or self.default_gantt_filename(schedule_name),
+                y_label_prefix="Rank", figsize=(16, 5), label_fontsize=7,
             )
-            plt.grid(True, axis="x", linestyle="--", alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(output_path or self.default_gantt_filename(schedule_name))
-            plt.close(fig)
 
         return max_time
 
@@ -2024,28 +1993,19 @@ class PerfLLM(PerfBase):
         self._last_schedules = schedules
 
         if draw:
-            fig, ax = plt.subplots(figsize=(16, 5))
-            colors = {"F": "#6b8ec9", "B": "#6db5b5", "W": "#5fa75f"}
-            for r, tasks in enumerate(schedules):
-                for kind, mb, vs_local, start, dur, end in tasks:
-                    ax.barh(y=pp - 1 - r, width=dur, left=start,
-                            height=0.6, color=colors[kind], edgecolor="black")
-                    txt_color = "black" if vs_local == 0 else "white"
-                    label = f"{kind}{mb + 1}"
-                    ax.text(start + dur / 2, pp - 1 - r, label,
-                            va="center", ha="center", fontsize=7,
-                            color=txt_color)
-            ax.set_yticks(range(pp))
-            ax.set_yticklabels([f"Rank {i}" for i in reversed(range(pp))])
-            ax.set_xlabel("Time")
-            ax.set_title(
-                f"{schedule_name} Pipeline Timeline "
-                f"(pp={pp}, V={V}, total_vs={total_vs})"
+            bars = [
+                [GanttBar(op=t[0], mb=t[1], vs_local=t[2],
+                          start=t[3], duration=t[4], end=t[5])
+                 for t in rank_tasks]
+                for rank_tasks in schedules
+            ]
+            plot_gantt(
+                bars, pp,
+                title=(f"{schedule_name} Pipeline Timeline "
+                       f"(pp={pp}, V={V}, total_vs={total_vs})"),
+                output_path=output_path or self.default_gantt_filename(schedule_name),
+                y_label_prefix="Rank", figsize=(16, 5), label_fontsize=7,
             )
-            plt.grid(True, axis="x", linestyle="--", alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(output_path or self.default_gantt_filename(schedule_name))
-            plt.close(fig)
 
         return max_time
 
@@ -2197,27 +2157,23 @@ class PerfLLM(PerfBase):
         self._last_schedules = schedules
 
         if draw:
-            fig, ax = plt.subplots(figsize=(16, 5))
-            colors = {"F": "#6b8ec9", "B": "#6db5b5", "W": "#5fa75f"}
-            for r, tasks in enumerate(schedules):
-                for kind, mb, vs_local, start, dur, end in tasks:
+            bars = []
+            for r, rank_tasks in enumerate(schedules):
+                rank_bars = []
+                for kind, mb, vs_local, start, dur, end in rank_tasks:
                     gvs = gvs_of(r, vs_local)
-                    ax.barh(y=pp - 1 - r, width=dur, left=start,
-                            height=0.6, color=colors[kind], edgecolor="black")
-                    label = f"{kind}{mb}.{gvs}"
-                    ax.text(start + dur / 2, pp - 1 - r, label,
-                            va="center", ha="center", fontsize=7, color="black")
-            ax.set_yticks(range(pp))
-            ax.set_yticklabels([f"Rank {i}" for i in reversed(range(pp))])
-            ax.set_xlabel("Time")
-            ax.set_title(
-                f"{schedule_name} Pipeline Timeline "
-                f"(pp={pp}, V={V}, total_vs={total_vs})"
+                    rank_bars.append(GanttBar(
+                        op=kind, mb=mb, start=start, duration=dur, end=end,
+                        label=f"{kind}{mb}.{gvs}",
+                    ))
+                bars.append(rank_bars)
+            plot_gantt(
+                bars, pp,
+                title=(f"{schedule_name} Pipeline Timeline "
+                       f"(pp={pp}, V={V}, total_vs={total_vs})"),
+                output_path=output_path or self.default_gantt_filename(schedule_name),
+                y_label_prefix="Rank", figsize=(16, 5), label_fontsize=7,
             )
-            plt.grid(True, axis="x", linestyle="--", alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(output_path or self.default_gantt_filename(schedule_name))
-            plt.close(fig)
 
         return max_time
 

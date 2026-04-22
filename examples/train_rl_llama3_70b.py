@@ -18,6 +18,7 @@ from simumax.utils import (
     get_simu_model_config,
     get_simu_strategy_config,
     get_simu_system_config,
+    get_simu_training_config,
 )
 
 
@@ -31,9 +32,11 @@ def main() -> None:
         default=None,
         help="Disturbance config name (without .json); omit for no disturbance",
     )
-    parser.add_argument("--total-timesteps", type=int, default=500_000)
-    parser.add_argument("--n-envs", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--training",
+        default="default",
+        help="Training config name (without .json) from configs/training/",
+    )
     parser.add_argument("--log-dir", default="logs/rl_env")
     parser.add_argument("--run-name", default=None)
     parser.add_argument(
@@ -43,6 +46,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    ppo_config = PPOTrainingConfig.init_from_config_file(
+        get_simu_training_config(args.training)
+    )
     env_config = RLEnvConfig(
         strategy_config=get_simu_strategy_config(args.strategy),
         model_config=get_simu_model_config(args.model),
@@ -52,12 +58,7 @@ def main() -> None:
             if args.disturbance is not None else None
         ),
         reward_mode=RewardMode(args.reward_mode),
-        seed=args.seed,
-    )
-    ppo_config = PPOTrainingConfig(
-        total_timesteps=args.total_timesteps,
-        n_envs=args.n_envs,
-        seed=args.seed,
+        seed=ppo_config.seed,
     )
     train(
         env_config=env_config,

@@ -8,8 +8,9 @@ telemetry.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,6 +57,27 @@ class PPOTrainingConfig:
     checkpoint_freq: int = 50_000
     eval_freq: int = 10_000
     eval_episodes: int = 5
+
+    @classmethod
+    def init_from_dict(cls, config_dict: dict[str, Any]) -> "PPOTrainingConfig":
+        # JSON has no tuple type; net_arch_* arrive as lists and must be
+        # tuples to stay hashable / immutable like the dataclass defaults.
+        known = {f.name for f in fields(cls)}
+        unknown = set(config_dict) - known
+        if unknown:
+            raise ValueError(
+                f"Unknown PPOTrainingConfig keys in JSON: {sorted(unknown)}"
+            )
+        normalized = dict(config_dict)
+        for key in ("net_arch_pi", "net_arch_vf"):
+            if key in normalized and normalized[key] is not None:
+                normalized[key] = tuple(int(x) for x in normalized[key])
+        return cls(**normalized)
+
+    @classmethod
+    def init_from_config_file(cls, config_file: str) -> "PPOTrainingConfig":
+        with open(config_file, "r", encoding="utf-8") as reader:
+            return cls.init_from_dict(json.load(reader))
 
 
 def make_env_fn(

@@ -21,15 +21,17 @@ def init_config_map(root):
     strategy_config_dir = os.path.join(root, 'strategy')
     system_config_dir = os.path.join(root, 'system')
     disturbance_config_dir = os.path.join(root, 'disturbance')
+    training_config_dir = os.path.join(root, 'training')
 
     models = get_config_files(model_config_dir)
     strategy = get_config_files(strategy_config_dir)
     systems = get_config_files(system_config_dir)
     disturbances = get_config_files(disturbance_config_dir)
-    return models, strategy, systems, disturbances
+    trainings = get_config_files(training_config_dir)
+    return models, strategy, systems, disturbances, trainings
 
-RELEASE_MODELS, RELEASE_STRATEGY, RELEASE_SYSTEM, RELEASE_DISTURBANCE = init_config_map(os.path.join(root, 'configs'))
-DEV_MODELS, DEV_STRATEGY, DEV_SYSTEM, DEV_DISTURBANCE = init_config_map(os.path.join(root, 'develop/configs'))
+RELEASE_MODELS, RELEASE_STRATEGY, RELEASE_SYSTEM, RELEASE_DISTURBANCE, RELEASE_TRAINING = init_config_map(os.path.join(root, 'configs'))
+DEV_MODELS, DEV_STRATEGY, DEV_SYSTEM, DEV_DISTURBANCE, DEV_TRAINING = init_config_map(os.path.join(root, 'develop/configs'))
 
 def get_config(key, version, r_maps:dict, d_maps:dict, m_type):
     if version == 'release':
@@ -52,6 +54,9 @@ def get_simu_system_config(system_name, version='release'):
 
 def get_simu_disturbance_config(disturbance_name, version='release'):
     return get_config(disturbance_name, version, RELEASE_DISTURBANCE, DEV_DISTURBANCE, 'disturbance')
+
+def get_simu_training_config(training_name, version='release'):
+    return get_config(training_name, version, RELEASE_TRAINING, DEV_TRAINING, 'training')
 
 def show_dict(maps:dict, headers):
     print(tabulate([[k, v] for i, (k, v) in enumerate(maps.items()) if k != 'root'], headers=headers))
@@ -89,6 +94,15 @@ def show_simu_disturbance(version='release'):
         show_dict(RELEASE_DISTURBANCE, headers)
     elif version == 'dev':
         show_dict(DEV_DISTURBANCE, headers)
+    else:
+        raise ValueError('type must be release or dev')
+
+def show_simu_training(version='release'):
+    headers = ['Training', 'Training Config Path']
+    if version == 'release':
+        show_dict(RELEASE_TRAINING, headers)
+    elif version == 'dev':
+        show_dict(DEV_TRAINING, headers)
     else:
         raise ValueError('type must be release or dev')
 

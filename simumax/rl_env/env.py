@@ -17,6 +17,7 @@ from gymnasium import spaces
 from numpy.typing import NDArray
 
 from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.gantt import GanttBar, plot_gantt
 from simumax.rl_env.backend import ConfigLike, EpisodeData, SimuMaxBackend
 from simumax.rl_env.event_queue import CompletionEvent, EventQueue
 from simumax.rl_env.stage_mapping import StageMapping
@@ -53,7 +54,10 @@ def _require_reset(name: str) -> NoReturn:
 class PipelineSchedulingEnv(gymnasium.Env):
     """Gym env where the agent dispatches PP tasks on SimuMax durations."""
 
-    metadata: dict[str, Any] = {"render_modes": [], "render_fps": 0}
+    metadata: dict[str, Any] = {
+        "render_modes": ["committed", "projected"],
+        "render_fps": 0,
+    }
 
     def __init__(
         self,
@@ -373,6 +377,63 @@ class PipelineSchedulingEnv(gymnasium.Env):
             return -(pp * T - useful_work)
 
         return useful_work / (pp * T) if T > 0.0 else 0.0
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+
+    def render(
+        self,
+        output_path: str,
+        *,
+        mode: str = "projected",
+        title: Optional[str] = None,
+    ) -> None:
+        """Save a Gantt chart of the episode so far to ``output_path``.
+
+        ``mode="committed"`` draws only completed tasks. ``mode="projected"``
+        (the default) also draws in-flight tasks at their scheduled
+        completion time (hatched, dimmed) and a vertical ``now`` cursor at
+        ``self._current_time``. Under Phase 1, stage index equals rank, so
+        rows map directly to pipeline stages.
+        """
+        if mode not in ("committed", "projected"):
+            raise ValueError(
+                f"mode must be 'committed' or 'projected'; got {mode!r}"
+            )
+        if self._task_graph is None:
+            _require_reset("render()")
+
+        schedules: list[list[GanttBar]] = [[] for _ in range(self._p)]
+        for rec in self._execution_log:
+            end_time = rec["end_time"]
+            in_flight = end_time is None
+            if in_flight:
+                if mode == "committed":
+                    continue
+                # Scheduled completion = dispatch time + sampled duration.
+                end_time = rec["start_time"] + rec["duration"]
+            schedules[rec["gpu"]].append(GanttBar(
+                op=OpType(rec["op"]).name,
+                mb=rec["microbatch"],
+                start=rec["start_time"],
+                duration=end_time - rec["start_time"],
+                end=end_time,
+                in_flight=in_flight,
+            ))
+
+        pp = self._p
+        mbc = self._m
+        default_title = (
+            f"RL episode Gantt ({mode}, pp={pp}, mbc={mbc}, "
+            f"t={self._current_time:.3f})"
+        )
+        plot_gantt(
+            schedules, pp,
+            title=title if title is not None else default_title,
+            output_path=output_path,
+            now=self._current_time if mode == "projected" else None,
+        )
 
     @property
     def current_time(self) -> float:

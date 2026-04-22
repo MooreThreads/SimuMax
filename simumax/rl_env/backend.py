@@ -117,6 +117,7 @@ class SimuMaxBackend:
         perf._sample_stage_disturbance()
         f_times, b_times, w_times = perf._per_rank_fwd_b_w_times(apply_disturbance=True)
 
+        strategy = perf.strategy
         return EpisodeData(
             p=strategy.pp_size,
             s=strategy.pp_size,
