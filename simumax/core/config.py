@@ -199,15 +199,16 @@ class StrategyConfig(Config):
     op_duration_min_factor: float = 0.1
     op_duration_max_factor: float = 10.0
 
-    # Feature B: whole-GPU slowdown. With probability gpu_slowdown_prob, one
-    # physical rank is picked uniformly at iteration start and every task
-    # that runs on it (all F / B / W across every microbatch, and every
-    # virtual stage mapped onto it for interleaved / zb_v) gets multiplied
-    # by gpu_slowdown_k. At most one slowed rank per iteration.
+    # Feature B: stage-wide slowdown. With probability stage_slowdown_prob,
+    # one physical PP rank (i.e. an entire TP/EP group — typically a whole
+    # node) is picked uniformly at iteration start and every task that runs
+    # on it (all F / B / W across every microbatch, and every virtual stage
+    # mapped onto it for interleaved / zb_v) gets multiplied by
+    # stage_slowdown_k. At most one slowed stage per iteration.
     # Schedule-independent: no dry-run required.
-    gpu_slowdown_prob: float = 0.0
-    gpu_slowdown_k: float = 1.0
-    gpu_slowdown_seed: Optional[int] = None
+    stage_slowdown_prob: float = 0.0
+    stage_slowdown_k: float = 1.0
+    stage_slowdown_seed: Optional[int] = None
 
     # Feature C: random per-task slowdown. Each scheduled task independently
     # draws a Bernoulli(op_slowdown_prob); triggered tasks get K multiplier.
@@ -545,12 +546,12 @@ class StrategyConfig(Config):
             f">= op_duration_min_factor ({self.op_duration_min_factor})"
         )
 
-        assert 0.0 <= self.gpu_slowdown_prob <= 1.0, (
-            f"gpu_slowdown_prob must be in [0, 1], got {self.gpu_slowdown_prob}"
+        assert 0.0 <= self.stage_slowdown_prob <= 1.0, (
+            f"stage_slowdown_prob must be in [0, 1], got {self.stage_slowdown_prob}"
         )
-        if self.gpu_slowdown_prob > 0.0:
-            assert self.gpu_slowdown_k >= 1.0, (
-                f"gpu_slowdown_k must be >= 1.0, got {self.gpu_slowdown_k}"
+        if self.stage_slowdown_prob > 0.0:
+            assert self.stage_slowdown_k >= 1.0, (
+                f"stage_slowdown_k must be >= 1.0, got {self.stage_slowdown_k}"
             )
 
         assert 0.0 <= self.op_slowdown_prob <= 1.0, (

@@ -229,8 +229,8 @@ class PerfBase(ABC):
         # must be sampled before Feature B's dry run applies them.
         if hasattr(self, "_sample_op_disturbance"):
             self._sample_op_disturbance()
-        if hasattr(self, "_sample_gpu_disturbance"):
-            self._sample_gpu_disturbance()
+        if hasattr(self, "_sample_stage_disturbance"):
+            self._sample_stage_disturbance()
 class PerfLLM(PerfBase):
 
     """Performance model for LLM"""
@@ -256,9 +256,9 @@ class PerfLLM(PerfBase):
         # kind ("F" / "B" / "W") whose value is a 2D ndarray of shape
         # (n_rank_units, mbc) where n_rank_units is pp for physical-rank
         # schedules and V*pp for virtual-stage schedules.
-        self.op_noise_mult = None          # Feature A multipliers (float)
-        self.op_slowdown_mask = None       # Feature C triggered mask (bool)
-        self.gpu_slowdown_mult = None      # Feature B multipliers (float)
+        self.op_noise_mult = None            # Feature A multipliers (float)
+        self.op_slowdown_mask = None         # Feature C triggered mask (bool)
+        self.stage_slowdown_mult = None      # Feature B multipliers (float)
         # Physical rank selected by Feature B (None when no slowdown fired).
         self._slowed_rank: Optional[int] = None
         # Sampled-event records for auditing (populated alongside the tables).
@@ -378,8 +378,8 @@ class PerfLLM(PerfBase):
         if self.op_slowdown_mask is not None and kind in self.op_slowdown_mask:
             if self.op_slowdown_mask[kind][idx, m]:
                 mult *= self.strategy.op_slowdown_k
-        if self.gpu_slowdown_mult is not None and kind in self.gpu_slowdown_mult:
-            mult *= float(self.gpu_slowdown_mult[kind][idx, m])
+        if self.stage_slowdown_mult is not None and kind in self.stage_slowdown_mult:
+            mult *= float(self.stage_slowdown_mult[kind][idx, m])
         return mult
 
     def _sample_op_disturbance(self):
@@ -459,33 +459,34 @@ class PerfLLM(PerfBase):
         else:
             self.op_slowdown_mask = None
 
-    def _sample_gpu_disturbance(self):
-        """Populate ``gpu_slowdown_mult`` (Feature B) with the whole-GPU
+    def _sample_stage_disturbance(self):
+        """Populate ``stage_slowdown_mult`` (Feature B) with the stage-wide
         slowdown semantics.
 
-        With probability ``gpu_slowdown_prob`` a single physical rank is
-        picked uniformly at iteration start and every task mapped onto it
-        (all F / B / W across every microbatch, and every virtual stage
-        mapped onto that rank for interleaved / zb_v schedules) gets
-        multiplied by ``gpu_slowdown_k``. At most one slowed rank per
-        iteration. Schedule-independent: no dry-run required.
+        With probability ``stage_slowdown_prob`` a single physical PP rank —
+        i.e. an entire TP/EP group, typically a whole node — is picked
+        uniformly at iteration start, and every task mapped onto it (all
+        F / B / W across every microbatch, and every virtual stage mapped
+        onto that rank for interleaved / zb_v schedules) gets multiplied
+        by ``stage_slowdown_k``. At most one slowed stage per iteration.
+        Schedule-independent: no dry-run required.
         """
         strategy = self.strategy
         self._slowed_rank = None
-        self.gpu_slowdown_mult = None
-        if strategy.gpu_slowdown_prob <= 0.0:
+        self.stage_slowdown_mult = None
+        if strategy.stage_slowdown_prob <= 0.0:
             return
 
         pp = strategy.pp_size
         mbc = strategy.micro_batch_num
         n_rank_units, kinds = self._disturbance_shape()
-        K = strategy.gpu_slowdown_k
+        K = strategy.stage_slowdown_k
 
-        rng_b = np.random.default_rng(strategy.gpu_slowdown_seed)
-        if float(rng_b.random()) >= strategy.gpu_slowdown_prob:
+        rng_b = np.random.default_rng(strategy.stage_slowdown_seed)
+        if float(rng_b.random()) >= strategy.stage_slowdown_prob:
             print(
-                f"[SimuMax] GPU-slowdown: prob={strategy.gpu_slowdown_prob}, "
-                f"K={K}, seed={strategy.gpu_slowdown_seed} -> no rank slowed"
+                f"[SimuMax] Stage-slowdown: prob={strategy.stage_slowdown_prob}, "
+                f"K={K}, seed={strategy.stage_slowdown_seed} -> no stage slowed"
             )
             return
 
@@ -502,10 +503,10 @@ class PerfLLM(PerfBase):
         for kind in kinds:
             for idx in affected_idx:
                 mult[kind][idx, :] = K
-        self.gpu_slowdown_mult = mult
+        self.stage_slowdown_mult = mult
         print(
-            f"[SimuMax] GPU-slowdown: prob={strategy.gpu_slowdown_prob}, "
-            f"K={K}, seed={strategy.gpu_slowdown_seed} -> slowed_rank={slowed_rank}"
+            f"[SimuMax] Stage-slowdown: prob={strategy.stage_slowdown_prob}, "
+            f"K={K}, seed={strategy.stage_slowdown_seed} -> slowed_rank={slowed_rank}"
         )
 
     def get_num_layers_to_build(self, config: StrategyConfig, model_conf: ModelConfig, parallel_stage="first") -> int:
@@ -3412,11 +3413,11 @@ class PerfLLM(PerfBase):
                     "triggered_count": len(self.op_slowdown_records),
                     "triggered": self.op_slowdown_records,
                 }
-            if self.strategy.gpu_slowdown_prob > 0.0:
-                disturbance_log["gpu_slowdown"] = {
-                    "configured_prob": self.strategy.gpu_slowdown_prob,
-                    "k": self.strategy.gpu_slowdown_k,
-                    "seed": self.strategy.gpu_slowdown_seed,
+            if self.strategy.stage_slowdown_prob > 0.0:
+                disturbance_log["stage_slowdown"] = {
+                    "configured_prob": self.strategy.stage_slowdown_prob,
+                    "k": self.strategy.stage_slowdown_k,
+                    "seed": self.strategy.stage_slowdown_seed,
                     "slowed_rank": self._slowed_rank,
                 }
             if disturbance_log:
