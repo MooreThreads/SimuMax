@@ -14,7 +14,7 @@ same per-episode disturbance / seq-len draws — apples-to-apples.
 from __future__ import annotations
 
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -27,21 +27,30 @@ from simumax.rl.env.env import PipelineSchedulingEnv, RLEnvConfig
 class EvalResult:
     agent_name: str
     iter_times: list[float]
+    pp_utilizations: list[float] = field(default_factory=list)
 
-    def summary(self) -> dict[str, float]:
-        n = len(self.iter_times)
-        mean = statistics.fmean(self.iter_times) if n else 0.0
-        std = statistics.stdev(self.iter_times) if n > 1 else 0.0
+    def _stats(self, values: list[float]) -> dict[str, float]:
+        n = len(values)
+        mean = statistics.fmean(values) if n else 0.0
+        std = statistics.stdev(values) if n > 1 else 0.0
         return {
             "n": n,
             "mean": mean,
             "std": std,
-            "min": min(self.iter_times) if n else 0.0,
-            "max": max(self.iter_times) if n else 0.0,
+            "min": min(values) if n else 0.0,
+            "max": max(values) if n else 0.0,
         }
 
+    def summary(self) -> dict[str, float]:
+        return self._stats(self.iter_times)
 
-def _run_episode(env: PipelineSchedulingEnv, agent, max_steps: int) -> float:
+    def utilization_summary(self) -> dict[str, float]:
+        return self._stats(self.pp_utilizations)
+
+
+def _run_episode(
+    env: PipelineSchedulingEnv, agent, max_steps: int
+) -> tuple[float, float]:
     # First reset on a fresh env pulls seed from env_config; subsequent
     # resets advance np_random naturally.
     obs, info = env.reset()
@@ -58,7 +67,7 @@ def _run_episode(env: PipelineSchedulingEnv, agent, max_steps: int) -> float:
                 f"without terminating — likely a schedule bug."
             )
             raise RuntimeError(msg)
-    return float(env.current_time)
+    return float(info["iter_time"]), float(info["pp_utilization"])
 
 
 def evaluate(
@@ -102,9 +111,11 @@ def evaluate(
         agent_env_config = RLEnvConfig(**{**env_config.__dict__, "seed": base_seed})
         env = PipelineSchedulingEnv(agent_env_config, backend=backend)
         iter_times: list[float] = []
+        pp_utilizations: list[float] = []
         for ep in range(n_episodes):
-            t = _run_episode(env, agent, max_steps)
+            t, u = _run_episode(env, agent, max_steps)
             iter_times.append(t)
+            pp_utilizations.append(u)
             if render_dir is not None or display:
                 out_path: Optional[str] = None
                 if render_dir is not None:
@@ -112,24 +123,36 @@ def evaluate(
                     out_path = str(render_dir / f"{name}_ep{ep:03d}.png")
                 env.render(
                     out_path,
-                    title=f"{name} ep {ep} (t={t:.6f}s)",
+                    title=f"{name} ep {ep} (t={t:.6f}s, u={u:.4f})",
                     display=display,
                 )
-        results.append(EvalResult(agent_name=name, iter_times=iter_times))
+        results.append(
+            EvalResult(
+                agent_name=name,
+                iter_times=iter_times,
+                pp_utilizations=pp_utilizations,
+            )
+        )
     return results
 
 
 def format_summary(results: list[EvalResult]) -> str:
     ordered = sorted(results, key=lambda r: r.summary()["mean"])
     lines = [
-        f"  {'agent':<10} {'n':>4} {'mean (s)':>14} {'std':>14} "
-        f"{'min':>14} {'max':>14}"
+        f"  {'agent':<10} {'n':>4} "
+        f"{'iter mean (s)':>14} {'iter std':>14} "
+        f"{'iter min':>14} {'iter max':>14} "
+        f"{'util mean':>12} {'util std':>12} "
+        f"{'util min':>12} {'util max':>12}"
     ]
     for r in ordered:
         s = r.summary()
+        u = r.utilization_summary()
         lines.append(
             f"  {r.agent_name:<10} {int(s['n']):>4d} "
             f"{s['mean']:>14.6f} {s['std']:>14.6f} "
-            f"{s['min']:>14.6f} {s['max']:>14.6f}"
+            f"{s['min']:>14.6f} {s['max']:>14.6f} "
+            f"{u['mean']:>12.4f} {u['std']:>12.4f} "
+            f"{u['min']:>12.4f} {u['max']:>12.4f}"
         )
     return "\n".join(lines)

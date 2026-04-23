@@ -218,6 +218,9 @@ class PipelineSchedulingEnv(gymnasium.Env):
         reward = self._compute_reward(terminated)
         obs = self._build_observation()
         info = {"action_mask": self._mask.copy()}
+        if terminated or truncated:
+            info["iter_time"] = float(self._current_time)
+            info["pp_utilization"] = self._compute_pp_utilization()
         return obs, reward, terminated, truncated, info
 
     def action_masks(self) -> NDArray[np.int8]:
@@ -358,14 +361,21 @@ class PipelineSchedulingEnv(gymnasium.Env):
                 gpu_end[g] = max(gpu_end[g], record["end_time"])
         return np.where(gpu_end > -np.inf, gpu_end - gpu_start, 0.0)
 
-    def _compute_reward(self, done: bool) -> float:
-        if not done:
-            return 0.0
-
+    def _compute_pp_utilization(self) -> float:
         # Aligned with SimuMax's closed-form definitions (perf_llm.py:2582-2657):
         #   T           = single_iter_time_no_dp_opim (0 -> last completion)
         #   useful_work = Σ_r Σ_m (f + b + w)  (same scope as _chunk_fwd_bwd_at)
         #   pp_utilization = useful_work / (pp * T)
+        T = self._current_time
+        if T <= 0.0:
+            return 0.0
+        useful_work = float(np.sum(self._tg.get_duration_matrix()))
+        return useful_work / (self._p * T)
+
+    def _compute_reward(self, done: bool) -> float:
+        if not done:
+            return 0.0
+
         pp = self._p
         T = self._current_time
         useful_work = float(np.sum(self._tg.get_duration_matrix()))

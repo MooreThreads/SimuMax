@@ -14,14 +14,17 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Optional
 
+import numpy as np
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
-from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 from stable_baselines3.common.utils import set_random_seed
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 
 from simumax.rl.env.env import PipelineSchedulingEnv, RLEnvConfig
 from simumax.rl.feature_extractor import PipelineFeatureExtractor
+
+_EPISODE_INFO_KEYS = ("iter_time", "pp_utilization")
 
 
 def _linear_schedule(initial: float, final: float) -> Callable[[float], float]:
@@ -29,6 +32,66 @@ def _linear_schedule(initial: float, final: float) -> Callable[[float], float]:
         return final + progress_remaining * (initial - final)
 
     return schedule
+
+
+class TrainMetricsCallback(BaseCallback):
+    """Log rolling means of iter_time / pp_utilization from the rollout buffer.
+
+    Relies on ``VecMonitor`` forwarding ``_EPISODE_INFO_KEYS`` into each
+    episode's info dict; SB3 keeps the most recent episodes in
+    ``model.ep_info_buffer``. Logging at rollout end keeps the cadence
+    aligned with PPO's stock ``rollout/*`` scalars.
+    """
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        buffer = self.model.ep_info_buffer
+        if not buffer:
+            return
+        for key in _EPISODE_INFO_KEYS:
+            vals = [ep[key] for ep in buffer if key in ep]
+            if vals:
+                self.logger.record(f"rollout/{key}_mean", float(np.mean(vals)))
+
+
+class MetricMaskableEvalCallback(MaskableEvalCallback):
+    """MaskableEvalCallback that also logs iter_time / pp_utilization."""
+
+    def _init_callback(self) -> None:
+        super()._init_callback()
+        self._eval_info_buffer: dict[str, list[float]] = {
+            k: [] for k in _EPISODE_INFO_KEYS
+        }
+
+    def _collect_eval_info(self, locals_: dict[str, Any], _globals: dict[str, Any]) -> None:
+        # ``evaluate_policy`` calls this every step with its locals. On episode
+        # end, the VecMonitor-wrapped eval env surfaces our info_keywords on
+        # ``infos[i]`` (the same dict the evaluator inspects for ``episode``).
+        if not locals_.get("done"):
+            return
+        info = locals_.get("info") or {}
+        for key in _EPISODE_INFO_KEYS:
+            if key in info:
+                self._eval_info_buffer[key].append(float(info[key]))
+
+    def _log_success_callback(
+        self, locals_: dict[str, Any], globals_: dict[str, Any]
+    ) -> None:
+        super()._log_success_callback(locals_, globals_)
+        self._collect_eval_info(locals_, globals_)
+
+    def _on_step(self) -> bool:
+        should_eval = self.eval_freq > 0 and self.n_calls % self.eval_freq == 0
+        if should_eval:
+            self._eval_info_buffer = {k: [] for k in _EPISODE_INFO_KEYS}
+        continue_training = super()._on_step()
+        if should_eval:
+            for key, vals in self._eval_info_buffer.items():
+                if vals:
+                    self.logger.record(f"eval/{key}_mean", float(np.mean(vals)))
+        return continue_training
 
 
 @dataclass
@@ -123,7 +186,8 @@ def train(
                 make_env_fn(env_config, rank=i, seed=ppo_config.seed)
                 for i in range(ppo_config.n_envs)
             ]
-        )
+        ),
+        info_keywords=_EPISODE_INFO_KEYS,
     )
     eval_env = VecMonitor(
         SubprocVecEnv(
@@ -131,7 +195,8 @@ def train(
                 make_env_fn(env_config, rank=i, seed=ppo_config.seed + 10_000)
                 for i in range(min(4, ppo_config.n_envs))
             ]
-        )
+        ),
+        info_keywords=_EPISODE_INFO_KEYS,
     )
 
     lr = _linear_schedule(ppo_config.lr_init, ppo_config.lr_final)
@@ -183,7 +248,7 @@ def train(
         save_path=checkpoint_dir,
         name_prefix="ppo",
     )
-    eval_cb = MaskableEvalCallback(
+    eval_cb = MetricMaskableEvalCallback(
         eval_env,
         best_model_save_path=best_model_dir,
         log_path=eval_log_dir,
@@ -191,7 +256,7 @@ def train(
         n_eval_episodes=ppo_config.eval_episodes,
         deterministic=True,
     )
-    callbacks = CallbackList([checkpoint_cb, eval_cb])
+    callbacks = CallbackList([checkpoint_cb, eval_cb, TrainMetricsCallback()])
 
     model.learn(
         total_timesteps=ppo_config.total_timesteps,
