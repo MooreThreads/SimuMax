@@ -1,0 +1,13 @@
+{
+    "model_type": "dense",
+    "model_name": "mistral_large",
+    "attention_type": "mha",
+    "hidden_size": 12288,
+    "head_num": 96,
+    "kv_head_num": 8,
+    "head_size": 128,
+    "intermediate_size": 28672,
+    "layer_num": 88,
+    "vocab_size": 32768,
+    "use_swiglu": true
+}

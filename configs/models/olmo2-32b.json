@@ -1,0 +1,13 @@
+{
+    "model_type": "dense",
+    "model_name": "olmo2_32b",
+    "attention_type": "mha",
+    "hidden_size": 5120,
+    "head_num": 40,
+    "kv_head_num": 8,
+    "head_size": 128,
+    "intermediate_size": 27648,
+    "layer_num": 64,
+    "vocab_size": 100352,
+    "use_swiglu": true
+}

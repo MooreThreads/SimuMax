@@ -1,0 +1,18 @@
+{
+    "model_type": "moe",
+    "model_name": "glm_4_5_air",
+    "attention_type": "mha",
+    "hidden_size": 4096,
+    "head_num": 96,
+    "kv_head_num": 8,
+    "head_size": 128,
+    "intermediate_size": 10944,
+    "moe_ffn_hidden_size": 1408,
+    "moe_shared_expert_intermediate_size": 1408,
+    "layer_num": 46,
+    "dense_layers": 1,
+    "expert_num": 128,
+    "topk": 8,
+    "vocab_size": 151552,
+    "use_swiglu": true
+}

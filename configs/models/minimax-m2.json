@@ -1,0 +1,17 @@
+{
+    "model_type": "moe",
+    "model_name": "minimax_m2",
+    "attention_type": "mha",
+    "hidden_size": 3072,
+    "head_num": 48,
+    "kv_head_num": 8,
+    "head_size": 128,
+    "intermediate_size": 1536,
+    "moe_ffn_hidden_size": 1536,
+    "layer_num": 62,
+    "dense_layers": 0,
+    "expert_num": 256,
+    "topk": 8,
+    "vocab_size": 200064,
+    "use_swiglu": true
+}

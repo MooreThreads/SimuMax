@@ -1,0 +1,17 @@
+{
+    "model_type": "moe",
+    "model_name": "gpt_oss_120b",
+    "attention_type": "mha",
+    "hidden_size": 2880,
+    "head_num": 64,
+    "kv_head_num": 8,
+    "head_size": 64,
+    "intermediate_size": 2880,
+    "moe_ffn_hidden_size": 2880,
+    "layer_num": 36,
+    "dense_layers": 0,
+    "expert_num": 128,
+    "topk": 4,
+    "vocab_size": 201088,
+    "use_swiglu": true
+}

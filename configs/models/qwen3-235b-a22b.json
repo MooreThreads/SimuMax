@@ -1,0 +1,17 @@
+{
+    "model_type": "moe",
+    "model_name": "qwen3_235b_a22b",
+    "attention_type": "mha",
+    "hidden_size": 4096,
+    "head_num": 64,
+    "kv_head_num": 4,
+    "head_size": 128,
+    "intermediate_size": 12288,
+    "moe_ffn_hidden_size": 1536,
+    "layer_num": 94,
+    "dense_layers": 0,
+    "expert_num": 128,
+    "topk": 8,
+    "vocab_size": 151936,
+    "use_swiglu": true
+}

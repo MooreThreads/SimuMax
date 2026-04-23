@@ -1,0 +1,17 @@
+{
+    "model_type": "moe",
+    "model_name": "qwen3_coder_480b_a35b",
+    "attention_type": "mha",
+    "hidden_size": 6144,
+    "head_num": 96,
+    "kv_head_num": 8,
+    "head_size": 128,
+    "intermediate_size": 8192,
+    "moe_ffn_hidden_size": 2560,
+    "layer_num": 62,
+    "dense_layers": 0,
+    "expert_num": 160,
+    "topk": 8,
+    "vocab_size": 151936,
+    "use_swiglu": true
+}

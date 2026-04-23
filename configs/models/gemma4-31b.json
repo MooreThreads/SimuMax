@@ -1,0 +1,13 @@
+{
+    "model_type": "dense",
+    "model_name": "gemma4_31b",
+    "attention_type": "mha",
+    "hidden_size": 5376,
+    "head_num": 32,
+    "kv_head_num": 16,
+    "head_size": 256,
+    "intermediate_size": 21504,
+    "layer_num": 60,
+    "vocab_size": 262144,
+    "use_swiglu": true
+}

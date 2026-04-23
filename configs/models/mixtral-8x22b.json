@@ -1,0 +1,17 @@
+{
+    "model_type": "moe",
+    "model_name": "mixtral_8x22b",
+    "attention_type": "mha",
+    "hidden_size": 6144,
+    "head_num": 48,
+    "kv_head_num": 8,
+    "head_size": 128,
+    "intermediate_size": 16384,
+    "moe_ffn_hidden_size": 16384,
+    "layer_num": 56,
+    "dense_layers": 0,
+    "expert_num": 8,
+    "topk": 2,
+    "vocab_size": 32000,
+    "use_swiglu": true
+}
