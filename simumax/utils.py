@@ -21,17 +21,19 @@ def init_config_map(root):
     strategy_config_dir = os.path.join(root, 'strategy')
     system_config_dir = os.path.join(root, 'system')
     disturbance_config_dir = os.path.join(root, 'disturbance')
+    pp_scheduling_config_dir = os.path.join(root, 'pp_scheduling')
     training_config_dir = os.path.join(root, 'training')
 
     models = get_config_files(model_config_dir)
     strategy = get_config_files(strategy_config_dir)
     systems = get_config_files(system_config_dir)
     disturbances = get_config_files(disturbance_config_dir)
+    pp_schedulings = get_config_files(pp_scheduling_config_dir)
     trainings = get_config_files(training_config_dir)
-    return models, strategy, systems, disturbances, trainings
+    return models, strategy, systems, disturbances, pp_schedulings, trainings
 
-RELEASE_MODELS, RELEASE_STRATEGY, RELEASE_SYSTEM, RELEASE_DISTURBANCE, RELEASE_TRAINING = init_config_map(os.path.join(root, 'configs'))
-DEV_MODELS, DEV_STRATEGY, DEV_SYSTEM, DEV_DISTURBANCE, DEV_TRAINING = init_config_map(os.path.join(root, 'develop/configs'))
+RELEASE_MODELS, RELEASE_STRATEGY, RELEASE_SYSTEM, RELEASE_DISTURBANCE, RELEASE_PP_SCHEDULING, RELEASE_TRAINING = init_config_map(os.path.join(root, 'configs'))
+DEV_MODELS, DEV_STRATEGY, DEV_SYSTEM, DEV_DISTURBANCE, DEV_PP_SCHEDULING, DEV_TRAINING = init_config_map(os.path.join(root, 'develop/configs'))
 
 def get_config(key, version, r_maps:dict, d_maps:dict, m_type):
     if version == 'release':
@@ -54,6 +56,9 @@ def get_simu_system_config(system_name, version='release'):
 
 def get_simu_disturbance_config(disturbance_name, version='release'):
     return get_config(disturbance_name, version, RELEASE_DISTURBANCE, DEV_DISTURBANCE, 'disturbance')
+
+def get_simu_pp_scheduling_config(pp_scheduling_name, version='release'):
+    return get_config(pp_scheduling_name, version, RELEASE_PP_SCHEDULING, DEV_PP_SCHEDULING, 'pp_scheduling')
 
 def get_simu_training_config(training_name, version='release'):
     return get_config(training_name, version, RELEASE_TRAINING, DEV_TRAINING, 'training')
@@ -132,7 +137,6 @@ def create_default_strategy(strs="", seq_len=4096, micro_batch_size=1, micro_bat
         "etp_size": 1,
         "moe_dispatcher_policy": "all2all",
         "enable_sequence_parallel": True,
-        "interleaving_size": 1,
         "zero_state": 1,
         "enable_dropout": False,
         "use_fused_norm": True,

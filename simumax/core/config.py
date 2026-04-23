@@ -283,6 +283,51 @@ class DisturbanceConfig(Config):
 
 
 @dataclass
+class PipelineScheduleConfig(Config):
+    """Pipeline-parallel scheduling configuration.
+
+    Orthogonal to ``StrategyConfig``: the same parallelism topology
+    (DP/TP/EP/PP, microbatches) can be simulated under any supported
+    pipeline schedule by swapping this config.
+
+    ``interleaving_size`` is the number of virtual stages each physical
+    PP rank owns. It is only meaningful for ``interleaved_1f1b`` and
+    ``zb_v``; other schedules require it to be 1.
+    """
+
+    pp_schedule: str = "1f1b"
+    interleaving_size: int = 1
+
+    valid_pp_schedules = [
+        "1f1b",
+        "zb_h1",
+        "zb_h2",
+        "gpipe",
+        "interleaved_1f1b",
+        "zb_v",
+    ]
+
+    def sanity_check(self) -> None:
+        assert self.pp_schedule in self.valid_pp_schedules, (
+            f"pp_schedule must be in {self.valid_pp_schedules}, "
+            f"got {self.pp_schedule}"
+        )
+        if self.pp_schedule == "zb_v":
+            assert self.interleaving_size == 2, (
+                f"zb_v requires interleaving_size == 2, got {self.interleaving_size}"
+            )
+        elif self.pp_schedule == "interleaved_1f1b":
+            assert self.interleaving_size >= 1, (
+                f"interleaved_1f1b requires interleaving_size >= 1, got {self.interleaving_size}"
+            )
+        elif self.interleaving_size != 1:
+            warnings.warn(
+                f"interleaving_size={self.interleaving_size} is ignored for "
+                f"pp_schedule={self.pp_schedule}; only used by interleaved_1f1b and zb_v."
+            )
+
+
+@dataclass
 class StrategyConfig(Config):
     """
     Training strategy configuration
@@ -318,11 +363,7 @@ class StrategyConfig(Config):
     mlp_rms_recompute: bool = False
 
     enable_sequence_parallel: bool = True
-    interleaving_size: int = 1
     zero_state: int = 1
-
-    # pipeline-parallel scheduling algorithm: "1f1b" or "zb_h2"
-    pp_schedule: str = "1f1b"
 
     attention_sparse_ratio: float = (
         0.0  # 0.0 means dense attention; 0.5 means compute optimize for causal attention
@@ -547,30 +588,6 @@ class StrategyConfig(Config):
             "all2all",
             "all2all-seq",
         ], "moe_dispatcher_policy must be in ['all2all', 'all2all-seq']"
-        assert self.pp_schedule in [
-            "1f1b",
-            "zb_h1",
-            "zb_h2",
-            "gpipe",
-            "interleaved_1f1b",
-            "zb_v",
-        ], (
-            f"pp_schedule must be in ['1f1b', 'zb_h1', 'zb_h2', 'gpipe', "
-            f"'interleaved_1f1b', 'zb_v'], got {self.pp_schedule}"
-        )
-        if self.pp_schedule == "zb_v":
-            assert self.interleaving_size == 2, (
-                f"zb_v requires interleaving_size == 2, got {self.interleaving_size}"
-            )
-        elif self.pp_schedule == "interleaved_1f1b":
-            assert self.interleaving_size >= 1, (
-                f"interleaved_1f1b requires interleaving_size >= 1, got {self.interleaving_size}"
-            )
-        elif self.interleaving_size != 1:
-            warnings.warn(
-                f"interleaving_size={self.interleaving_size} is ignored for "
-                f"pp_schedule={self.pp_schedule}; only used by interleaved_1f1b and zb_v."
-            )
         if self.enable_dropout:
             warnings.warn(
                 "enable_dropout is not supported yet, the configuration will be ignored."

@@ -1,15 +1,16 @@
-"""Render the pipeline Gantt chart for a chosen strategy.
+"""Render the pipeline Gantt chart for a chosen strategy + schedule.
 
-Dispatches on the strategy's ``pp_schedule`` field (e.g. ``1f1b``, ``zb_h2``)
-and writes the appropriate Gantt chart plus the standard SimuMax JSON
-outputs.
+Strategy and pipeline schedule are independent configs: the same
+parallelism strategy can be simulated under any supported schedule by
+selecting a different ``--schedule``.
 
 Examples
 --------
     python examples/run_gantt_demo.py
-    python examples/run_gantt_demo.py --strategy llama70b_tp8_pp4_dp100_zbh2
+    python examples/run_gantt_demo.py --schedule zb_h2
     python examples/run_gantt_demo.py --strategy llama70b_tp8_pp4_dp100 \\
-        --model llama3-70b --system h100_nvlink --output my_chart.png
+        --schedule interleaved_1f1b --model llama3-70b --system h100_nvlink \\
+        --output my_chart.png
 """
 
 import argparse
@@ -19,11 +20,18 @@ import matplotlib
 
 matplotlib.use("Agg")  # headless backend; no GUI window pops up
 
-from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.config import (
+    DisturbanceConfig,
+    ModelConfig,
+    PipelineScheduleConfig,
+    StrategyConfig,
+    SystemConfig,
+)
 from simumax.core.perf_llm import PerfLLM
 from simumax.utils import (
     get_simu_disturbance_config,
     get_simu_model_config,
+    get_simu_pp_scheduling_config,
     get_simu_strategy_config,
     get_simu_system_config,
 )
@@ -36,6 +44,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--strategy", default="llama70b_tp8_pp4_dp100",
                         help="Strategy config name (without .json).")
+    parser.add_argument("--schedule", default="1f1b",
+                        help="Pipeline schedule config name (without .json), "
+                             f"one of: {', '.join(SUPPORTED_SCHEDULES)}.")
     parser.add_argument("--model", default="llama3-70b",
                         help="Model config name (without .json).")
     parser.add_argument("--system", default="h100_nvlink",
@@ -62,6 +73,7 @@ def main():
         sys.exit(0)
 
     strategy_path = get_simu_strategy_config(args.strategy)
+    schedule_path = get_simu_pp_scheduling_config(args.schedule)
     model_path = get_simu_model_config(args.model)
     system_path = get_simu_system_config(args.system)
     disturbance_config = None
@@ -75,6 +87,7 @@ def main():
         strategy_config=StrategyConfig.init_from_config_file(strategy_path),
         model_config=ModelConfig.init_from_config_file(model_path),
         system_config=SystemConfig.init_from_config_file(system_path),
+        pp_scheduling_config=PipelineScheduleConfig.init_from_config_file(schedule_path),
         disturbance_config=disturbance_config,
     )
     perf_model.run_estimate()
@@ -82,7 +95,7 @@ def main():
     save_dir = f"{perf_model.model_config.model_name}_{perf_model.system.sys_name}"
     perf_model.analysis(save_dir)
 
-    schedule = perf_model.strategy.pp_schedule
+    schedule = perf_model.pp_scheduling.pp_schedule
     iter_time = perf_model.draw_pp_gantt(output_path=args.output)
 
     pp = perf_model.strategy.pp_size

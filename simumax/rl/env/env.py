@@ -39,6 +39,7 @@ class RLEnvConfig:
     strategy_config: ConfigLike
     model_config: ConfigLike
     system_config: ConfigLike
+    pp_scheduling_config: Optional[ConfigLike] = None
     disturbance_config: Optional[ConfigLike] = None
     reward_mode: RewardMode = RewardMode.UTILIZATION
     max_time_limit: Optional[float] = None
@@ -76,6 +77,7 @@ class PipelineSchedulingEnv(gymnasium.Env):
             strategy_config=env_config.strategy_config,
             model_config=env_config.model_config,
             system_config=env_config.system_config,
+            pp_scheduling_config=env_config.pp_scheduling_config,
             disturbance_config=env_config.disturbance_config,
         )
 

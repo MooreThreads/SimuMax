@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from simumax.core.base_struct import PathDebugContext
-from simumax.core.config import DisturbanceConfig, StrategyConfig, SystemConfig, ModelConfig, set_capture_graph_only, TMP_PATH, SIMU_CHECK, SIMU_DEBUG, ENABLE_SIMU_GRAPH
+from simumax.core.config import DisturbanceConfig, PipelineScheduleConfig, StrategyConfig, SystemConfig, ModelConfig, set_capture_graph_only, TMP_PATH, SIMU_CHECK, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.base_struct import InputOutputInfo, TensorSize, Result
 from simumax.core.transformer.language_model import LLMModel, PeakPoint
 from simumax.core.gantt import GanttBar, plot_gantt
@@ -46,6 +46,7 @@ class PerfBase(ABC):
     def __init__(self) -> None:
         self.is_configured = False
         self.strategy = None
+        self.pp_scheduling = None
         self.disturbance = None
         self.model_config = None
         self.system = None
@@ -65,6 +66,10 @@ class PerfBase(ABC):
     def _set_strategy_config(self, strategy: StrategyConfig):
         strategy.sanity_check()
         self.strategy = strategy
+
+    def _set_pp_scheduling_config(self, pp_scheduling: PipelineScheduleConfig):
+        pp_scheduling.sanity_check()
+        self.pp_scheduling = pp_scheduling
 
     def _set_disturbance_config(self, disturbance: DisturbanceConfig):
         disturbance.sanity_check()
@@ -88,6 +93,7 @@ class PerfBase(ABC):
         strategy_config: Union[StrategyConfig, str] = None,
         model_config: Union[ModelConfig, str] = None,
         system_config: Union[SystemConfig, str] = None,
+        pp_scheduling_config: Union[PipelineScheduleConfig, str, None] = None,
         disturbance_config: Union[DisturbanceConfig, str, None] = None,
         debug_points: List[str] = None,
         debug_points_last_stage=None,
@@ -96,6 +102,10 @@ class PerfBase(ABC):
         Configure the performance model, including strategy, model and system config.
         And check the sanity of the configuration.
 
+        ``pp_scheduling_config`` is optional: when omitted an all-defaults
+        ``PipelineScheduleConfig`` is used (``pp_schedule="1f1b"``,
+        ``interleaving_size=1``).
+
         ``disturbance_config`` is optional: when omitted an all-defaults
         ``DisturbanceConfig`` is used, which reduces to nominal (no-noise,
         no-slowdown) behaviour.
@@ -103,6 +113,14 @@ class PerfBase(ABC):
         if not isinstance(strategy_config, StrategyConfig):
             strategy_config = StrategyConfig.init_from_config_file(strategy_config)
         self._set_strategy_config(strategy_config)
+
+        if pp_scheduling_config is None:
+            pp_scheduling_config = PipelineScheduleConfig()
+        elif not isinstance(pp_scheduling_config, PipelineScheduleConfig):
+            pp_scheduling_config = PipelineScheduleConfig.init_from_config_file(
+                pp_scheduling_config
+            )
+        self._set_pp_scheduling_config(pp_scheduling_config)
 
         if disturbance_config is None:
             disturbance_config = DisturbanceConfig()
@@ -366,10 +384,10 @@ class PerfLLM(PerfBase):
         (interleaved_1f1b, zb_v). ``kinds`` includes ``"W"`` only for
         schedules that split the backward into B / W (zb_h1, zb_h2, zb_v).
         """
-        schedule = self.strategy.pp_schedule
+        schedule = self.pp_scheduling.pp_schedule
         pp = self.strategy.pp_size
         if schedule == "interleaved_1f1b":
-            return self.strategy.interleaving_size * pp, ("F", "B")
+            return self.pp_scheduling.interleaving_size * pp, ("F", "B")
         if schedule == "zb_v":
             return 2 * pp, ("F", "B", "W")
         if schedule in ("zb_h1", "zb_h2"):
@@ -378,7 +396,7 @@ class PerfLLM(PerfBase):
         return pp, ("F", "B")
 
     def _is_virtual_stage_schedule(self):
-        return self.strategy.pp_schedule in ("interleaved_1f1b", "zb_v")
+        return self.pp_scheduling.pp_schedule in ("interleaved_1f1b", "zb_v")
 
     def _vs_to_rank_owned(self):
         """Return ``(V, vs_to_rank_fn, owned_vs)``.
@@ -387,10 +405,10 @@ class PerfLLM(PerfBase):
         to physical rank ``r``. For physical-rank schedules ``V == 1`` and
         ``owned_vs[r] == [r]``.
         """
-        schedule = self.strategy.pp_schedule
+        schedule = self.pp_scheduling.pp_schedule
         pp = self.strategy.pp_size
         if schedule == "interleaved_1f1b":
-            V = self.strategy.interleaving_size
+            V = self.pp_scheduling.interleaving_size
             vs_to_rank = lambda gvs: gvs % pp
         elif schedule == "zb_v":
             V = 2
@@ -2433,7 +2451,7 @@ class PerfLLM(PerfBase):
     def _compute_pp_total_time(self, draw=False, output_path=None):
         pp = self.strategy.pp_size
         mbc = self.strategy.micro_batch_num
-        schedule = self.strategy.pp_schedule
+        schedule = self.pp_scheduling.pp_schedule
 
         if schedule in ("zb_h1", "zb_h2"):
             fwd_times, b_times, w_times = self._per_rank_fwd_b_w_times()
@@ -2445,7 +2463,7 @@ class PerfLLM(PerfBase):
             )
 
         if schedule == "interleaved_1f1b":
-            V = self.strategy.interleaving_size
+            V = self.pp_scheduling.interleaving_size
             fwd_vs, bwd_vs = self._per_virtual_stage_times(
                 V, vs_to_rank=lambda gvs: gvs % pp, split_bw=False
             )
@@ -2479,7 +2497,7 @@ class PerfLLM(PerfBase):
     def draw_pp_gantt(self, output_path=None):
         """Render the Gantt chart for the configured PP schedule.
 
-        Dispatches on ``strategy.pp_schedule`` and returns the simulated
+        Dispatches on ``pp_scheduling.pp_schedule`` and returns the simulated
         iteration time. Honours the chosen schedule's per-rank timing
         decomposition (fused B for 1F1B, split B/W for ZB-H2).
         """
@@ -3323,6 +3341,10 @@ class PerfLLM(PerfBase):
         with open(f"{save_path}/strategy_config.json", "w") as f:
             f.write(str(self.strategy))
 
+        if self.pp_scheduling is not None:
+            with open(f"{save_path}/pp_scheduling_config.json", "w") as f:
+                f.write(str(self.pp_scheduling))
+
         if self.disturbance is not None:
             with open(f"{save_path}/disturbance_config.json", "w") as f:
                 f.write(str(self.disturbance))
@@ -3360,6 +3382,10 @@ class PerfLLM(PerfBase):
             
             with open(f"{save_path}/strategy_config.json", "w") as f:
                 f.write(str(self.strategy))
+
+            if self.pp_scheduling is not None:
+                with open(f"{save_path}/pp_scheduling_config.json", "w") as f:
+                    f.write(str(self.pp_scheduling))
 
             with open(f"{save_path}/system_config.json", "w") as f:
                 f.write(str(self.system))

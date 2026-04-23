@@ -91,6 +91,7 @@ def evaluate(
         strategy_config=env_config.strategy_config,
         model_config=env_config.model_config,
         system_config=env_config.system_config,
+        pp_scheduling_config=env_config.pp_scheduling_config,
         disturbance_config=env_config.disturbance_config,
     )
     pp = backend.num_gpus

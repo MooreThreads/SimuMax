@@ -17,7 +17,6 @@ CANDIDATE_STRATEGY = {
     "dtype": ["bf16"],
     "tp_size": [1, 2, 4, 8],
     "enable_sequence_parallel": [True],
-    "interleaving_size": [1],
     "zero_state": [1],
     "use_fused_norm": [True],
     "use_math_sdp": [False],

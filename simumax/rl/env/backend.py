@@ -11,7 +11,7 @@ semantics (e.g. classical GPipe / 1F1B) are expressed at the agent
 level via ``FUSED_BACKWARD``, not by switching the backend's timing
 representation. Accordingly this backend unconditionally pulls split
 per-rank timings from :meth:`PerfLLM._per_rank_fwd_b_w_times`,
-regardless of the strategy's ``pp_schedule``.
+regardless of the configured ``pp_scheduling.pp_schedule``.
 """
 
 from __future__ import annotations
@@ -21,7 +21,13 @@ from typing import Optional, Union
 
 import numpy as np
 
-from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.config import (
+    DisturbanceConfig,
+    ModelConfig,
+    PipelineScheduleConfig,
+    StrategyConfig,
+    SystemConfig,
+)
 from simumax.core.perf_llm import PerfLLM
 
 
@@ -44,7 +50,14 @@ class EpisodeData:
     seq_lens: np.ndarray
 
 
-ConfigLike = Union[StrategyConfig, ModelConfig, SystemConfig, DisturbanceConfig, str]
+ConfigLike = Union[
+    StrategyConfig,
+    ModelConfig,
+    SystemConfig,
+    DisturbanceConfig,
+    PipelineScheduleConfig,
+    str,
+]
 
 
 class SimuMaxBackend:
@@ -55,6 +68,7 @@ class SimuMaxBackend:
         strategy_config: ConfigLike,
         model_config: ConfigLike,
         system_config: ConfigLike,
+        pp_scheduling_config: Optional[ConfigLike] = None,
         disturbance_config: Optional[ConfigLike] = None,
     ) -> None:
         perf = PerfLLM()
@@ -62,6 +76,7 @@ class SimuMaxBackend:
             strategy_config=strategy_config,
             model_config=model_config,
             system_config=system_config,
+            pp_scheduling_config=pp_scheduling_config,
             disturbance_config=disturbance_config,
         )
         # run_estimate does build() + sample_seq_lens + _run() + initial

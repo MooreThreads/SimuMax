@@ -23,7 +23,13 @@ from typing import Optional
 
 import numpy as np
 
-from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.config import (
+    DisturbanceConfig,
+    ModelConfig,
+    PipelineScheduleConfig,
+    StrategyConfig,
+    SystemConfig,
+)
 from simumax.core.perf_llm import PerfLLM
 from simumax.utils import (
     get_simu_disturbance_config,
@@ -80,13 +86,15 @@ def run_baseline(
 
     out: dict[str, list[float]] = {}
     for schedule in _SCHEDULES:
-        strategy = replace(base_strategy, pp_schedule=schedule)
+        strategy = replace(base_strategy)
+        pp_scheduling = PipelineScheduleConfig(pp_schedule=schedule)
         disturbance = replace(base_disturbance) if base_disturbance is not None else None
         perf = PerfLLM()
         perf.configure(
             strategy_config=strategy,
             model_config=model_cfg,
             system_config=system_cfg,
+            pp_scheduling_config=pp_scheduling,
             disturbance_config=disturbance,
         )
         perf.run_estimate()
