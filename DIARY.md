@@ -67,7 +67,7 @@
     uv run python examples/eval_agents.py \
         --agents zb_h2 ppo_best \
         --ppo-checkpoint ppo_best=logs/rl_env/my_run/best_model/best_model.zip \
-        --n-episodes 20 --disturbance default
+        --n-episodes 20 --disturbance both
 
   Rendering — combine freely:
     - `--render-dir /tmp/gantts` saves `<agent>_ep<NNN>.png` per episode
