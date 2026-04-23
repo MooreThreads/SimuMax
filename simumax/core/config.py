@@ -210,6 +210,9 @@ class DisturbanceConfig(Config):
 
     seed: Optional[int] = None
 
+    # When True, print a one-line summary per disturbance feature at sampling time.
+    verbose: bool = False
+
     # Feature 0 — variable sequence length.
     seq_len_mean: Optional[float] = None  # defaults to strategy.seq_len when None
     seq_len_std: float = 0.0

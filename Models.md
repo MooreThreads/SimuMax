@@ -38,3 +38,27 @@ Compiled from web searches on 2026-04-22. Covers notable open-source / open-weig
 - **Fully open** (weights + data + training code): OLMo 2 is the only family in this list that qualifies.
 - **Announced but not publicly released**: Llama 4 Behemoth (~2T), Nemotron 3 Ultra (~500B/50B).
 - **Megatron** is not a model — it's NVIDIA's training framework (Megatron-LM repo, Megatron-Core library). Used to train Nemotron and many third-party models.
+
+## Open Weights Big Models Reference
+
+Filtered view of the table above: for each family, only variants with more than 50B total parameters are kept (MoE sized by total params). If no variant in a family clears 50B, the single largest available version is kept.
+
+| Family / Variant | Dense or MoE | Versions kept (params) | Notes |
+|---|---|---|---|
+| Gemma 3 (Google) | Dense | 27B | Biggest available (no >50B variant) |
+| Gemma 4 (Google) | Dense | 31B | Biggest available (no >50B variant) |
+| Qwen3 (MoE) | MoE | 235B/22B, 480B/35B (Coder) | Qwen3-Coder-480B-A35B is the largest Qwen open-weights |
+| Qwen3.5 Medium (MoE) | MoE | 122B/10B, 397B/17B | 397B is the flagship MoE |
+| DeepSeek R1 | MoE | 671B/37B | Based on V3-Base |
+| Kimi K2 (Moonshot) | MoE | K2-Base, K2-Instruct, K2-Thinking, K2.5, K2.6 — ~1T/32B | Largest open-weights LLM released to date; K2.6 multimodal, 262K ctx |
+| GLM-4.5 (Z.ai) | MoE | 355B/32B, Air 106B/12B | MIT license |
+| GLM-4.6 (Z.ai) | MoE | 355B/32B | 200K context |
+| MiniMax M2 family | MoE | M2.5, M2.7 — 230B/10B | M2.5 scored 80.2% SWE-Bench Verified; M2.7 leads open-weights on GDPval-AA |
+| Llama 4 (Meta) | MoE | Scout 109B/17B (16 experts), Maverick 400B/17B (128 experts) | Behemoth ~2T announced but NOT released |
+| Llama 3.1 (Meta) | Dense | 70B, 405B | 405B is the largest dense open model |
+| Mistral Large 3 | MoE | 675B/41B | Dec 2025 |
+| Mixtral (Mistral, older) | MoE | 8x22B (141B/39B) | Apr 2024; Apache 2.0 |
+| OpenAI gpt-oss | MoE | gpt-oss-120b (117B/5.1B) | Aug 2025; native MXFP4; Apache 2.0 |
+| OLMo 2 (AllenAI) | Dense | 32B | Biggest available (no >50B variant); fully open |
+| NVIDIA Nemotron 3 | MoE (hybrid Mamba-Transformer) | Super 120B/12B, Ultra ~500B/50B (announced) | 1M-token context; open training data |
+| Ling-1T (inclusionAI) | MoE | 1T/~50B (+ Ling-2.5-1T, FP8 variants) | First FP8-trained 1T foundation model |

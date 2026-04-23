@@ -343,13 +343,14 @@ class PerfLLM(PerfBase):
         if strategy.enable_sequence_parallel and strategy.tp_size > 1:
             tp = strategy.tp_size
             clipped = np.maximum(tp, (clipped // tp) * tp)
-        print(
-            f"[SimuMax] Variable seq_len: N(mean={mean}, std={std}), "
-            f"mbc={mbc} -> "
-            f"min={int(clipped.min())}, "
-            f"mean={float(clipped.mean()):.1f}, "
-            f"max={int(clipped.max())}; values={clipped.tolist()}"
-        )
+        if disturbance.verbose:
+            print(
+                f"[SimuMax] Variable seq_len: N(mean={mean}, std={std}), "
+                f"mbc={mbc} -> "
+                f"min={int(clipped.min())}, "
+                f"mean={float(clipped.mean()):.1f}, "
+                f"max={int(clipped.max())}; values={clipped.tolist()}"
+            )
         return clipped
 
     # ------------------------------------------------------------------
@@ -445,14 +446,15 @@ class PerfLLM(PerfBase):
                     disturbance.op_duration_max_factor,
                 )
             self.op_noise_mult = mult
-            flat = np.concatenate([m.ravel() for m in mult.values()])
-            print(
-                f"[SimuMax] Op-duration noise: N(1, {disturbance.op_duration_std}), "
-                f"shape=({len(kinds)}, {n_rank_units}, {mbc}) -> "
-                f"min={float(flat.min()):.3f}, "
-                f"mean={float(flat.mean()):.3f}, "
-                f"max={float(flat.max()):.3f}"
-            )
+            if disturbance.verbose:
+                flat = np.concatenate([m.ravel() for m in mult.values()])
+                print(
+                    f"[SimuMax] Op-duration noise: N(1, {disturbance.op_duration_std}), "
+                    f"shape=({len(kinds)}, {n_rank_units}, {mbc}) -> "
+                    f"min={float(flat.min()):.3f}, "
+                    f"mean={float(flat.mean()):.3f}, "
+                    f"max={float(flat.max()):.3f}"
+                )
         else:
             self.op_noise_mult = None
 
@@ -486,13 +488,14 @@ class PerfLLM(PerfBase):
                     self.op_slowdown_records.append(
                         {"kind": k, "rank_unit": int(idx), "mb": int(mb)}
                     )
-            print(
-                f"[SimuMax] Op-slowdown: p={disturbance.op_slowdown_prob}, "
-                f"K={disturbance.op_slowdown_k}, "
-                f"triggered={len(self.op_slowdown_records)}"
-                + (f" (cap={disturbance.op_slowdown_max_count})"
-                   if disturbance.op_slowdown_max_count is not None else "")
-            )
+            if disturbance.verbose:
+                print(
+                    f"[SimuMax] Op-slowdown: p={disturbance.op_slowdown_prob}, "
+                    f"K={disturbance.op_slowdown_k}, "
+                    f"triggered={len(self.op_slowdown_records)}"
+                    + (f" (cap={disturbance.op_slowdown_max_count})"
+                       if disturbance.op_slowdown_max_count is not None else "")
+                )
         else:
             self.op_slowdown_mask = None
 
@@ -522,10 +525,11 @@ class PerfLLM(PerfBase):
 
         rng_b = self._disturbance_rng(_SEED_STAGE_SLOWDOWN)
         if float(rng_b.random()) >= disturbance.stage_slowdown_prob:
-            print(
-                f"[SimuMax] Stage-slowdown: prob={disturbance.stage_slowdown_prob}, "
-                f"K={K} -> no stage slowed"
-            )
+            if disturbance.verbose:
+                print(
+                    f"[SimuMax] Stage-slowdown: prob={disturbance.stage_slowdown_prob}, "
+                    f"K={K} -> no stage slowed"
+                )
             return
 
         slowed_rank = int(rng_b.integers(0, pp))
@@ -542,10 +546,11 @@ class PerfLLM(PerfBase):
             for idx in affected_idx:
                 mult[kind][idx, :] = K
         self.stage_slowdown_mult = mult
-        print(
-            f"[SimuMax] Stage-slowdown: prob={disturbance.stage_slowdown_prob}, "
-            f"K={K} -> slowed_rank={slowed_rank}"
-        )
+        if disturbance.verbose:
+            print(
+                f"[SimuMax] Stage-slowdown: prob={disturbance.stage_slowdown_prob}, "
+                f"K={K} -> slowed_rank={slowed_rank}"
+            )
 
     def get_num_layers_to_build(self, config: StrategyConfig, model_conf: ModelConfig, parallel_stage="first") -> int:
         """

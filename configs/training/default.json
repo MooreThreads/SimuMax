@@ -1,13 +1,13 @@
 {
-    "total_timesteps": 500000,
-    "n_envs": 8,
+    "total_timesteps": 5000000,
+    "n_envs": 16,
     "n_steps": 256,
-    "batch_size": 64,
-    "n_epochs": 10,
-    "gamma": 1.0,
+    "batch_size": 256,
+    "n_epochs": 4,
+    "gamma": 0.99,
     "gae_lambda": 0.95,
-    "lr_init": 3e-4,
-    "lr_final": 1e-5,
+    "lr_init": 5e-5,
+    "lr_final": 2e-6,
     "clip_range_init": 0.2,
     "clip_range_final": 0.05,
     "ent_coef": 0.0,
@@ -15,12 +15,18 @@
     "max_grad_norm": 0.5,
     "target_kl": null,
     "normalize_advantage": true,
-    "features_dim": 64,
-    "net_arch_pi": [128, 128],
-    "net_arch_vf": [128, 128],
+    "features_dim": 128,
+    "net_arch_pi": [
+        256,
+        256
+    ],
+    "net_arch_vf": [
+        256,
+        256
+    ],
     "seed": 0,
     "device": "auto",
-    "checkpoint_freq": 50000,
-    "eval_freq": 10000,
-    "eval_episodes": 5
+    "checkpoint_freq": 500000,
+    "eval_freq": 100000,
+    "eval_episodes": 20
 }

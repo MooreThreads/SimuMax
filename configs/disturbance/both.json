@@ -1,13 +1,13 @@
 {
     "seed": 0,
     "seq_len_mean": 4096,
-    "seq_len_std": 2048,
-    "seq_len_min": 512,
-    "seq_len_max": 8192,
+    "seq_len_std": 6144,
+    "seq_len_min": 256,
+    "seq_len_max": 16384,
     "op_duration_std": 0.05,
     "stage_slowdown_prob": 0.5,
     "stage_slowdown_k": 1.5,
-    "op_slowdown_prob": 0.02,
+    "op_slowdown_prob": 0.10,
     "op_slowdown_k": 3.0,
     "op_slowdown_max_count": 5
 }
