@@ -6,9 +6,12 @@ re-samples the three stochastic inputs (variable seq_len, Feature A op
 noise, Feature B stage slowdown, Feature C op bernoulli slowdown) and
 returns a frozen per-task duration table.
 
-Phase 1 scope: only the physical-rank schedules
-(``1f1b`` / ``gpipe`` / ``zb_h1`` / ``zb_h2``). Interleaved / zb_v
-would need :meth:`PerfLLM._per_virtual_stage_times` instead.
+The RL env always models tasks in F/B/W-split form; fused-backward
+semantics (e.g. classical GPipe / 1F1B) are expressed at the agent
+level via ``FUSED_BACKWARD``, not by switching the backend's timing
+representation. Accordingly this backend unconditionally pulls split
+per-rank timings from :meth:`PerfLLM._per_rank_fwd_b_w_times`,
+regardless of the strategy's ``pp_schedule``.
 """
 
 from __future__ import annotations
@@ -20,9 +23,6 @@ import numpy as np
 
 from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
 from simumax.core.perf_llm import PerfLLM
-
-
-_PHYSICAL_RANK_SCHEDULES = ("1f1b", "gpipe", "zb_h1", "zb_h2")
 
 
 @dataclass(frozen=True)
@@ -68,14 +68,6 @@ class SimuMaxBackend:
         # disturbance samples. We pay this once; sample_episode() then only
         # re-runs the cheap samplers.
         perf.run_estimate()
-
-        schedule = perf.strategy.pp_schedule
-        if schedule not in _PHYSICAL_RANK_SCHEDULES:
-            raise NotImplementedError(
-                f"Phase 1 supports only {_PHYSICAL_RANK_SCHEDULES}; "
-                f"strategy.pp_schedule = {schedule!r}. Interleaved / zb_v "
-                f"need virtual-stage timing."
-            )
 
         self._perf = perf
 
