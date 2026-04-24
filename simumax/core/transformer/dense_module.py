@@ -208,6 +208,7 @@ class LinearCol(LinearBase):
         enable_fp8:bool = True,
         is_last_recompute = False,
         disable_tensor_parallel = False,
+        input_is_full_seq = False,
         specific_name='ColumnParallelLinear'
     ) -> None:
         super().__init__(input_size, output_size, strategy, system, specific_name)
@@ -219,6 +220,10 @@ class LinearCol(LinearBase):
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
         self.is_last_recompute = is_last_recompute
+        # Upstream already produced full (non-SP-sharded) sequence, e.g. an MLA down-proj
+        # with disable_tensor_parallel=True. Skip the SP input allgather and treat the
+        # input as TP-replicated (TP-pattern comms) in fwd/bwd.
+        self.input_is_full_seq = input_is_full_seq
         if self.is_last_recompute and self.enable_recompute:
             self.set_variance_node(True)
         if self.strategy.fp8 and enable_fp8:
@@ -236,7 +241,8 @@ class LinearCol(LinearBase):
         model_info = f"microbatch:{args.microbatch}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
-        if self.strategy.enable_sequence_parallel and self.strategy.tp_size > 1:
+        use_sp_input = self.strategy.enable_sequence_parallel and not self.input_is_full_seq
+        if use_sp_input and self.strategy.tp_size > 1:
             # fwd compute with sp
             comm_size = (
                 self.micro_hidden_state_size
@@ -248,7 +254,7 @@ class LinearCol(LinearBase):
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
             )
-            self.layers.append(all_gather(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
+            self.layers.append(all_gather(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}",
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
                                          fwd_cost=cost, bwd_cost=cost))#'comm all_gather input/ bwd:rs'
             state.comm_order += 1
@@ -264,7 +270,7 @@ class LinearCol(LinearBase):
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
             )
-            self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
+            self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}",
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
                                          fwd_cost=0, bwd_cost=cost))
             state.comm_order += 1
@@ -272,8 +278,8 @@ class LinearCol(LinearBase):
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
                                  bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,
                                  specific_name='Linear'))
-        
-        if self.strategy.enable_sequence_parallel and self.strategy.tp_size > 1:
+
+        if use_sp_input and self.strategy.tp_size > 1:
             comm_size = comm_size = (
                 self.micro_hidden_state_size
                 * self.dtype_to_element_size[self.strategy.dtype]
@@ -284,7 +290,7 @@ class LinearCol(LinearBase):
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
             )
-            self.layers.append(all_gather_bwd(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
+            self.layers.append(all_gather_bwd(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}",
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
                                          fwd_cost=0, bwd_cost=cost))  #gather again in bwd to save memory
             state.comm_order += 1
@@ -301,11 +307,11 @@ class LinearCol(LinearBase):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.input_info.tensors[0].size(2)
-        if self.strategy.enable_sequence_parallel:
-            # collect the full sequence data by all-gather, the seq_size is seq_len * tp_size 
+        if self.strategy.enable_sequence_parallel and not self.input_is_full_seq:
+            # collect the full sequence data by all-gather, the seq_size is seq_len * tp_size
             seq_len *= self.strategy.tp_size
         return TensorSize(shape = [batch_size, seq_len, hidden_size], dtype=self.input_info.tensors[0].dtype)
-        
+
     @property
     def micro_hidden_state_size(self):
         """
@@ -316,8 +322,8 @@ class LinearCol(LinearBase):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         hidden_size = self.input_info.tensors[0].size(2)
-        if self.strategy.enable_sequence_parallel:
-            # collect the full sequence data by all-gather, the seq_size is seq_len * tp_size 
+        if self.strategy.enable_sequence_parallel and not self.input_is_full_seq:
+            # collect the full sequence data by all-gather, the seq_size is seq_len * tp_size
             seq_len *= self.strategy.tp_size
         return batch_size * seq_len * hidden_size
 
@@ -332,13 +338,13 @@ class LinearCol(LinearBase):
     def create_output_info(self):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
-        if self.strategy.enable_sequence_parallel:
+        if self.strategy.enable_sequence_parallel and not self.input_is_full_seq:
             seq_len *= self.strategy.tp_size
         output_info = InputOutputInfo(
             tensors=[TensorSize(shape=(batch_size, seq_len, self.output_size))]
         )
         return output_info
-    
+
     def set_breakpoints(self, status):
         self.is_breakpoints = status
 
@@ -348,8 +354,9 @@ class LinearCol(LinearBase):
 
     def _comp_leaf_intra_net_info(self):
         # all-gather + matmul(fwd)
+        use_sp_input = self.strategy.enable_sequence_parallel and not self.input_is_full_seq
         # 1.FWD
-        if self.strategy.enable_sequence_parallel and self.strategy.tp_size > 1:
+        if use_sp_input and self.strategy.tp_size > 1:
             # fwd compute with sp
             # Gather the hidden states of the full sequence from all tp ranks, then compute
             comm_size = (
@@ -373,7 +380,7 @@ class LinearCol(LinearBase):
             self._cost_info.recompute_net_time = self._cost_info.fwd_net_time
         # 3.Bwd act
         # grad_input = grad_output.matmul(weight)  # [b*s, output_size] * [output_size, input_size]
-        if self.strategy.enable_sequence_parallel and self.strategy.tp_size > 1:
+        if use_sp_input and self.strategy.tp_size > 1:
             comm_size = (
                 self.micro_hidden_state_size
                 * self.dtype_to_element_size[self.strategy.dtype]
@@ -399,7 +406,7 @@ class LinearCol(LinearBase):
             )
         # 4.Bwd weight
         # grad_weight = grad_output.t().matmul(total_input)
-        if self.strategy.enable_sequence_parallel and self.strategy.tp_size > 1:
+        if use_sp_input and self.strategy.tp_size > 1:
             comm_size = comm_size = (
                 self.micro_hidden_state_size
                 * self.dtype_to_element_size[self.strategy.dtype]
@@ -424,8 +431,9 @@ class LinearCol(LinearBase):
         self._act_info.activation_mem_cache = (
             self.micro_hidden_state_size * self.a_element_size
         )
-        if self.strategy.enable_sequence_parallel and not self.strategy.fp8:
-            # Note: sp only cache the activation slice, when bf16
+        if self.strategy.enable_sequence_parallel and not self.strategy.fp8 and not self.input_is_full_seq:
+            # Note: sp only cache the activation slice, when bf16.
+            # If the input is already full-seq (TP-replicated), keep the whole cache.
             self._act_info.activation_mem_cache /= self.strategy.tp_size
         if self.has_cached_inputs:
             self._act_info.activation_mem_cache = 0
@@ -1972,24 +1980,26 @@ class Float8Quantizer(MetaModule):
 
 #region ----------------- Composite module ----------------
 class QuantizedColLinear(MetaModule):
-    def __init__(self, 
-                 layer_idx, 
-                 input_size, 
-                 output_size, 
-                 use_bias, 
-                 has_cached_inputs, 
-                 enable_recompute, 
-                 strategy, 
-                 system, 
+    def __init__(self,
+                 layer_idx,
+                 input_size,
+                 output_size,
+                 use_bias,
+                 has_cached_inputs,
+                 enable_recompute,
+                 strategy,
+                 system,
                  is_last_recompute = False,
                  disable_tensor_parallel = False,
+                 input_is_full_seq = False,
                  specific_name='QuantizedColLinear'):
         super().__init__(strategy, system, specific_name, parent_module=None)
         assert self.strategy.fp8, 'QuantizedColLinear only support fp8'
         self.quntizer = Float8Quantizer(enable_recompute=enable_recompute, strategy=strategy, system=system)
-        self.linear = LinearCol(layer_idx, input_size, output_size, use_bias, has_cached_inputs, enable_recompute, strategy, system, 
-                                is_last_recompute = is_last_recompute, 
-                                disable_tensor_parallel = disable_tensor_parallel)
+        self.linear = LinearCol(layer_idx, input_size, output_size, use_bias, has_cached_inputs, enable_recompute, strategy, system,
+                                is_last_recompute = is_last_recompute,
+                                disable_tensor_parallel = disable_tensor_parallel,
+                                input_is_full_seq = input_is_full_seq)
     
     def set_breakpoints(self, status):
         self.linear.set_breakpoints(status)
@@ -2152,7 +2162,6 @@ class MLAAttention(MetaModule):
         specific_name='',
     ) -> None:
         super().__init__(strategy, system, specific_name)
-        assert strategy.tp_size==1, "MLA do not support Tensor Parallel"
         self.layer_idx = layer_idx
         self.config = config
         self.strategy = strategy
@@ -2174,7 +2183,8 @@ class MLAAttention(MetaModule):
 
         
         LinearCol_ = QuantizedColLinear if self.strategy.fp8 else LinearCol
-        
+        LinearRow_ = QuantizedRowLinear if self.strategy.fp8 else LinearRow
+
         if self.config.q_lora_rank is None:
             self.linear_q_proj = LinearCol_(
                     layer_idx=layer_idx,
@@ -2187,6 +2197,10 @@ class MLAAttention(MetaModule):
                     system=system
                 )
         else:
+            # Down-proj keeps the full latent dim replicated across TP ranks.
+            # Under SP+TP it still all-gathers the sequence in fwd, but produces a
+            # full-seq, full-hidden output (no column split). The matching up-proj
+            # then uses input_is_full_seq=True to skip a second SP allgather.
             self.linear_q_down_proj = LinearCol_(
                 layer_idx=layer_idx,
                 input_size=self.config.hidden_size,
@@ -2195,7 +2209,7 @@ class MLAAttention(MetaModule):
                 has_cached_inputs=False,
                 enable_recompute=attention_recompute_conf.q_down_recompute,
                 is_last_recompute = True,
-                # disable_tensor_parallel=True,
+                disable_tensor_parallel=True,
                 strategy=strategy,
                 system=system
             )
@@ -2212,14 +2226,15 @@ class MLAAttention(MetaModule):
             self.linear_q_up_proj = LinearCol_(
                     layer_idx=layer_idx,
                     input_size=self.config.q_lora_rank,
-                    output_size=self.config.head_num * self.q_head_dim, 
+                    output_size=self.config.head_num * self.q_head_dim,
                     use_bias=False,
                     has_cached_inputs=False,
                     enable_recompute=attention_recompute_conf.q_up_recompute,
+                    input_is_full_seq=True,
                     strategy=strategy,
                     system=system
                 )
-        
+
         self.linear_kv_down_proj = LinearCol_(
                 layer_idx=layer_idx,
                 input_size=self.config.hidden_size,
@@ -2228,10 +2243,11 @@ class MLAAttention(MetaModule):
                 has_cached_inputs=True,
                 enable_recompute=attention_recompute_conf.kv_down_recompute,
                 is_last_recompute = True,
+                disable_tensor_parallel=True,
                 strategy=strategy,
                 system=system
             )
-    
+
         self.kv_layernorm = LayerNorm(
                 norm_size=self.config.kv_lora_rank,
                 norm_type="rms_norm",
@@ -2249,6 +2265,7 @@ class MLAAttention(MetaModule):
                 use_bias=False,
                 has_cached_inputs=False,
                 enable_recompute=attention_recompute_conf.kv_up_recompute,
+                input_is_full_seq=True,
                 strategy=strategy,
                 system=system,
             )
@@ -2274,7 +2291,9 @@ class MLAAttention(MetaModule):
                 v_head_dim=config.v_head_dim
             )
         # TODO(sherry): in selective_recompute, linear_out is not recomputed
-        self.linear_out_proj = LinearCol_(
+        # Output projection is row-parallel: takes head-sharded input from core
+        # attention and reduces back to full hidden, scattering along seq under SP.
+        self.linear_out_proj = LinearRow_(
                 layer_idx=layer_idx,
                 input_size=query_projection_size,
                 output_size=self.config.hidden_size,

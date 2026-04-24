@@ -16,6 +16,12 @@
   ZB-V:
   uv run python examples/run_gantt_demo.py --strategy llama70b_tp8_pp4_dp100_zbv
 
+  uv run python examples/run_gantt_demo.py --strategy llama3_70b_optimal
+      --model llama3-70b \
+      --system h100_nvlink \
+      --schedule 1f1b
+
+
   ## RL env: train & evaluate
 
   The RL env lives under `simumax/rl/` — `env/` is the Gymnasium env,
