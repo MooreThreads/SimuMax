@@ -2,15 +2,17 @@
 
 Strategy and pipeline schedule are independent configs: the same
 parallelism strategy can be simulated under any supported schedule by
-selecting a different ``--schedule``.
+selecting a different ``--schedule``. ``--strategy`` defaults to
+``<model>_optimal_mfu`` (with ``-``/``.`` → ``_``); override explicitly
+when you want a different strategy.
 
 Examples
 --------
-    python examples/run_gantt_demo.py
-    python examples/run_gantt_demo.py --schedule zb_h2
-    python examples/run_gantt_demo.py --strategy llama70b_tp8_pp4_dp100 \\
-        --schedule interleaved_1f1b --model llama3-70b --system h100_nvlink \\
-        --output my_chart.png
+    python examples/run_gantt_demo.py --model llama3-70b
+    python examples/run_gantt_demo.py --model llama3-70b --schedule zb_h2
+    python examples/run_gantt_demo.py --model llama3-70b \\
+        --strategy llama3_70b_optimal_mfu --schedule interleaved_1f1b \\
+        --system h100_nvlink --output my_chart.png
 """
 
 import argparse
@@ -40,15 +42,21 @@ SUPPORTED_SCHEDULES = ["1f1b", "zb_h1", "zb_h2", "gpipe",
                        "interleaved_1f1b", "zb_v"]
 
 
+def _default_strategy_for(model: str) -> str:
+    return model.replace("-", "_").replace(".", "_") + "_optimal_mfu"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--strategy", default="llama70b_tp8_pp4_dp100",
-                        help="Strategy config name (without .json).")
+    parser.add_argument("--model", default=None,
+                        help="Model config name (without .json). "
+                             "Required unless --list-schedules is passed.")
+    parser.add_argument("--strategy", default=None,
+                        help="Strategy config name (without .json). "
+                             "Defaults to <model>_optimal_mfu.")
     parser.add_argument("--schedule", default="1f1b",
                         help="Pipeline schedule config name (without .json), "
                              f"one of: {', '.join(SUPPORTED_SCHEDULES)}.")
-    parser.add_argument("--model", default="llama3-70b",
-                        help="Model config name (without .json).")
     parser.add_argument("--system", default="h100_nvlink",
                         help="System config name (without .json).")
     parser.add_argument("--disturbance", default=None,
@@ -72,7 +80,11 @@ def main():
                   f"{PerfLLM.default_gantt_filename(s)}")
         sys.exit(0)
 
-    strategy_path = get_simu_strategy_config(args.strategy)
+    if args.model is None:
+        sys.exit("--model is required (or pass --list-schedules)")
+
+    strategy_name = args.strategy or _default_strategy_for(args.model)
+    strategy_path = get_simu_strategy_config(strategy_name)
     schedule_path = get_simu_pp_scheduling_config(args.schedule)
     model_path = get_simu_model_config(args.model)
     system_path = get_simu_system_config(args.system)

@@ -14,9 +14,12 @@ same per-episode disturbance / seq-len draws — apples-to-apples.
 from __future__ import annotations
 
 import statistics
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from tqdm.auto import tqdm
 
 from simumax.rl.agents import PPOAgent, make_agent
 from simumax.rl.env.backend import SimuMaxBackend
@@ -78,6 +81,7 @@ def evaluate(
     render_dir: Optional[Path] = None,
     display: bool = False,
     ppo_checkpoints: Optional[dict[str, str]] = None,
+    show_progress: bool = False,
 ) -> list[EvalResult]:
     """Run each agent for ``n_episodes`` episodes; return per-agent iter times.
 
@@ -103,37 +107,50 @@ def evaluate(
     ckpts = ppo_checkpoints or {}
 
     results: list[EvalResult] = []
-    for name in agent_names:
-        if name in ckpts:
-            agent = PPOAgent(ckpts[name])
-        else:
-            agent = make_agent(name, pp, mbc)
-        # Fresh env per agent so np_random starts from base_seed for all.
-        agent_env_config = RLEnvConfig(**{**env_config.__dict__, "seed": base_seed})
-        env = PipelineSchedulingEnv(agent_env_config, backend=backend)
-        iter_times: list[float] = []
-        pp_utilizations: list[float] = []
-        for ep in range(n_episodes):
-            t, u = _run_episode(env, agent, max_steps)
-            iter_times.append(t)
-            pp_utilizations.append(u)
-            if render_dir is not None or display:
-                out_path: Optional[str] = None
-                if render_dir is not None:
-                    render_dir.mkdir(parents=True, exist_ok=True)
-                    out_path = str(render_dir / f"{name}_ep{ep:03d}.png")
-                env.render(
-                    out_path,
-                    title=f"{name} ep {ep} (t={t:.6f}s, u={u:.4f})",
-                    display=display,
-                )
-        results.append(
-            EvalResult(
-                agent_name=name,
-                iter_times=iter_times,
-                pp_utilizations=pp_utilizations,
+    total = len(agent_names) * n_episodes
+    progress_ctx = (
+        tqdm(total=total, desc="episodes", unit="ep")
+        if show_progress
+        else nullcontext()
+    )
+    with progress_ctx as pbar:
+        for name in agent_names:
+            if name in ckpts:
+                agent = PPOAgent(ckpts[name])
+            else:
+                agent = make_agent(name, pp, mbc)
+            # Fresh env per agent so np_random starts from base_seed for all.
+            agent_env_config = RLEnvConfig(
+                **{**env_config.__dict__, "seed": base_seed}
             )
-        )
+            env = PipelineSchedulingEnv(agent_env_config, backend=backend)
+            iter_times: list[float] = []
+            pp_utilizations: list[float] = []
+            for ep in range(n_episodes):
+                if pbar is not None:
+                    pbar.set_postfix_str(f"{name} ep{ep}")
+                t, u = _run_episode(env, agent, max_steps)
+                iter_times.append(t)
+                pp_utilizations.append(u)
+                if render_dir is not None or display:
+                    out_path: Optional[str] = None
+                    if render_dir is not None:
+                        render_dir.mkdir(parents=True, exist_ok=True)
+                        out_path = str(render_dir / f"{name}_ep{ep:03d}.png")
+                    env.render(
+                        out_path,
+                        title=f"{name} ep {ep} (t={t:.6f}s, u={u:.4f})",
+                        display=display,
+                    )
+                if pbar is not None:
+                    pbar.update(1)
+            results.append(
+                EvalResult(
+                    agent_name=name,
+                    iter_times=iter_times,
+                    pp_utilizations=pp_utilizations,
+                )
+            )
     return results
 
 

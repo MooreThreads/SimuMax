@@ -1,11 +1,14 @@
 """Evaluate baseline and/or trained agents on the SimuMax-driven RL env.
 
+``--strategy`` defaults to ``<model>_optimal_mfu`` (with ``-``/``.`` → ``_``);
+override explicitly when you want a different strategy.
+
 Examples
 --------
-    python examples/eval_static_agents.py --agents gpipe 1f1b zb_h1 zb_h2
-    python examples/eval_static_agents.py --agents zb_h2 --n-episodes 20 \\
+    python examples/eval_agents.py --model llama3-70b --agents gpipe 1f1b zb_h1 zb_h2
+    python examples/eval_agents.py --model llama3-70b --agents zb_h2 --n-episodes 20 \\
         --disturbance default --render-dir /tmp/gantts
-    python examples/eval_static_agents.py \\
+    python examples/eval_agents.py --model llama3-70b \\
         --agents 1f1b zb_h2 ppo_best \\
         --ppo-checkpoint ppo_best=/tmp/runs/foo/best_model.zip \\
         --display
@@ -34,6 +37,10 @@ from simumax.utils import (
 )
 
 
+def _default_strategy_for(model: str) -> str:
+    return model.replace("-", "_").replace(".", "_") + "_optimal_mfu"
+
+
 def _parse_ppo_checkpoint(value: str) -> tuple[str, str]:
     if "=" not in value:
         raise argparse.ArgumentTypeError(
@@ -56,12 +63,12 @@ def _parse_ppo_checkpoint(value: str) -> tuple[str, str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
-        "--strategy",
-        default="tp1_pp2_dp4_mbs1",
-        help="Strategy config name (without .json)",
+        "--model", required=True, help="Model config name (without .json)"
     )
     parser.add_argument(
-        "--model", default="llama3-8b", help="Model config name (without .json)"
+        "--strategy",
+        default=None,
+        help="Strategy config name (without .json); defaults to <model>_optimal_mfu",
     )
     parser.add_argument(
         "--system", default="a100_pcie", help="System config name (without .json)"
@@ -121,8 +128,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    strategy_name = args.strategy or _default_strategy_for(args.model)
     strategy = StrategyConfig.init_from_config_file(
-        get_simu_strategy_config(args.strategy)
+        get_simu_strategy_config(strategy_name)
     )
     model = ModelConfig.init_from_config_file(get_simu_model_config(args.model))
     system = SystemConfig.init_from_config_file(get_simu_system_config(args.system))
@@ -171,10 +179,11 @@ def main() -> None:
         render_dir=render_dir,
         display=args.display,
         ppo_checkpoints=ppo_checkpoints,
+        show_progress=True,
     )
 
     print(
-        f"Agent eval on {args.strategy} / {args.model} / {args.system} "
+        f"Agent eval on {strategy_name} / {args.model} / {args.system} "
         f"over {args.n_episodes} episode(s) (seed={args.seed}):"
     )
     print(format_summary(results))

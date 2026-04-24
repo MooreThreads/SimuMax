@@ -16,10 +16,7 @@
   ZB-V:
   uv run python examples/run_gantt_demo.py --strategy llama70b_tp8_pp4_dp100_zbv
 
-  uv run python examples/run_gantt_demo.py --strategy llama3_70b_optimal
-      --model llama3-70b \
-      --system h100_nvlink \
-      --schedule 1f1b
+  uv run python examples/run_gantt_demo.py --strategy llama3_70b_optimal_mfu --model llama3-70b --system h100_nvlink --schedule zb_h2 --disturbance both
 
 
   ## RL env: train & evaluate
@@ -64,7 +61,6 @@
   Static baselines only:
 
     uv run python examples/eval_agents.py \
-        --strategy llama70b_tp8_pp4_dp100 \
         --model llama3-70b --system h100_nvlink \
         --agents gpipe gpipe_overlap 1f1b 1f1b_overlap zb_h1 zb_h2 \
         --n-episodes 20
