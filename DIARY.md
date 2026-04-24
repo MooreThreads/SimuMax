@@ -31,15 +31,17 @@
 
   ### A) Train a PPO agent
 
-  CLI: `examples/train_rl_llama3_70b.py` wraps `simumax.rl.train.train`.
+  CLI: `examples/train_rl.py` wraps `simumax.rl.train.train`.
 
-    uv run python examples/train_rl_llama3_70b.py \
-        --strategy llama70b_tp8_pp4_dp100 \
+    uv run python examples/train_rl.py \
         --model llama3-70b \
         --system h100_nvlink \
         --training default \
         --log-dir logs/rl_env \
         --run-name my_run
+
+  `--strategy` defaults to `<model>_optimal_mfu` (with `-`/`.` → `_`);
+  override explicitly when you want a non-optimal-MFU strategy.
 
   Optional: `--disturbance <name>` for stochastic episodes;
   `--reward-mode {utilization,makespan,bubble}`.

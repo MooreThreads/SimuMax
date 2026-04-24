@@ -1,7 +1,7 @@
 """Phase 1 training entry point: MaskablePPO on SimuMax-driven env.
 
 Fixed-sequence, no-disturbance setting — trains a policy to schedule
-forward/backward/weight tasks on a llama3-8b × tp1_pp2_dp4_mbs1 × a100
+forward/backward/weight tasks for a given model × strategy × system
 deployment. Set ``seq_len_std`` in the strategy JSON or pass a
 ``--disturbance`` config to enable Phase 2 stochasticity.
 """
@@ -22,10 +22,18 @@ from simumax.utils import (
 )
 
 
+def _default_strategy_for(model: str) -> str:
+    return model.replace("-", "_").replace(".", "_") + "_optimal_mfu"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--strategy", default="llama70b_tp8_pp4_dp100")
-    parser.add_argument("--model", default="llama3-70b")
+    parser.add_argument("--model", required=True)
+    parser.add_argument(
+        "--strategy",
+        default=None,
+        help="Strategy config name (without .json); defaults to <model>_optimal_mfu",
+    )
     parser.add_argument("--system", default="h100_nvlink")
     parser.add_argument(
         "--disturbance",
@@ -46,11 +54,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    strategy = args.strategy or _default_strategy_for(args.model)
+
     ppo_config = PPOTrainingConfig.init_from_config_file(
         get_simu_training_config(args.training)
     )
     env_config = RLEnvConfig(
-        strategy_config=get_simu_strategy_config(args.strategy),
+        strategy_config=get_simu_strategy_config(strategy),
         model_config=get_simu_model_config(args.model),
         system_config=get_simu_system_config(args.system),
         disturbance_config=(
