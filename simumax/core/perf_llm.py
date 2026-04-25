@@ -376,24 +376,26 @@ class PerfLLM(PerfBase):
     # ------------------------------------------------------------------
 
     def _disturbance_shape(self):
-        """Return ``(n_rank_units, kinds)`` matching the per-task timing
-        tables consumed by the scheduler for the current ``pp_schedule``.
+        """Return ``(n_rank_units, kinds)`` for the disturbance multiplier
+        tables.
 
         ``n_rank_units`` is ``pp`` for physical-rank schedules (1f1b,
         gpipe, zb_h1, zb_h2) and ``V*pp`` for virtual-stage schedules
-        (interleaved_1f1b, zb_v). ``kinds`` includes ``"W"`` only for
-        schedules that split the backward into B / W (zb_h1, zb_h2, zb_v).
+        (interleaved_1f1b, zb_v). ``kinds`` is always ``("F", "B", "W")``:
+        the RL env's task graph is unconditionally F/B/W split (see
+        ``simumax/rl/env/backend.py``), so W must be perturbed for the env
+        path even when the analytical scheduler fuses B+W (1f1b, gpipe,
+        interleaved_1f1b). The analytical fused-B path simply ignores the
+        W entry; F and B draws stay byte-equal because they are sampled
+        first.
         """
-        schedule = self.pp_scheduling.pp_schedule
         pp = self.strategy.pp_size
-        if schedule == "interleaved_1f1b":
-            return self.pp_scheduling.interleaving_size * pp, ("F", "B")
-        if schedule == "zb_v":
-            return 2 * pp, ("F", "B", "W")
-        if schedule in ("zb_h1", "zb_h2"):
-            return pp, ("F", "B", "W")
-        # 1f1b, gpipe
-        return pp, ("F", "B")
+        kinds = ("F", "B", "W")
+        if self.pp_scheduling.pp_schedule == "interleaved_1f1b":
+            return self.pp_scheduling.interleaving_size * pp, kinds
+        if self.pp_scheduling.pp_schedule == "zb_v":
+            return 2 * pp, kinds
+        return pp, kinds
 
     def _is_virtual_stage_schedule(self):
         return self.pp_scheduling.pp_schedule in ("interleaved_1f1b", "zb_v")
