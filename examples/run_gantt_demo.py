@@ -143,21 +143,27 @@ def main():
     # like PipelineSchedulingEnv.reset() does in the RL eval path.
     rng, _ = seeding.np_random(args.seed)
     utils: list[float] = []
+    mfus: list[float] = []
     for ep in range(args.n_episodes):
         ep_seed = int(rng.integers(0, 2**31 - 1))
         perf_model.disturbance.seed = ep_seed
         perf_model.run_estimate()
         # analysis_cost() runs convert_final_result_to_human_format, so most
-        # numeric fields end up stringified. pp_utilization stays a float.
-        utils.append(float(perf_model.analysis_cost().data["pp_utilization"]))
+        # numeric fields end up stringified. pp_utilization and mfu stay floats.
+        cost = perf_model.analysis_cost().data
+        utils.append(float(cost["pp_utilization"]))
+        mfus.append(float(cost["mfu"]))
 
-    std = statistics.stdev(utils) if len(utils) > 1 else 0.0
+    util_std = statistics.stdev(utils) if len(utils) > 1 else 0.0
+    mfu_std = statistics.stdev(mfus) if len(mfus) > 1 else 0.0
     print()
     print(f"schedule = {schedule}")
     print(f"pp = {pp}, mbc = {mbc}")
     print(f"episodes = {args.n_episodes}, base seed = {args.seed}")
     print(f"pp_utilization: mean={statistics.fmean(utils):.4f} "
-          f"std={std:.4f} min={min(utils):.4f} max={max(utils):.4f}")
+          f"std={util_std:.4f} min={min(utils):.4f} max={max(utils):.4f}")
+    print(f"mfu:            mean={statistics.fmean(mfus):.4f} "
+          f"std={mfu_std:.4f} min={min(mfus):.4f} max={max(mfus):.4f}")
     print("Gantt skipped (n_episodes > 1).")
 
 
