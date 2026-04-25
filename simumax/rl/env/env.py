@@ -364,10 +364,10 @@ class PipelineSchedulingEnv(gymnasium.Env):
         return np.where(gpu_end > -np.inf, gpu_end - gpu_start, 0.0)
 
     def _compute_pp_utilization(self) -> float:
-        # Aligned with SimuMax's closed-form definitions (perf_llm.py:2582-2657):
-        #   T           = single_iter_time_no_dp_opim (0 -> last completion)
-        #   useful_work = Σ_r Σ_m (f + b + w)  (same scope as _chunk_fwd_bwd_at)
-        #   pp_utilization = useful_work / (pp * T)
+        # Matches PerfLLM.analysis_cost's pp_utilization (perf_llm.py): both
+        # divide Σ_r Σ_m disturbance-applied (f + b + w) by pp × makespan, so
+        # the metric is the true scheduling bubble fraction (idle gaps), not a
+        # mix of bubble and disturbance slowdown.
         T = self._current_time
         if T <= 0.0:
             return 0.0

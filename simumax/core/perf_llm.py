@@ -2665,11 +2665,15 @@ class PerfLLM(PerfBase):
         # pp_utilization = Σ_r work_r / (pp × max_iter_time). 1.0 means every rank is
         # busy for the whole iteration (zero bubble); lower values mean more idle time
         # distributed across ranks. Complement is the bubble fraction.
-        total_work_all_ranks = chunk_work[FIRST_CHUNK]
-        if pp_size > 2:
-            total_work_all_ranks += (pp_size - 2) * chunk_work[MIDDLE_CHUNK]
-        if pp_size > 1:
-            total_work_all_ranks += chunk_work[LAST_CHUNK]
+        # Numerator uses disturbance-applied per-task durations so the metric is the
+        # true scheduling bubble; using base work would conflate disturbance slowdown
+        # (which inflates the denominator) with bubble (idle gaps in the schedule).
+        f_t, b_t, w_t = self._per_rank_fwd_b_w_times(apply_disturbance=True)
+        total_work_all_ranks = sum(
+            f_t[r][m] + b_t[r][m] + w_t[r][m]
+            for r in range(pp_size)
+            for m in range(mbc)
+        )
         pp_utilization = (total_work_all_ranks / (pp_size * single_iter_time_no_dp_opim)
                           if single_iter_time_no_dp_opim > 0 else 1.0)
 
