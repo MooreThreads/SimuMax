@@ -1,7 +1,7 @@
 {
     "seq_len": 4096,
     "micro_batch_size": 1,
-    "micro_batch_num": 512,
+    "micro_batch_num": 128,
     "dtype": "bf16",
     "world_size": 16,
     "tp_size": 1,

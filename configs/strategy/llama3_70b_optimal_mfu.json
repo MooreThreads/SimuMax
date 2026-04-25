@@ -1,11 +1,11 @@
 {
     "seq_len": 4096,
     "micro_batch_size": 1,
-    "micro_batch_num": 512,
+    "micro_batch_num": 128,
     "dtype": "bf16",
     "world_size": 32,
-    "tp_size": 2,
-    "pp_size": 8,
+    "tp_size": 4,
+    "pp_size": 4,
     "ep_size": 1,
     "etp_size": 1,
     "moe_dispatcher_policy": "all2all",
@@ -16,8 +16,6 @@
     "use_math_sdp": false,
     "use_flash_sdp": true,
     "use_fp32_accum_grad": true,
-    "enable_recompute": true,
-    "mem_factor": 0.94,
-    "recompute_granularity": "full_block",
-    "recompute_layer_num": 6
+    "enable_recompute": false,
+    "mem_factor": 0.94
 }

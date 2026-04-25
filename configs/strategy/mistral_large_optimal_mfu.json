@@ -1,10 +1,10 @@
 {
     "seq_len": 4096,
     "micro_batch_size": 1,
-    "micro_batch_num": 512,
+    "micro_batch_num": 256,
     "dtype": "bf16",
-    "world_size": 64,
-    "tp_size": 2,
+    "world_size": 32,
+    "tp_size": 4,
     "pp_size": 8,
     "ep_size": 1,
     "etp_size": 1,
@@ -19,5 +19,5 @@
     "enable_recompute": true,
     "mem_factor": 0.94,
     "recompute_granularity": "full_block",
-    "recompute_layer_num": 11
+    "recompute_layer_num": 9
 }

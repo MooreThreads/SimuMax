@@ -102,12 +102,14 @@ def suppress_stdout():
         devnull.close()
 
 
-def enumerate_combos(model_cfg: ModelConfig, gbs_target: int, max_world: int):
+def enumerate_combos(model_cfg: ModelConfig, gbs_target: int, max_world: int,
+                     relax_factor: float = GBS_RELAX_FACTOR):
     """Yield valid (tp, pp, ep, dp, mbn, gbs_eff) for this model.
 
     Picks mbn so that mbn*dp is as close as possible to gbs_target, subject to
     mbn >= pp (pipeline validity). Combos where the resulting gbs_eff would fall
-    outside [gbs_target/GBS_RELAX_FACTOR, gbs_target*GBS_RELAX_FACTOR] are dropped.
+    outside [gbs_target/relax_factor, gbs_target*relax_factor] are dropped. Pass
+    relax_factor=1.0 to require gbs_eff == gbs_target exactly.
     """
     head_num = model_cfg.head_num
     kv_head_num = model_cfg.kv_head_num
@@ -134,8 +136,8 @@ def enumerate_combos(model_cfg: ModelConfig, gbs_target: int, max_world: int):
     else:
         ep_list = EP_CANDIDATES_DENSE
 
-    gbs_min = gbs_target / GBS_RELAX_FACTOR
-    gbs_max = gbs_target * GBS_RELAX_FACTOR
+    gbs_min = gbs_target / relax_factor
+    gbs_max = gbs_target * relax_factor
 
     for tp in tp_list:
         for pp in pp_list:
@@ -256,8 +258,9 @@ def build_strategy_json(best: dict) -> dict:
 
 
 def make_perf_model(model_config_path: str, system_config_path: str) -> PerfLLM:
-    # Use the tp1_pp2_dp4_mbs1 template as a starting strategy — seq_len=4096 matches our target.
-    template_path = RELEASE_STRATEGY["tp1_pp2_dp4_mbs1"]
+    # Any valid StrategyConfig works as a skeleton — search overrides world_size, tp/pp/ep,
+    # mbs, mbn, and recompute_* per combo. Pick an existing file from configs/strategy/.
+    template_path = RELEASE_STRATEGY["llama3_70b_optimal_mfu"]
     perf = PerfLLM()
     perf.configure(
         strategy_config=StrategyConfig.init_from_config_file(template_path),
@@ -275,7 +278,8 @@ def make_perf_model(model_config_path: str, system_config_path: str) -> PerfLLM:
 
 
 def search_for_model(model_name: str, model_config_path: str, system_config_path: str,
-                     gbs_target: int, max_world: int, verbose: bool = False):
+                     gbs_target: int, max_world: int, verbose: bool = False,
+                     relax_factor: float = GBS_RELAX_FACTOR):
     perf = make_perf_model(model_config_path, system_config_path)
     mcfg = perf.model_config
 
@@ -284,7 +288,8 @@ def search_for_model(model_name: str, model_config_path: str, system_config_path
     tried = 0
     fit = 0
 
-    combos = list(enumerate_combos(mcfg, gbs_target=gbs_target, max_world=max_world))
+    combos = list(enumerate_combos(mcfg, gbs_target=gbs_target, max_world=max_world,
+                                   relax_factor=relax_factor))
     print(f"[{model_name}] {len(combos)} (tp, pp, ep, dp) combos to search "
           f"(gbs≈{gbs_target}, max_world={max_world})")
 
@@ -353,7 +358,11 @@ def main():
                         help="Maximum world_size to consider. If omitted, picked by model size: "
                              f"<{SMALL_THRESHOLD_B:g}B->{MAX_WORLD_SMALL}, "
                              f"<{LARGE_THRESHOLD_B:g}B->{MAX_WORLD_MEDIUM}, else {MAX_WORLD_LARGE}.")
+    parser.add_argument("--exact-gbs", action="store_true",
+                        help="Require gbs_eff == gbs_target exactly (relax_factor=1.0). "
+                             "By default, accepts combos within [gbs/2, gbs*2].")
     args = parser.parse_args()
+    relax_factor = 1.0 if args.exact_gbs else GBS_RELAX_FACTOR
 
     system_config_path = get_simu_system_config(args.system)
 
@@ -375,7 +384,7 @@ def main():
         print(f"\n=== {model_name} (params≈{estimate_params_b(mcfg):.0f}B, gbs={gbs_target}, max_world={max_world}) ===")
         best = search_for_model(model_name, model_path, system_config_path,
                                 gbs_target=gbs_target, max_world=max_world,
-                                verbose=args.verbose)
+                                verbose=args.verbose, relax_factor=relax_factor)
         if not best:
             summary.append((model_name, None, "no-fit"))
             continue
