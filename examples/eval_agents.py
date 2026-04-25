@@ -122,6 +122,11 @@ def parse_args() -> argparse.Namespace:
         help="Open a blocking matplotlib window per episode "
         "(combine with --render-dir to also save PNGs).",
     )
+    parser.add_argument(
+        "--profile-inference",
+        action="store_true",
+        help="Print per-agent agent.act() timing stats over all episodes.",
+    )
     return parser.parse_args()
 
 
@@ -189,6 +194,25 @@ def main() -> None:
     print(format_summary(results))
     if render_dir is not None:
         print(f"Gantts written to {render_dir}")
+
+    if args.profile_inference:
+        print("\nInference timing per agent (agent.act() wall time):")
+        header = (
+            f"  {'agent':<14} {'n_calls':>8} "
+            f"{'mean (ms)':>12} {'std (ms)':>12} "
+            f"{'min (ms)':>12} {'max (ms)':>12} "
+            f"{'total (s)':>12}"
+        )
+        print(header)
+        for r in sorted(results, key=lambda x: x.act_summary()["mean"]):
+            a = r.act_summary()
+            total_s = a["mean"] * a["n"]
+            print(
+                f"  {r.agent_name:<14} {int(a['n']):>8d} "
+                f"{a['mean'] * 1000:>12.4f} {a['std'] * 1000:>12.4f} "
+                f"{a['min'] * 1000:>12.4f} {a['max'] * 1000:>12.4f} "
+                f"{total_s:>12.4f}"
+            )
 
 
 if __name__ == "__main__":

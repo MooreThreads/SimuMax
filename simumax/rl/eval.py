@@ -14,6 +14,7 @@ same per-episode disturbance / seq-len draws — apples-to-apples.
 from __future__ import annotations
 
 import statistics
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,7 @@ class EvalResult:
     iter_times: list[float]
     pp_utilizations: list[float] = field(default_factory=list)
     mfus: list[float] = field(default_factory=list)
+    act_times: list[float] = field(default_factory=list)
 
     def _stats(self, values: list[float]) -> dict[str, float]:
         n = len(values)
@@ -54,18 +56,24 @@ class EvalResult:
     def mfu_summary(self) -> dict[str, float]:
         return self._stats(self.mfus)
 
+    def act_summary(self) -> dict[str, float]:
+        return self._stats(self.act_times)
+
 
 def _run_episode(
     env: PipelineSchedulingEnv, agent, max_steps: int
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, list[float]]:
     # First reset on a fresh env pulls seed from env_config; subsequent
     # resets advance np_random naturally.
     obs, info = env.reset()
     agent.reset()
     terminated = truncated = False
     steps = 0
+    act_times: list[float] = []
     while not (terminated or truncated):
+        t0 = time.perf_counter()
         action = agent.act(obs, info["action_mask"])
+        act_times.append(time.perf_counter() - t0)
         obs, _reward, terminated, truncated, info = env.step(action)
         steps += 1
         if steps > max_steps:
@@ -78,6 +86,7 @@ def _run_episode(
         float(info["iter_time"]),
         float(info["pp_utilization"]),
         float(info["mfu"]),
+        act_times,
     )
 
 
@@ -135,13 +144,15 @@ def evaluate(
             iter_times: list[float] = []
             pp_utilizations: list[float] = []
             mfus: list[float] = []
+            act_times: list[float] = []
             for ep in range(n_episodes):
                 if pbar is not None:
                     pbar.set_postfix_str(f"{name} ep{ep}")
-                t, u, mfu = _run_episode(env, agent, max_steps)
+                t, u, mfu, ep_act_times = _run_episode(env, agent, max_steps)
                 iter_times.append(t)
                 pp_utilizations.append(u)
                 mfus.append(mfu)
+                act_times.extend(ep_act_times)
                 if render_dir is not None or display:
                     out_path: Optional[str] = None
                     if render_dir is not None:
@@ -160,6 +171,7 @@ def evaluate(
                     iter_times=iter_times,
                     pp_utilizations=pp_utilizations,
                     mfus=mfus,
+                    act_times=act_times,
                 )
             )
     return results
