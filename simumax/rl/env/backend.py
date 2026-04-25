@@ -28,7 +28,7 @@ from simumax.core.config import (
     StrategyConfig,
     SystemConfig,
 )
-from simumax.core.perf_llm import PerfLLM
+from simumax.core.perf_llm import FIRST_CHUNK, LAST_CHUNK, MIDDLE_CHUNK, PerfLLM
 
 
 @dataclass(frozen=True)
@@ -86,6 +86,35 @@ class SimuMaxBackend:
 
         self._perf = perf
 
+        # Precompute MFU constants — mirrors perf_llm.py:2596-2620 but pulls
+        # the schedule-dependent term (PP iter time) from the RL env at episode
+        # end. dp_optim_per_chunk and theory_flops_per_token are constant for
+        # a fixed (model, strategy, system); accelerator_tflops likewise.
+        pp_size = perf.strategy.pp_size
+        chunks = [FIRST_CHUNK]
+        if pp_size > 2:
+            chunks.append(MIDDLE_CHUNK)
+        if pp_size > 1:
+            chunks.append(LAST_CHUNK)
+        self._dp_optim_per_chunk = tuple(
+            float(perf._compute_dp_time(c)["dp_comm_exposed_time"])
+            + float(perf._compute_optim_time(c)["optim_exposed_time"])
+            for c in chunks
+        )
+        self._max_dp_optim = max(self._dp_optim_per_chunk)
+        self._flops_per_token = float(
+            perf.model_config.flops_per_token(
+                context_seq_len=perf.strategy.seq_len, with_attn=True
+            )
+        )
+        self._accelerator_tflops = float(perf.system.accelerator.op["default"].tflops)
+        self._world_size = int(perf.strategy.world_size)
+        self._dp_size = int(perf.strategy.dp_size)
+        self._micro_batch_size = int(perf.strategy.micro_batch_size)
+        self._nominal_seq_len = int(perf.strategy.seq_len)
+        self._nominal_global_batch_size = int(perf.strategy.global_batch_size)
+        self._seq_len_std = float(perf.disturbance.seq_len_std)
+
     @property
     def perf(self) -> PerfLLM:
         return self._perf
@@ -102,6 +131,30 @@ class SimuMaxBackend:
     @property
     def num_microbatches(self) -> int:
         return self._perf.strategy.micro_batch_num
+
+    def compute_mfu(self, pp_time: float, seq_lens: np.ndarray) -> float:
+        """MFU for an episode given its scheduled PP iter time.
+
+        Mirrors ``PerfLLM._analysis_single_iter_cost_impl`` (perf_llm.py:2606-2620):
+        the static analysis runs ``_compute_pp_total_time()`` to get the PP-only
+        iteration time and adds a fixed DP+optim overhead per chunk; we use the
+        env's ``current_time`` as that PP-only term instead. ``final_duration =
+        pp_time + max_dp_optim`` because ``pp_time`` is shared across chunks, so
+        the per-chunk max collapses to a single addition.
+
+        Returns 0.0 for non-positive durations to mirror the upstream guard.
+        """
+        if pp_time <= 0.0:
+            return 0.0
+        duration_ms = pp_time + self._max_dp_optim
+        if self._seq_len_std > 0.0:
+            tokens_per_mb_slot = int(seq_lens.sum()) * self._micro_batch_size
+            tokens_per_iter = tokens_per_mb_slot * self._dp_size
+        else:
+            tokens_per_iter = self._nominal_seq_len * self._nominal_global_batch_size
+        theory_flops = self._flops_per_token * tokens_per_iter // self._world_size
+        tflops = theory_flops / (duration_ms / 1000.0) / 1e12
+        return float(tflops / self._accelerator_tflops)
 
     def sample_episode(self, seed: Optional[int] = None) -> EpisodeData:
         """Re-sample stochastic inputs and return a frozen duration table.

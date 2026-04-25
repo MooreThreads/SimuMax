@@ -31,6 +31,7 @@ class EvalResult:
     agent_name: str
     iter_times: list[float]
     pp_utilizations: list[float] = field(default_factory=list)
+    mfus: list[float] = field(default_factory=list)
 
     def _stats(self, values: list[float]) -> dict[str, float]:
         n = len(values)
@@ -50,10 +51,13 @@ class EvalResult:
     def utilization_summary(self) -> dict[str, float]:
         return self._stats(self.pp_utilizations)
 
+    def mfu_summary(self) -> dict[str, float]:
+        return self._stats(self.mfus)
+
 
 def _run_episode(
     env: PipelineSchedulingEnv, agent, max_steps: int
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     # First reset on a fresh env pulls seed from env_config; subsequent
     # resets advance np_random naturally.
     obs, info = env.reset()
@@ -70,7 +74,11 @@ def _run_episode(
                 f"without terminating — likely a schedule bug."
             )
             raise RuntimeError(msg)
-    return float(info["iter_time"]), float(info["pp_utilization"])
+    return (
+        float(info["iter_time"]),
+        float(info["pp_utilization"]),
+        float(info["mfu"]),
+    )
 
 
 def evaluate(
@@ -126,12 +134,14 @@ def evaluate(
             env = PipelineSchedulingEnv(agent_env_config, backend=backend)
             iter_times: list[float] = []
             pp_utilizations: list[float] = []
+            mfus: list[float] = []
             for ep in range(n_episodes):
                 if pbar is not None:
                     pbar.set_postfix_str(f"{name} ep{ep}")
-                t, u = _run_episode(env, agent, max_steps)
+                t, u, mfu = _run_episode(env, agent, max_steps)
                 iter_times.append(t)
                 pp_utilizations.append(u)
+                mfus.append(mfu)
                 if render_dir is not None or display:
                     out_path: Optional[str] = None
                     if render_dir is not None:
@@ -139,7 +149,7 @@ def evaluate(
                         out_path = str(render_dir / f"{name}_ep{ep:03d}.png")
                     env.render(
                         out_path,
-                        title=f"{name} ep {ep} (t={t:.6f}s, u={u:.4f})",
+                        title=f"{name} ep {ep} (t={t:.6f}s, u={u:.4f}, mfu={mfu:.4f})",
                         display=display,
                     )
                 if pbar is not None:
@@ -149,6 +159,7 @@ def evaluate(
                     agent_name=name,
                     iter_times=iter_times,
                     pp_utilizations=pp_utilizations,
+                    mfus=mfus,
                 )
             )
     return results
@@ -161,16 +172,21 @@ def format_summary(results: list[EvalResult]) -> str:
         f"{'iter mean (s)':>14} {'iter std':>14} "
         f"{'iter min':>14} {'iter max':>14} "
         f"{'util mean':>12} {'util std':>12} "
-        f"{'util min':>12} {'util max':>12}"
+        f"{'util min':>12} {'util max':>12} "
+        f"{'mfu mean':>12} {'mfu std':>12} "
+        f"{'mfu min':>12} {'mfu max':>12}"
     ]
     for r in ordered:
         s = r.summary()
         u = r.utilization_summary()
+        m = r.mfu_summary()
         lines.append(
             f"  {r.agent_name:<10} {int(s['n']):>4d} "
             f"{s['mean']:>14.6f} {s['std']:>14.6f} "
             f"{s['min']:>14.6f} {s['max']:>14.6f} "
             f"{u['mean']:>12.4f} {u['std']:>12.4f} "
-            f"{u['min']:>12.4f} {u['max']:>12.4f}"
+            f"{u['min']:>12.4f} {u['max']:>12.4f} "
+            f"{m['mean']:>12.4f} {m['std']:>12.4f} "
+            f"{m['min']:>12.4f} {m['max']:>12.4f}"
         )
     return "\n".join(lines)

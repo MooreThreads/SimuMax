@@ -223,6 +223,7 @@ class PipelineSchedulingEnv(gymnasium.Env):
         if terminated or truncated:
             info["iter_time"] = float(self._current_time)
             info["pp_utilization"] = self._compute_pp_utilization()
+            info["mfu"] = self._compute_mfu()
         return obs, reward, terminated, truncated, info
 
     def action_masks(self) -> NDArray[np.int8]:
@@ -363,6 +364,14 @@ class PipelineSchedulingEnv(gymnasium.Env):
                 gpu_end[g] = max(gpu_end[g], record["end_time"])
         return np.where(gpu_end > -np.inf, gpu_end - gpu_start, 0.0)
 
+    def _compute_mfu(self) -> float:
+        # Episode-level MFU: PP iter time from the agent's schedule combined
+        # with the constant DP+optim overhead and the episode's sampled
+        # seq_lens, mirroring PerfLLM.analysis_cost (perf_llm.py:2606-2620).
+        if self._episode is None:
+            _require_reset("_episode")
+        return self._backend.compute_mfu(self._current_time, self._episode.seq_lens)
+
     def _compute_pp_utilization(self) -> float:
         # Matches PerfLLM.analysis_cost's pp_utilization (perf_llm.py): both
         # divide Σ_r Σ_m disturbance-applied (f + b + w) by pp × makespan, so
@@ -387,6 +396,9 @@ class PipelineSchedulingEnv(gymnasium.Env):
 
         if self._reward_mode == RewardMode.BUBBLE:
             return -(pp * T - useful_work)
+
+        if self._reward_mode == RewardMode.MFU:
+            return self._compute_mfu()
 
         return useful_work / (pp * T) if T > 0.0 else 0.0
 

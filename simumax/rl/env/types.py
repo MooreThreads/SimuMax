@@ -22,3 +22,4 @@ class RewardMode(StrEnum):
     MAKESPAN = "makespan"
     BUBBLE = "bubble"
     UTILIZATION = "utilization"
+    MFU = "mfu"

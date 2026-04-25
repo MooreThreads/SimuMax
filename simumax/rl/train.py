@@ -24,7 +24,7 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 from simumax.rl.env.env import PipelineSchedulingEnv, RLEnvConfig
 from simumax.rl.feature_extractor import PipelineFeatureExtractor
 
-_EPISODE_INFO_KEYS = ("iter_time", "pp_utilization")
+_EPISODE_INFO_KEYS = ("iter_time", "pp_utilization", "mfu")
 
 
 def _linear_schedule(initial: float, final: float) -> Callable[[float], float]:
