@@ -3494,6 +3494,11 @@ class PerfLLM(PerfBase):
         all_search_result=None,
         save_path=None,
     ):
+        # Without this, ``is_recompute`` (config.py) returns False even when
+        # recompute_granularity + per-submodule flags are set, causing
+        # recompute_status to misreport "No Recompute" and saved configs to
+        # drop the recompute fields entirely.
+        self.strategy.enable_recompute = True
         self.strategy.recompute_granularity = "selective_recompute"
         accelerator_mem_gbytes = (
             self.system.accelerator.mem_gbs - gmi_error
@@ -3582,6 +3587,11 @@ class PerfLLM(PerfBase):
         Returns:
             dict: search result
         """
+        # Same reason as in search_best_selective_recompute: without this,
+        # is_recompute returns False and recompute_status misreports
+        # "No Recompute" even at recompute_layer_num > 0, breaking the
+        # save → reload round-trip for any combo where recompute is the winner.
+        self.strategy.enable_recompute = True
         accelerator_mem_gbytes = (
             self.system.accelerator.mem_gbs - gmi_error
         )  # gmi has 6 GB error
