@@ -3470,6 +3470,18 @@ class PerfLLM(PerfBase):
             "peak_mem_with_reserved": mem_result.data["peak_mem_with_reserved"]
             if "peak_mem_with_reserved" in mem_result.data
             else {s: v["peak_mem_with_reserved"] for s, v in mem_result.data.items()},
+            # Pipeline-split fields are not encoded in the parallelism string
+            # but are required to round-trip non-divisible-pp configs. We only
+            # surface them when the split is uneven; for divisible cases the
+            # in-memory value equals ceil(L/pp) on every stage and the saved
+            # JSON can omit it (the runtime takes the divisible branch and
+            # produces an identical layer distribution).
+            "num_layers_in_first_pipeline_stage":
+                self.strategy.num_layers_in_first_pipeline_stage,
+            "num_layers_in_last_pipeline_stage":
+                self.strategy.num_layers_in_last_pipeline_stage
+                if self.model_config.layer_num % self.strategy.pp_size != 0
+                else None,
         }
         return perf
 

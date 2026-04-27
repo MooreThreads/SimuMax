@@ -254,6 +254,14 @@ def build_strategy_json(best: dict) -> dict:
             strategy["mlp_recompute"] = recompute["mlp_recompute"]
             strategy["mlp_rms_recompute"] = recompute["mlp_rms_recompute"]
             strategy["recompute_variance"] = recompute["recompute_variance"]
+
+    # Carry over pipeline-split fields the search set when layer_num % pp != 0.
+    # Without these, reload of a non-divisible-pp config trips the strict
+    # divisibility assertion in get_num_layers_to_build (perf_llm.py).
+    if best.get("num_layers_in_first_pipeline_stage") is not None:
+        strategy["num_layers_in_first_pipeline_stage"] = best["num_layers_in_first_pipeline_stage"]
+    if best.get("num_layers_in_last_pipeline_stage") is not None:
+        strategy["num_layers_in_last_pipeline_stage"] = best["num_layers_in_last_pipeline_stage"]
     return strategy
 
 
