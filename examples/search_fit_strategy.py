@@ -7,7 +7,7 @@ micro_batch_num is chosen as close as possible to gbs_target / dp while respecti
 pipeline validity constraint (mbn >= pp). Combos whose effective gbs would drift beyond
 GBS_RELAX_FACTOR away from the target are dropped.
 
-Output: configs/strategy/<model_name>_optimal.json, matching the StrategyConfig schema.
+Output: configs/strategy/<model_name>_optimal_mfu.json, matching the StrategyConfig schema.
 """
 import argparse
 import json
@@ -43,11 +43,37 @@ SMALL_THRESHOLD_B = 80.0
 LARGE_THRESHOLD_B = 300.0
 
 TP_CANDIDATES = [1, 2, 4, 8]
-PP_CANDIDATES = [1, 2, 4, 8, 16, 32]
+PP_CANDIDATES = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 32]
 EP_CANDIDATES_MOE = [1, 2, 4, 8, 16, 32, 64]
 EP_CANDIDATES_DENSE = [1]
 DP_CANDIDATES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 RECOMPUTE_TYPES = ["no_recompute", "full_block", "selective_recompute"]
+
+# Skeleton strategy used to construct PerfLLM. The search overrides world_size,
+# tp/pp/ep, mbs, mbn, and recompute_* per combo, so the specific values here
+# don't matter as long as they form a valid StrategyConfig. Inlined to avoid a
+# disk dependency on configs/strategy_buggy/llama3_70b_optimal_mfu.json.
+TEMPLATE_STRATEGY = {
+    "seq_len": 4096,
+    "micro_batch_size": 1,
+    "micro_batch_num": 128,
+    "dtype": "bf16",
+    "world_size": 32,
+    "tp_size": 4,
+    "pp_size": 4,
+    "ep_size": 1,
+    "etp_size": 1,
+    "moe_dispatcher_policy": "all2all",
+    "enable_sequence_parallel": True,
+    "zero_state": 1,
+    "enable_dropout": False,
+    "use_fused_norm": True,
+    "use_math_sdp": False,
+    "use_flash_sdp": True,
+    "use_fp32_accum_grad": True,
+    "enable_recompute": False,
+    "mem_factor": 0.94,
+}
 
 
 def estimate_params_b(model_cfg: ModelConfig) -> float:
@@ -266,12 +292,9 @@ def build_strategy_json(best: dict) -> dict:
 
 
 def make_perf_model(model_config_path: str, system_config_path: str) -> PerfLLM:
-    # Any valid StrategyConfig works as a skeleton — search overrides world_size, tp/pp/ep,
-    # mbs, mbn, and recompute_* per combo. Pick an existing file from configs/strategy/.
-    template_path = RELEASE_STRATEGY["llama3_70b_optimal_mfu"]
     perf = PerfLLM()
     perf.configure(
-        strategy_config=StrategyConfig.init_from_config_file(template_path),
+        strategy_config=StrategyConfig.init_from_dict(TEMPLATE_STRATEGY),
         model_config=ModelConfig.init_from_config_file(model_config_path),
         system_config=SystemConfig.init_from_config_file(system_config_path),
     )
@@ -399,7 +422,7 @@ def main():
 
         # Use the stored model_name from the config for the filename (e.g., "deepseek_r1").
         mcfg = ModelConfig.init_from_config_file(model_path)
-        out_name = f"{mcfg.model_name}_optimal.json"
+        out_name = f"{mcfg.model_name}_optimal_mfu.json"
         out_path = os.path.join(strategy_dir, out_name)
 
         strategy_json = build_strategy_json(best)
