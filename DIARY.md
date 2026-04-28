@@ -132,3 +132,10 @@
   `base_op_slowdown_max_count`, …) so each file is self-describing for
   re-plotting without joining the manifest.
   what the B/W-split env naturally enables).
+
+
+  uv run python scripts/plot.py nominal --results-dir results/h100_nvlink --figs-dir paper/figs
+
+  uv run python scripts/plot.py ablation --results-dir results/h100_nvlink --figs-dir paper/figs
+
+  uv run python scripts/plot.py scatter --results-dir results/h100_nvlink --figs-dir paper/figs
