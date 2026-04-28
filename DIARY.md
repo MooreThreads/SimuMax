@@ -30,12 +30,7 @@
 
   CLI: `examples/train_rl.py` wraps `simumax.rl.train.train`.
 
-    uv run python examples/train_rl.py \
-        --model llama3-70b \
-        --system h100_nvlink \
-        --training default \
-        --log-dir logs/rl_env \
-        --run-name my_run
+    uv run python examples/train_rl.py --model llama3-70b --system h100_nvlink --training default --log-dir logs/rl_env --run-name my_run
 
   `--strategy` defaults to `<model>_optimal_mfu` (with `-`/`.` → `_`);
   override explicitly when you want a non-optimal-MFU strategy.
@@ -60,10 +55,7 @@
 
   Static baselines only:
 
-    uv run python examples/eval_agents.py \
-        --model llama3-70b --system h100_nvlink \
-        --agents gpipe gpipe_overlap 1f1b 1f1b_overlap zb_h1 zb_h2 \
-        --n-episodes 20
+    uv run python examples/eval_agents.py --model llama3-70b --system h100_nvlink --agents gpipe gpipe_overlap 1f1b 1f1b_overlap zb_h1 zb_h2 --n-episodes 20
 
   Mix in a trained PPO checkpoint (label can be anything not clashing
   with a built-in static agent); repeat `--ppo-checkpoint` for more:
@@ -136,6 +128,9 @@
 
   uv run python scripts/plot.py nominal --results-dir results/h100_nvlink --figs-dir paper/figs
 
+  uv run python scripts/plot.py baseline --results-dir results/h100_nvlink --figs-dir paper/figs
+
   uv run python scripts/plot.py ablation --results-dir results/h100_nvlink --figs-dir paper/figs
 
   uv run python scripts/plot.py scatter --results-dir results/h100_nvlink --figs-dir paper/figs
+

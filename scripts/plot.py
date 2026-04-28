@@ -510,6 +510,93 @@ def plot_ablation_for_cell(data: SweepData,
 
 
 # ----------------------------------------------------------------------------
+# Figure: full-disturbance baseline MFU + PP utilization, clustered by model.
+# ----------------------------------------------------------------------------
+
+def plot_baseline_by_model(data: SweepData,
+                           args: argparse.Namespace) -> None:
+    """Two-panel grouped bar chart under the full-disturbance baseline.
+
+    Mirrors ``plot_nominal_by_model`` (same model order, same schedule
+    legend, same colors) but heights are the mean over episodes from
+    ``baseline_disturbed.parquet`` with ±1σ error bars; the underlying
+    disturbance profile is ``configs/disturbance/both.json``.
+    """
+    if data.baseline is None:
+        raise SystemExit(
+            "baseline figure requires baseline_disturbed.parquet."
+        )
+    df = data.baseline
+    models = _order_models(data, args)
+    schedules = data.schedules
+
+    # Aggregate per (model, schedule); std is NaN for groups of size 1.
+    agg = (df.groupby(["model", "pp_schedule"])[["mfu", "pp_utilization"]]
+              .agg(["mean", "std"]))
+
+    n_models = len(models)
+    n_sched = len(schedules)
+    cluster_span = 0.82
+    bar_width = cluster_span / n_sched
+    x = np.arange(n_models)
+
+    fig, axes = plt.subplots(
+        2, 1, figsize=(args.fig_width, args.fig_height),
+        sharex=True, gridspec_kw={"hspace": 0.18},
+    )
+
+    panel_specs = [
+        (axes[0], "mfu",            "MFU (%)",            "(a)"),
+        (axes[1], "pp_utilization", "PP utilization (%)", "(b)"),
+    ]
+    for ax, col, ylabel, panel in panel_specs:
+        for i, sched in enumerate(schedules):
+            offsets = (i - (n_sched - 1) / 2) * bar_width
+            heights, errors = [], []
+            for model in models:
+                key = (model, sched)
+                if key in agg.index:
+                    mean_v = float(agg.loc[key, (col, "mean")]) * 100.0
+                    std_raw = agg.loc[key, (col, "std")]
+                    std_v = (0.0 if pd.isna(std_raw)
+                             else float(std_raw) * 100.0)
+                else:
+                    mean_v, std_v = np.nan, 0.0
+                heights.append(mean_v)
+                errors.append(std_v)
+            ax.bar(
+                x + offsets, heights, width=bar_width,
+                color=SCHEDULE_COLORS[sched],
+                edgecolor="white", linewidth=0.6,
+                yerr=errors,
+                error_kw={"elinewidth": 0.6, "capsize": 1.5,
+                          "ecolor": "#222222", "alpha": 0.75},
+                label=SCHEDULE_LABELS[sched],
+            )
+        ax.set_ylabel(ylabel)
+        ax.set_ylim(0, 100)
+        ax.set_yticks(np.arange(0, 101, 20))
+        ax.grid(axis="y", which="major")
+        ax.tick_params(axis="x", length=0)
+        ax.text(
+            -0.045, 1.02, panel, transform=ax.transAxes,
+            fontsize=9, fontweight="bold", va="bottom", ha="left",
+        )
+
+    axes[-1].set_xticks(x)
+    axes[-1].set_xticklabels(models, rotation=40, ha="right")
+    axes[-1].set_xlabel("Model")
+
+    axes[0].legend(
+        ncol=n_sched, loc="lower center",
+        bbox_to_anchor=(0.5, 1.08), frameon=False,
+        columnspacing=1.6, handlelength=1.6, handletextpad=0.5,
+    )
+
+    _save_figure(fig, "baseline_by_model", args)
+
+
+# ----------------------------------------------------------------------------
 # Figure: nominal-vs-disturbed scatter (PP utilization × MFU), per model.
 # ----------------------------------------------------------------------------
 
@@ -649,6 +736,7 @@ class FigureSpec:
 
 FIGURES: Dict[str, FigureSpec] = {
     "nominal":  FigureSpec(plot_nominal_by_model),
+    "baseline": FigureSpec(plot_baseline_by_model, needs_baseline=True),
     "ablation": FigureSpec(plot_ablation_for_cell,
                            needs_ablations=ABLATION_AXES),
     "scatter":  FigureSpec(plot_nominal_vs_disturbed_scatter,
@@ -692,6 +780,15 @@ def parse_args() -> argparse.Namespace:
              "utilization (clustered by model, one bar per schedule).",
     )
     _add_common_args(p_nom)
+
+    p_base = sub.add_parser(
+        "baseline",
+        help="Two-panel grouped bar chart under the full-disturbance "
+             "baseline (configs/disturbance/both.json), clustered by "
+             "model, one bar per schedule. Mirrors `nominal` but uses "
+             "baseline_disturbed.parquet (mean ± 1σ over episodes).",
+    )
+    _add_common_args(p_base)
 
     p_abl = sub.add_parser(
         "ablation",

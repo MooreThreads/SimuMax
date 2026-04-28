@@ -3,7 +3,7 @@
     "op_duration_std": 0.05,
     "stage_slowdown_prob": 0.5,
     "stage_slowdown_k": 1.5,
-    "op_slowdown_prob": 0.02,
+    "op_slowdown_prob": 0.10,
     "op_slowdown_k": 3.0,
     "op_slowdown_max_count": 5
 }
