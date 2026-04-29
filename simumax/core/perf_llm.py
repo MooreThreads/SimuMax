@@ -23,6 +23,7 @@ from simumax.core.config import (
 )
 from simumax.core.base_struct import InputOutputInfo, TensorSize, Result
 from simumax.core.transformer.language_model import LLMModel, PeakPoint
+from simumax.core.memory_tracker import ActivationTracker
 from simumax.core.gantt import GanttBar, plot_gantt
 from simumax.core.graph import SimuONNXGraphBuilder, visualize_with_graphviz
 from simumax.core.utils import (
@@ -1006,7 +1007,19 @@ class PerfLLM(PerfBase):
         self,
         micro_batch_num,
         model_name=FIRST_CHUNK,
+        peak_mem_override=None,
     ):
+        """Build the per-stage memory report dict.
+
+        ``peak_mem_override`` is the schedule-aware total peak memory
+        (already including ``model_mem`` and intra-mb peaks) produced by
+        the tracker walk in ``analysis_mem``. When provided it replaces
+        the legacy 1F1B-only formula
+        ``model_mem + (micro_batch_num - 1) * cache + intra_peak`` for
+        the ``peak_mem`` field. The ``micro_batch_num`` argument is then
+        only used for the diagnostic ``cached_micro_batch_num`` field
+        (kept for compatibility with downstream consumers).
+        """
         result = {}
         model_info = self.model_chunk_dict[model_name].get_model_info()
 
@@ -1057,22 +1070,32 @@ class PerfLLM(PerfBase):
         result["model_mem_detail"] = dict(dense=dense_model_mem, moe=moe_model_mem)
         # result["with_recompute"] = self.strategy.enable_recompute
 
-        # -------------------------- 2. compute peak activation in 1F1B--------------------------
+        # -------------------------- 2. compute peak activation --------------------------
         cur_act_info: PeakPoint = self.pp_state_peak_point[model_name]
         result["fwd_activation_cache_per_micro_batch"] = (
             f"{cur_act_info.activation_mem_cache / 1024 / 1024 / 1024:.4f} GB"
         )
-        result["peak_activation_mem_in_1F1B"] = cur_act_info.peak_mem
+        # Renamed from ``peak_activation_mem_in_1F1B``: the field has always
+        # been the per-chunk intra-mb peak (worst of fwd / bwd / recomp),
+        # not literally the 1F1B-specific value. Kept under the new name
+        # to reflect what it actually is.
+        result["peak_activation_mem"] = cur_act_info.peak_mem
         model_mem = result["model_mem"]
 
         # -------------------------- 3. compute total peak peak mem --------------------------
-        # result["fwd_peak_allocated_mem"] = cur_act_info.fwd_peak_mem
-        # result["bwd_peak_allocated_mem"] = max(cur_act_info.bwd_peak_mem, cur_act_info.recomp_fwd_peak_mem, cur_act_info.recomp_bwd_peak_mem)
-        result["peak_mem"] = (
-            model_mem
-            + (micro_batch_num - 1) * cur_act_info.activation_mem_cache
-            + result["peak_activation_mem_in_1F1B"]
-        )
+        if peak_mem_override is not None:
+            # Schedule-aware path: the tracker walk has already produced
+            # the per-stage GPU peak (model_mem + max-over-time(live + intra)).
+            result["peak_mem"] = peak_mem_override
+        else:
+            # Legacy 1F1B-only fallback. Used for ``pp_size == 1`` and
+            # for V-shaped schedules (``interleaved_1f1b``, ``zb_v``)
+            # where the schedule-aware walker is not yet wired in.
+            result["peak_mem"] = (
+                model_mem
+                + (micro_batch_num - 1) * cur_act_info.activation_mem_cache
+                + result["peak_activation_mem"]
+            )
         result["peak_mem_with_reserved"] = result["peak_mem"] / self.strategy.mem_factor
 
         result["memory_reserved_ratio"] = str(self.strategy.mem_factor)
@@ -1083,29 +1106,183 @@ class PerfLLM(PerfBase):
         convert_final_result_to_human_format(result)
         return result
 
+    def _chunk_for_rank(self, rank: int) -> str:
+        """Chunk type living on physical rank ``rank``.
+
+        Mirrors the existing ``analysis_mem`` convention: rank 0 hosts
+        the embedding-bearing first chunk, rank ``pp-1`` hosts the LM
+        head's last chunk, intermediate ranks host middle chunks. For
+        ``pp == 1`` a single first chunk holds the whole model.
+        """
+        pp = self.strategy.pp_size
+        if pp == 1 or rank == 0:
+            return FIRST_CHUNK
+        if rank == pp - 1:
+            return LAST_CHUNK
+        return MIDDLE_CHUNK
+
+    def _model_mem_for_chunk(self, chunk_name: str) -> float:
+        """Total resident model memory for ``chunk_name`` in bytes.
+
+        Sum of weight + grad (halved when ``grad_reduce_in_bf16``) +
+        sharded optim state, dense plus MoE. Matches the figure
+        ``_analysis_mem_impl`` already builds, lifted out so the tracker
+        walk can read it without rerunning the per-chunk logic.
+        """
+        info = self.model_chunk_dict[chunk_name].get_model_info()
+        dense_grad = info.dense_grad_bytes
+        moe_grad = info.moe_grad_bytes
+        if self.strategy.grad_reduce_in_bf16:
+            dense_grad = dense_grad / 2
+            moe_grad = moe_grad / 2
+        return (
+            info.dense_weight_bytes
+            + dense_grad
+            + info.dense_state_bytes
+            + info.moe_weight_bytes
+            + moe_grad
+            + info.moe_state_bytes
+        )
+
+    def _collect_stage_mem_constants(self):
+        """Per-rank ``(act_per_mb, peak_intra_mb, model_mem)`` arrays.
+
+        Each rank's constants come from the chunk type that lives there.
+        The physical-rank schedule walker uses these directly; the env
+        side reads the same arrays via the backend so static and live
+        memory accounting stay in sync.
+        """
+        pp = self.strategy.pp_size
+        act_per_mb = []
+        peak_intra_mb = []
+        model_mem_per_rank = []
+        for r in range(pp):
+            chunk = self._chunk_for_rank(r)
+            peak_point: PeakPoint = self.pp_state_peak_point[chunk]
+            act_per_mb.append(float(peak_point.activation_mem_cache))
+            peak_intra_mb.append(float(peak_point.peak_mem))
+            model_mem_per_rank.append(self._model_mem_for_chunk(chunk))
+        return act_per_mb, peak_intra_mb, model_mem_per_rank
+
+    def _walk_schedule_for_peak(self):
+        """Drive the tracker over ``self._last_schedules`` and return the
+        per-rank peak GPU memory in bytes.
+
+        Returns ``None`` for V-shaped schedules (``interleaved_1f1b``,
+        ``zb_v``) — the per-rank aggregation across virtual chunks is
+        not yet implemented and the caller falls back to the legacy
+        per-chunk-type formula. Also returns ``None`` if the schedule
+        cache has not been populated yet (no PP run was performed).
+
+        Sort order is by op end time so that on_F fires when an
+        activation enters the cache and on_W fires when it is released.
+        For schedules that fuse B and W into a single op
+        (``1f1b``, ``gpipe``), the B event triggers the activation
+        release; for split-backward schedules (``zb_h1``, ``zb_h2``) the
+        W event does the release and B is a no-op for memory.
+        """
+        schedule = self.pp_scheduling.pp_schedule
+        if schedule in ("interleaved_1f1b", "zb_v"):
+            # Per-rank aggregation across virtual chunks lives in a
+            # later phase. Caller falls back to the legacy formula,
+            # which is anyway 1F1B-flavored and therefore conservative
+            # for these schedules' steady state.
+            return None
+        if self._last_schedules is None:
+            # ``run_estimate`` only populates per-chunk ``pp_state_peak_point``;
+            # the schedule cache is populated lazily by ``_compute_pp_total_time``
+            # (called from ``analysis_cost`` / ``draw_pp_gantt``). For callers
+            # that go straight from ``run_estimate`` to ``analysis_mem`` (e.g.
+            # search), trigger the schedule walk on demand. Cheap relative to
+            # the full perf pass and idempotent — subsequent calls reuse the
+            # populated cache.
+            self._compute_pp_total_time(draw=False)
+
+        pp = self.strategy.pp_size
+        act, intra, model_mem = self._collect_stage_mem_constants()
+        nominal_seq_len = self._nominal_seq_len_for_mem()
+        if self.seq_lens is not None:
+            seq_lens = self.seq_lens
+        else:
+            mbc = self.strategy.micro_batch_num
+            seq_lens = np.full(mbc, self.strategy.seq_len, dtype=np.int64)
+
+        tracker = ActivationTracker(
+            num_stages=pp,
+            act_per_mb_nominal=act,
+            peak_intra_mb_per_stage=intra,
+            model_mem_per_stage=model_mem,
+            nominal_seq_len=nominal_seq_len,
+        )
+
+        fused_backward = schedule in ("1f1b", "gpipe")
+
+        # Collect (end_time, rank, kind, mb) and sort by end time. For
+        # ties (rare with float arithmetic but possible), break by
+        # (rank, kind) so ordering stays deterministic across runs.
+        events = []
+        for rank, rank_tasks in enumerate(self._last_schedules):
+            for t in rank_tasks:
+                # Physical-rank tuple: (kind, mb, start, dur, end).
+                kind, mb, _start, _dur, end = t
+                events.append((end, rank, kind, mb))
+        events.sort(key=lambda e: (e[0], e[1], e[2]))
+
+        for _end_t, rank, kind, mb in events:
+            s = int(seq_lens[mb])
+            if kind == "F":
+                tracker.on_F(rank, mb, s)
+            elif kind == "W" or (kind == "B" and fused_backward):
+                tracker.on_W(rank, mb)
+            # else: B in split-backward — activation stays cached
+            # until the matching W fires.
+        return tracker.peak()
+
     def analysis_mem(self):
         """Based the simulation result, analyze the memory usage"""
-        if self.strategy.pp_size == 1:
-            result = self._analysis_mem_impl(micro_batch_num=1, model_name=FIRST_CHUNK)
-        elif self.strategy.pp_size == 2:
-            # add more condition here to ensure the correctness the order of pp stage in result
+        pp = self.strategy.pp_size
+        if pp == 1:
+            return Result(
+                self._analysis_mem_impl(micro_batch_num=1, model_name=FIRST_CHUNK)
+            )
+
+        peak_per_rank = self._walk_schedule_for_peak()  # None on V-shaped
+        # Pick a representative middle rank (any non-edge rank works for
+        # symmetric schedules; we use 1 to keep the report close to the
+        # rank that first hits steady state).
+        middle_rank = 1 if pp > 2 else None
+
+        def _peak_for(rank):
+            return peak_per_rank[rank] if peak_per_rank is not None else None
+
+        if pp == 2:
             result = {"first_stage": {}, "last_stage": {}}
             result["first_stage"] = self._analysis_mem_impl(
-                micro_batch_num=self.strategy.pp_size, model_name=FIRST_CHUNK
-            )  # The 0th stage, here should be the corresponding 1F1B, the ac of stage1 needs to hold pp_size mbs (micro batch size)
-            result["last_stage"] = self._analysis_mem_impl(
-                micro_batch_num=1, model_name=LAST_CHUNK
+                micro_batch_num=pp,
+                model_name=FIRST_CHUNK,
+                peak_mem_override=_peak_for(0),
             )
-        elif self.strategy.pp_size > 2:
+            result["last_stage"] = self._analysis_mem_impl(
+                micro_batch_num=1,
+                model_name=LAST_CHUNK,
+                peak_mem_override=_peak_for(pp - 1),
+            )
+        else:  # pp > 2
             result = {"first_stage": {}, "middle_stage": {}, "last_stage": {}}
             result["first_stage"] = self._analysis_mem_impl(
-                micro_batch_num=self.strategy.pp_size, model_name=FIRST_CHUNK
-            )  # The 0th stage, here should be the corresponding 1F1B, the ac of stage1 needs to hold pp_size mbs (micro batch size)
+                micro_batch_num=pp,
+                model_name=FIRST_CHUNK,
+                peak_mem_override=_peak_for(0),
+            )
             result["middle_stage"] = self._analysis_mem_impl(
-                micro_batch_num=self.strategy.pp_size - 1, model_name=MIDDLE_CHUNK
-            )  # The first stage, here should be the corresponding 1F1B, the ac of stage2 needs to hold pp_size-1 mbs (micro batch size)
+                micro_batch_num=pp - 1,
+                model_name=MIDDLE_CHUNK,
+                peak_mem_override=_peak_for(middle_rank),
+            )
             result["last_stage"] = self._analysis_mem_impl(
-                micro_batch_num=1, model_name=LAST_CHUNK
+                micro_batch_num=1,
+                model_name=LAST_CHUNK,
+                peak_mem_override=_peak_for(pp - 1),
             )
         return Result(result)
 

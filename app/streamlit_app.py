@@ -814,7 +814,7 @@ def main():
 
                             with mem_col1:
                                 st.metric("Forward Activation Memory (Per Batch)", f"{mem_result['fwd_activation_cache_per_micro_batch']}")
-                                st.metric("1F1B Peak Activation Memory (Per Batch)", f"{mem_result['peak_activation_mem_in_1F1B']}")
+                                st.metric("Peak Activation Memory (Per Batch)", f"{mem_result['peak_activation_mem']}")
 
                             with mem_col2:
                                 st.metric("Model Memory", f"{mem_result['model_mem']}")

@@ -17,12 +17,28 @@ import re
 import sys
 from contextlib import contextmanager
 
-from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.config import (
+    ModelConfig,
+    PipelineScheduleConfig,
+    StrategyConfig,
+    SystemConfig,
+)
 from simumax.core.perf_llm import PerfLLM
 from simumax.utils import (
     RELEASE_MODELS,
     RELEASE_STRATEGY,
+    get_simu_pp_scheduling_config,
     get_simu_system_config,
+)
+
+
+SUPPORTED_SCHEDULES = (
+    "1f1b",
+    "gpipe",
+    "zb_h1",
+    "zb_h2",
+    "interleaved_1f1b",
+    "zb_v",
 )
 
 
@@ -291,12 +307,22 @@ def build_strategy_json(best: dict) -> dict:
     return strategy
 
 
-def make_perf_model(model_config_path: str, system_config_path: str) -> PerfLLM:
+def make_perf_model(
+    model_config_path: str,
+    system_config_path: str,
+    pp_scheduling_config_path: str | None = None,
+) -> PerfLLM:
     perf = PerfLLM()
+    pp_scheduling = (
+        PipelineScheduleConfig.init_from_config_file(pp_scheduling_config_path)
+        if pp_scheduling_config_path is not None
+        else None
+    )
     perf.configure(
         strategy_config=StrategyConfig.init_from_dict(TEMPLATE_STRATEGY),
         model_config=ModelConfig.init_from_config_file(model_config_path),
         system_config=SystemConfig.init_from_config_file(system_config_path),
+        pp_scheduling_config=pp_scheduling,
     )
     # Align with megatron defaults as done in llm_search.py (affects MoE capacity modeling).
     perf.model_config.moe_pad_expert_input_to_capacity = True
@@ -310,8 +336,10 @@ def make_perf_model(model_config_path: str, system_config_path: str) -> PerfLLM:
 
 def search_for_model(model_name: str, model_config_path: str, system_config_path: str,
                      gbs_target: int, max_world: int, verbose: bool = False,
-                     relax_factor: float = GBS_RELAX_FACTOR):
-    perf = make_perf_model(model_config_path, system_config_path)
+                     relax_factor: float = GBS_RELAX_FACTOR,
+                     pp_scheduling_config_path: str | None = None):
+    perf = make_perf_model(model_config_path, system_config_path,
+                           pp_scheduling_config_path)
     mcfg = perf.model_config
 
     best_overall = {}
@@ -330,7 +358,8 @@ def search_for_model(model_name: str, model_config_path: str, system_config_path
 
         # Fresh PerfLLM per combo: the search mutates strategy fields (and resets
         # recompute_layer_num on exit), so isolating avoids state leak.
-        perf = make_perf_model(model_config_path, system_config_path)
+        perf = make_perf_model(model_config_path, system_config_path,
+                               pp_scheduling_config_path)
         all_search_result = {}
 
         def _run():
@@ -392,10 +421,17 @@ def main():
     parser.add_argument("--exact-gbs", action="store_true",
                         help="Require gbs_eff == gbs_target exactly (relax_factor=1.0). "
                              "By default, accepts combos within [gbs/2, gbs*2].")
+    parser.add_argument("--schedule", default="1f1b",
+                        choices=SUPPORTED_SCHEDULES,
+                        help="Pipeline schedule under which the strategy will run. "
+                             "The fit gate uses schedule-aware peak memory, so "
+                             "different schedules yield different optimal strategies. "
+                             "Default '1f1b' reproduces the legacy behavior.")
     args = parser.parse_args()
     relax_factor = 1.0 if args.exact_gbs else GBS_RELAX_FACTOR
 
     system_config_path = get_simu_system_config(args.system)
+    pp_scheduling_config_path = get_simu_pp_scheduling_config(args.schedule)
 
     # Output directory: same as where configs/strategy/ lives in the repo.
     strategy_dir = args.output_dir or RELEASE_STRATEGY["root"]
@@ -412,17 +448,23 @@ def main():
         mcfg = ModelConfig.init_from_config_file(model_path)
         gbs_target = args.gbs if args.gbs is not None else auto_gbs(mcfg)
         max_world = args.max_world if args.max_world is not None else auto_max_world(mcfg)
-        print(f"\n=== {model_name} (params≈{estimate_params_b(mcfg):.0f}B, gbs={gbs_target}, max_world={max_world}) ===")
+        print(f"\n=== {model_name} (params≈{estimate_params_b(mcfg):.0f}B, gbs={gbs_target}, max_world={max_world}, schedule={args.schedule}) ===")
         best = search_for_model(model_name, model_path, system_config_path,
                                 gbs_target=gbs_target, max_world=max_world,
-                                verbose=args.verbose, relax_factor=relax_factor)
+                                verbose=args.verbose, relax_factor=relax_factor,
+                                pp_scheduling_config_path=pp_scheduling_config_path)
         if not best:
             summary.append((model_name, None, "no-fit"))
             continue
 
-        # Use the stored model_name from the config for the filename (e.g., "deepseek_r1").
+        # Schedule-suffixed filename. Even for ``--schedule 1f1b`` the new
+        # output goes to ``*_optimal_mfu_1f1b.json`` rather than silently
+        # overwriting the existing ``*_optimal_mfu.json`` release artifacts
+        # (see ``Schedule_Aware_Memory_Plan.md`` §5.5.3 / §7.1). The user
+        # promotes a fresh result to the unsuffixed filename by hand once
+        # the anti-regression check has passed.
         mcfg = ModelConfig.init_from_config_file(model_path)
-        out_name = f"{mcfg.model_name}_optimal_mfu.json"
+        out_name = f"{mcfg.model_name}_optimal_mfu_{args.schedule}.json"
         out_path = os.path.join(strategy_dir, out_name)
 
         strategy_json = build_strategy_json(best)

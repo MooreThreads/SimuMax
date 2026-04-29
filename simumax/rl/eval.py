@@ -34,6 +34,11 @@ class EvalResult:
     pp_utilizations: list[float] = field(default_factory=list)
     mfus: list[float] = field(default_factory=list)
     act_times: list[float] = field(default_factory=list)
+    # Per-episode max-over-stages peak GPU memory in GB. Sourced from
+    # the env's ``ActivationTracker`` (``info["peak_mem_max_gb"]``);
+    # surfaces in ``format_summary`` so eval runs show how memory
+    # behaves alongside iter_time / mfu.
+    peak_mems_gb: list[float] = field(default_factory=list)
 
     def _stats(self, values: list[float]) -> dict[str, float]:
         n = len(values)
@@ -59,10 +64,13 @@ class EvalResult:
     def act_summary(self) -> dict[str, float]:
         return self._stats(self.act_times)
 
+    def peak_mem_summary(self) -> dict[str, float]:
+        return self._stats(self.peak_mems_gb)
+
 
 def _run_episode(
     env: PipelineSchedulingEnv, agent, max_steps: int
-) -> tuple[float, float, float, list[float]]:
+) -> tuple[float, float, float, float, list[float]]:
     # First reset on a fresh env pulls seed from env_config; subsequent
     # resets advance np_random naturally.
     obs, info = env.reset()
@@ -86,6 +94,7 @@ def _run_episode(
         float(info["iter_time"]),
         float(info["pp_utilization"]),
         float(info["mfu"]),
+        float(info["peak_mem_max_gb"]),
         act_times,
     )
 
@@ -144,14 +153,16 @@ def evaluate(
             iter_times: list[float] = []
             pp_utilizations: list[float] = []
             mfus: list[float] = []
+            peak_mems_gb: list[float] = []
             act_times: list[float] = []
             for ep in range(n_episodes):
                 if pbar is not None:
                     pbar.set_postfix_str(f"{name} ep{ep}")
-                t, u, mfu, ep_act_times = _run_episode(env, agent, max_steps)
+                t, u, mfu, peak_gb, ep_act_times = _run_episode(env, agent, max_steps)
                 iter_times.append(t)
                 pp_utilizations.append(u)
                 mfus.append(mfu)
+                peak_mems_gb.append(peak_gb)
                 act_times.extend(ep_act_times)
                 if render_dir is not None or display:
                     out_path: Optional[str] = None
@@ -172,6 +183,7 @@ def evaluate(
                     pp_utilizations=pp_utilizations,
                     mfus=mfus,
                     act_times=act_times,
+                    peak_mems_gb=peak_mems_gb,
                 )
             )
     return results
@@ -186,12 +198,15 @@ def format_summary(results: list[EvalResult]) -> str:
         f"{'util mean':>12} {'util std':>12} "
         f"{'util min':>12} {'util max':>12} "
         f"{'mfu mean':>12} {'mfu std':>12} "
-        f"{'mfu min':>12} {'mfu max':>12}"
+        f"{'mfu min':>12} {'mfu max':>12} "
+        f"{'mem mean (GB)':>14} {'mem std':>10} "
+        f"{'mem min':>10} {'mem max':>10}"
     ]
     for r in ordered:
         s = r.summary()
         u = r.utilization_summary()
         m = r.mfu_summary()
+        pm = r.peak_mem_summary()
         lines.append(
             f"  {r.agent_name:<10} {int(s['n']):>4d} "
             f"{s['mean']:>14.6f} {s['std']:>14.6f} "
@@ -199,6 +214,8 @@ def format_summary(results: list[EvalResult]) -> str:
             f"{u['mean']:>12.4f} {u['std']:>12.4f} "
             f"{u['min']:>12.4f} {u['max']:>12.4f} "
             f"{m['mean']:>12.4f} {m['std']:>12.4f} "
-            f"{m['min']:>12.4f} {m['max']:>12.4f}"
+            f"{m['min']:>12.4f} {m['max']:>12.4f} "
+            f"{pm['mean']:>14.4f} {pm['std']:>10.4f} "
+            f"{pm['min']:>10.4f} {pm['max']:>10.4f}"
         )
     return "\n".join(lines)

@@ -50,6 +50,23 @@ class EpisodeData:
     seq_lens: np.ndarray
 
 
+@dataclass(frozen=True)
+class StageMemConstants:
+    """Per-stage memory constants exported once at backend init.
+
+    The env's :class:`~simumax.core.memory_tracker.ActivationTracker` is
+    built from these on every ``reset()``; the static analyzer reads
+    the same arrays via :meth:`PerfLLM._collect_stage_mem_constants`,
+    so static and live memory accounting stay numerically aligned for
+    the same ``(strategy, schedule, seed)`` triple.
+    """
+
+    act_per_mb_nominal: tuple[float, ...]  # bytes
+    peak_intra_mb_per_stage: tuple[float, ...]  # bytes
+    model_mem_per_stage: tuple[float, ...]  # bytes
+    nominal_seq_len: int
+
+
 ConfigLike = Union[
     StrategyConfig,
     ModelConfig,
@@ -115,6 +132,19 @@ class SimuMaxBackend:
         self._nominal_global_batch_size = int(perf.strategy.global_batch_size)
         self._seq_len_std = float(perf.disturbance.seq_len_std)
 
+        # Per-rank memory constants. Read once at init: the chunk-type
+        # mapping (rank 0 -> first, rank pp-1 -> last, others -> middle)
+        # is fixed for the lifetime of the backend. Used by the env's
+        # tracker on every reset; the static analyzer reads the same
+        # arrays so the two paths agree numerically.
+        act, intra, model_mem = perf._collect_stage_mem_constants()
+        self._stage_mem = StageMemConstants(
+            act_per_mb_nominal=tuple(act),
+            peak_intra_mb_per_stage=tuple(intra),
+            model_mem_per_stage=tuple(model_mem),
+            nominal_seq_len=int(perf._nominal_seq_len_for_mem()),
+        )
+
     @property
     def perf(self) -> PerfLLM:
         return self._perf
@@ -131,6 +161,10 @@ class SimuMaxBackend:
     @property
     def num_microbatches(self) -> int:
         return self._perf.strategy.micro_batch_num
+
+    @property
+    def stage_mem(self) -> StageMemConstants:
+        return self._stage_mem
 
     def compute_mfu(self, pp_time: float, seq_lens: np.ndarray) -> float:
         """MFU for an episode given its scheduled PP iter time.

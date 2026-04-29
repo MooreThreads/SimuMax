@@ -24,7 +24,20 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 from simumax.rl.env.env import PipelineSchedulingEnv, RLEnvConfig
 from simumax.rl.feature_extractor import PipelineFeatureExtractor
 
-_EPISODE_INFO_KEYS = ("iter_time", "pp_utilization", "mfu")
+# Scalar episode-info keys auto-logged to tensorboard via SB3's
+# ``ep_info_buffer``. The memory keys come from the schedule-aware
+# tracker (Schedule_Aware_Memory_Plan §5.4.5) — only scalars belong
+# here; the full per-stage tuple is exposed under
+# ``info["peak_mem_per_stage"]`` for programmatic consumers.
+_EPISODE_INFO_KEYS = (
+    "iter_time",
+    "pp_utilization",
+    "mfu",
+    "peak_mem_max_gb",
+    "peak_mem_first_gb",
+    "peak_mem_middle_gb",
+    "peak_mem_last_gb",
+)
 
 
 def _linear_schedule(initial: float, final: float) -> Callable[[float], float]:

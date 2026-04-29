@@ -18,6 +18,7 @@ from numpy.typing import NDArray
 
 from simumax.core.config import DisturbanceConfig, ModelConfig, StrategyConfig, SystemConfig
 from simumax.core.gantt import GanttBar, plot_gantt
+from simumax.core.memory_tracker import ActivationTracker
 from simumax.rl.env.backend import ConfigLike, EpisodeData, SimuMaxBackend
 from simumax.rl.env.event_queue import CompletionEvent, EventQueue
 from simumax.rl.env.stage_mapping import StageMapping
@@ -118,6 +119,13 @@ class PipelineSchedulingEnv(gymnasium.Env):
         self._action_mask: Optional[NDArray[np.int8]] = None
         self._execution_log: list[dict[str, Any]] = []
         self._episode: Optional[EpisodeData] = None
+        # Per-episode peak-memory tracker. Built fresh on every reset;
+        # ``on_F`` / ``on_W`` fired from ``_dispatch_task`` /
+        # ``_advance_time``. Memory release follows the universal
+        # release-on-W rule (see ``ActivationTracker`` docstring) — for
+        # FUSED_BACKWARD agents the env still emits W as a separate
+        # task, so the same hook covers split and fused-backward agents.
+        self._mem_tracker: Optional[ActivationTracker] = None
 
     # ------------------------------------------------------------------
 
@@ -181,6 +189,15 @@ class PipelineSchedulingEnv(gymnasium.Env):
         ep_seed = int(self.np_random.integers(0, 2**31 - 1))
         self._episode = self._backend.sample_episode(seed=ep_seed)
 
+        mem_const = self._backend.stage_mem
+        self._mem_tracker = ActivationTracker(
+            num_stages=self._s,
+            act_per_mb_nominal=mem_const.act_per_mb_nominal,
+            peak_intra_mb_per_stage=mem_const.peak_intra_mb_per_stage,
+            model_mem_per_stage=mem_const.model_mem_per_stage,
+            nominal_seq_len=mem_const.nominal_seq_len,
+        )
+
         self._action_mask = self._compute_action_mask()
         obs = self._build_observation()
         info: dict[str, Any] = {"action_mask": self._action_mask.copy()}
@@ -224,6 +241,7 @@ class PipelineSchedulingEnv(gymnasium.Env):
             info["iter_time"] = float(self._current_time)
             info["pp_utilization"] = self._compute_pp_utilization()
             info["mfu"] = self._compute_mfu()
+            self._populate_memory_info(info)
         return obs, reward, terminated, truncated, info
 
     def action_masks(self) -> NDArray[np.int8]:
@@ -347,6 +365,16 @@ class PipelineSchedulingEnv(gymnasium.Env):
                     record["end_time"] = event.time
                     break
             task_graph.update_blocked_to_ready(event.task_index)
+            # Memory accounting: F-completion adds the activation to
+            # the live cache; W-completion releases it. B-completion is
+            # a no-op for memory because the saved input ``x`` is still
+            # needed by the matching W (chain rule for ``y = xW``).
+            mb, stage, op = task_graph.index_to_task(event.task_index)
+            if op == OpType.F:
+                seq_len = int(self._episode.seq_lens[mb])
+                self._mem_tracker.on_F(stage, mb, seq_len)
+            elif op == OpType.W:
+                self._mem_tracker.on_W(stage, mb)
 
         self._current_time = new_time
 
@@ -363,6 +391,35 @@ class PipelineSchedulingEnv(gymnasium.Env):
             if record["end_time"] is not None:
                 gpu_end[g] = max(gpu_end[g], record["end_time"])
         return np.where(gpu_end > -np.inf, gpu_end - gpu_start, 0.0)
+
+    def _populate_memory_info(self, info: dict[str, Any]) -> None:
+        """Surface the per-episode peak GPU memory in the env's ``info``.
+
+        Mirrors how ``mfu`` / ``pp_utilization`` are exposed: scalar
+        keys (``peak_mem_max_gb``, ``peak_mem_first_gb``, …) are picked
+        up by the SB3 ``ep_info_buffer`` and logged to tensorboard via
+        ``simumax/rl/train.py``'s ``_EPISODE_INFO_KEYS`` mechanism. The
+        full per-stage tuple is stashed under a non-scalar key for
+        programmatic consumers (eval scripts).
+
+        Per-stage memory is reported in the same units as the static
+        analyzer (bytes), then converted to GB for the scalar keys so
+        the tensorboard plots are directly comparable to device
+        capacity.
+        """
+        if self._mem_tracker is None:
+            _require_reset("_mem_tracker")
+        gb = 1024.0 ** 3
+        peak_per_stage = self._mem_tracker.peak()
+        info["peak_mem_per_stage"] = peak_per_stage
+        info["peak_mem_max_gb"] = max(peak_per_stage) / gb
+        if self._p >= 2:
+            info["peak_mem_first_gb"] = peak_per_stage[0] / gb
+            info["peak_mem_last_gb"] = peak_per_stage[self._p - 1] / gb
+            if self._p > 2:
+                # Pick rank 1 as the representative middle stage to match
+                # ``PerfLLM.analysis_mem``'s ``middle_stage`` reporting.
+                info["peak_mem_middle_gb"] = peak_per_stage[1] / gb
 
     def _compute_mfu(self) -> float:
         # Episode-level MFU: PP iter time from the agent's schedule combined

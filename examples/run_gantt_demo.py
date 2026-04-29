@@ -130,11 +130,23 @@ def main():
         perf_model.analysis(save_dir)
         iter_time = perf_model.draw_pp_gantt(output_path=args.output)
         out_path = args.output or PerfLLM.default_gantt_filename(schedule)
+        # ``analysis_mem`` triggers the schedule walk under the active
+        # ``pp_scheduling.pp_schedule``; for V-shaped schedules the
+        # walker falls back to the legacy 1F1B-flavored formula and
+        # reports the legacy numbers (flagged in the plan §8.2).
+        peak_per_rank = perf_model._walk_schedule_for_peak()
 
         print()
         print(f"schedule = {schedule}")
         print(f"pp = {pp}, mbc = {mbc}")
         print(f"simulated iter time = {iter_time:.6f} s")
+        if peak_per_rank is not None:
+            gb = 1024.0 ** 3
+            peaks_gb = [p / gb for p in peak_per_rank]
+            print("peak_mem per rank (GB):", " ".join(
+                f"{p:.4f}" for p in peaks_gb
+            ))
+            print(f"peak_mem max over ranks = {max(peaks_gb):.4f} GB")
         print(f"Gantt saved to {out_path}")
         return
 
@@ -144,6 +156,8 @@ def main():
     rng, _ = seeding.np_random(args.seed)
     utils: list[float] = []
     mfus: list[float] = []
+    peak_mems_gb: list[float] = []
+    gb = 1024.0 ** 3
     for ep in range(args.n_episodes):
         ep_seed = int(rng.integers(0, 2**31 - 1))
         perf_model.disturbance.seed = ep_seed
@@ -153,6 +167,9 @@ def main():
         cost = perf_model.analysis_cost().data
         utils.append(float(cost["pp_utilization"]))
         mfus.append(float(cost["mfu"]))
+        peak_per_rank = perf_model._walk_schedule_for_peak()
+        if peak_per_rank is not None:
+            peak_mems_gb.append(max(peak_per_rank) / gb)
 
     util_std = statistics.stdev(utils) if len(utils) > 1 else 0.0
     mfu_std = statistics.stdev(mfus) if len(mfus) > 1 else 0.0
@@ -164,6 +181,11 @@ def main():
           f"std={util_std:.4f} min={min(utils):.4f} max={max(utils):.4f}")
     print(f"mfu:            mean={statistics.fmean(mfus):.4f} "
           f"std={mfu_std:.4f} min={min(mfus):.4f} max={max(mfus):.4f}")
+    if peak_mems_gb:
+        peak_std = statistics.stdev(peak_mems_gb) if len(peak_mems_gb) > 1 else 0.0
+        print(f"peak_mem (GB):  mean={statistics.fmean(peak_mems_gb):.4f} "
+              f"std={peak_std:.4f} min={min(peak_mems_gb):.4f} "
+              f"max={max(peak_mems_gb):.4f}")
     print("Gantt skipped (n_episodes > 1).")
 
 
