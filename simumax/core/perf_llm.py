@@ -1164,30 +1164,82 @@ class PerfLLM(PerfBase):
             model_mem_per_rank.append(self._model_mem_for_chunk(chunk))
         return act_per_mb, peak_intra_mb, model_mem_per_rank
 
+    def _chunk_for_global_vs(self, gvs: int, total_vs: int) -> str:
+        """Chunk type for global virtual stage ``gvs`` in a V-shaped schedule.
+
+        First and last virtual stages carry the embedding and LM head
+        respectively; everything in between is treated as a middle
+        chunk. Same convention used by the timing path's
+        ``_per_virtual_stage_times``.
+        """
+        if gvs == 0:
+            return FIRST_CHUNK
+        if gvs == total_vs - 1:
+            return LAST_CHUNK
+        return MIDDLE_CHUNK
+
+    def _collect_vstage_mem_constants(
+        self, V: int, owned_vs
+    ):
+        """Per-virtual-stage memory constants for V-shaped schedules.
+
+        Returns ``(act_per_vs, intra_per_vs, model_mem_per_vs,
+        stage_to_rank)`` arrays of length ``V * pp_size``.
+
+        All three numeric arrays are scaled by ``1/V`` (see
+        ``V_Shaped_Memory_Plan.md`` §4.3): each virtual chunk carries
+        ``layer_num / (V * pp)`` layers' worth of memory, not the full
+        ``layer_num / pp`` that ``pp_state_peak_point`` was built for.
+        This mirrors what the timing path already does in
+        ``_per_virtual_stage_times`` (chunk_time / V) and is exact for
+        per-layer-uniform terms (activation caches), approximate only
+        for chunk-position-specific terms like embeddings on FIRST and
+        LM head on LAST (bounded by the embedding fraction of weight
+        memory — a few percent for llama3-70b).
+        """
+        pp = self.strategy.pp_size
+        total_vs = V * pp
+        act_per_vs = [0.0] * total_vs
+        intra_per_vs = [0.0] * total_vs
+        model_mem_per_vs = [0.0] * total_vs
+        stage_to_rank = [0] * total_vs
+        for gvs in range(total_vs):
+            chunk = self._chunk_for_global_vs(gvs, total_vs)
+            peak_point: PeakPoint = self.pp_state_peak_point[chunk]
+            act_per_vs[gvs] = float(peak_point.activation_mem_cache) / V
+            intra_per_vs[gvs] = float(peak_point.peak_mem) / V
+            model_mem_per_vs[gvs] = self._model_mem_for_chunk(chunk) / V
+        # ``owned_vs[r]`` lists the global vs indices on rank r, so
+        # the inverse map fills stage_to_rank in one pass.
+        for r, vs_list in enumerate(owned_vs):
+            for gvs in vs_list:
+                stage_to_rank[gvs] = r
+        return act_per_vs, intra_per_vs, model_mem_per_vs, stage_to_rank
+
     def _walk_schedule_for_peak(self):
         """Drive the tracker over ``self._last_schedules`` and return the
         per-rank peak GPU memory in bytes.
 
-        Returns ``None`` for V-shaped schedules (``interleaved_1f1b``,
-        ``zb_v``) — the per-rank aggregation across virtual chunks is
-        not yet implemented and the caller falls back to the legacy
-        per-chunk-type formula. Also returns ``None`` if the schedule
-        cache has not been populated yet (no PP run was performed).
+        Dispatches by schedule type:
+        - physical-rank (``1f1b``, ``gpipe``, ``zb_h1``, ``zb_h2``):
+          one stage per rank, walker reads the 5-tuple
+          ``(kind, mb, start, dur, end)`` schedule format.
+        - V-shaped (``interleaved_1f1b``, ``zb_v``): ``V * pp`` virtual
+          stages aggregated per rank, walker reads the 6-tuple
+          ``(kind, mb, vs_local, start, dur, end)`` format and uses
+          ``ActivationTracker``'s per-rank account.
+
+        Returns ``None`` only if the schedule cache has not been
+        populated yet (no PP run performed).
 
         Sort order is by op end time so that on_F fires when an
         activation enters the cache and on_W fires when it is released.
         For schedules that fuse B and W into a single op
-        (``1f1b``, ``gpipe``), the B event triggers the activation
-        release; for split-backward schedules (``zb_h1``, ``zb_h2``) the
-        W event does the release and B is a no-op for memory.
+        (``1f1b``, ``gpipe``, ``interleaved_1f1b``), the B event
+        triggers the activation release; for split-backward schedules
+        (``zb_h1``, ``zb_h2``, ``zb_v``) the W event does the release
+        and B is a no-op for memory.
         """
-        schedule = self.pp_scheduling.pp_schedule
-        if schedule in ("interleaved_1f1b", "zb_v"):
-            # Per-rank aggregation across virtual chunks lives in a
-            # later phase. Caller falls back to the legacy formula,
-            # which is anyway 1F1B-flavored and therefore conservative
-            # for these schedules' steady state.
-            return None
         if self._last_schedules is None:
             # ``run_estimate`` only populates per-chunk ``pp_state_peak_point``;
             # the schedule cache is populated lazily by ``_compute_pp_total_time``
@@ -1197,7 +1249,13 @@ class PerfLLM(PerfBase):
             # the full perf pass and idempotent — subsequent calls reuse the
             # populated cache.
             self._compute_pp_total_time(draw=False)
+        if self._is_virtual_stage_schedule():
+            return self._walk_v_shaped_schedule()
+        return self._walk_physical_rank_schedule()
 
+    def _walk_physical_rank_schedule(self):
+        """Per-rank schedule walker for ``1f1b`` / ``gpipe`` / ``zb_h*``."""
+        schedule = self.pp_scheduling.pp_schedule
         pp = self.strategy.pp_size
         act, intra, model_mem = self._collect_stage_mem_constants()
         nominal_seq_len = self._nominal_seq_len_for_mem()
@@ -1236,7 +1294,82 @@ class PerfLLM(PerfBase):
                 tracker.on_W(rank, mb)
             # else: B in split-backward — activation stays cached
             # until the matching W fires.
-        return tracker.peak()
+        # For physical-rank schedules ``stage_to_rank`` is identity, so
+        # peak_per_rank() == peak() — using the per-rank getter keeps
+        # the call site uniform with the V-shaped path.
+        return tracker.peak_per_rank()
+
+    def _walk_v_shaped_schedule(self):
+        """Per-rank schedule walker for ``interleaved_1f1b`` / ``zb_v``.
+
+        ``num_stages = V * pp`` virtual stages with a ``stage_to_rank``
+        mapping so that the tracker accumulates per-rank live across
+        the multiple virtual chunks sharing one GPU. Per-virtual-stage
+        constants are scaled by 1/V (see
+        ``_collect_vstage_mem_constants``) to mirror the timing path's
+        layer-fraction treatment.
+        """
+        schedule = self.pp_scheduling.pp_schedule
+        pp = self.strategy.pp_size
+        V, _vs_to_rank, owned_vs = self._vs_to_rank_owned()
+        total_vs = V * pp
+
+        # vs_local-on-rank → global vs lookup. ``owned_vs[r]`` is the
+        # ordered list of global vs indices on rank r; the schedule
+        # tuple's ``vs_local`` indexes into that list.
+        gvs_lookup = [list(vs_list) for vs_list in owned_vs]
+
+        act, intra, model_mem, stage_to_rank = (
+            self._collect_vstage_mem_constants(V, owned_vs)
+        )
+        nominal_seq_len = self._nominal_seq_len_for_mem()
+        if self.seq_lens is not None:
+            seq_lens = self.seq_lens
+        else:
+            mbc = self.strategy.micro_batch_num
+            seq_lens = np.full(mbc, self.strategy.seq_len, dtype=np.int64)
+
+        tracker = ActivationTracker(
+            num_stages=total_vs,
+            act_per_mb_nominal=act,
+            peak_intra_mb_per_stage=intra,
+            model_mem_per_stage=model_mem,
+            nominal_seq_len=nominal_seq_len,
+            stage_to_rank=stage_to_rank,
+        )
+
+        # Both V-shaped schedulers we cache today emit explicit "F",
+        # "B", "W" ops in their tuples. interleaved_1f1b emits only
+        # "F" / "B" (B is fused B+W in the analytical path); zb_v
+        # emits all three (B and W are split). Same fused-backward
+        # heuristic as the physical-rank path.
+        fused_backward = schedule == "interleaved_1f1b"
+
+        # Collect events sorted by op end time. The 6-tuple format is
+        # ``(kind, mb, vs_local, start, dur, end)`` (perf_llm.py:1907).
+        events = []
+        for rank, rank_tasks in enumerate(self._last_schedules):
+            for t in rank_tasks:
+                kind, mb, vs_local, _start, _dur, end = t
+                gvs = gvs_lookup[rank][vs_local]
+                events.append((end, rank, kind, mb, gvs))
+        events.sort(key=lambda e: (e[0], e[1], e[2]))
+
+        # Encode (mb, gvs) into a single integer mb-key so the
+        # tracker's ``_mb_act`` dictionary keeps each
+        # (microbatch, virtual stage) F→W cycle independent. A single
+        # microbatch passes through multiple virtual stages on the
+        # same rank in V-shaped schedules, so a bare ``mb`` would
+        # collide.
+        for _end_t, _rank, kind, mb, gvs in events:
+            s = int(seq_lens[mb])
+            mb_key = mb * total_vs + gvs
+            if kind == "F":
+                tracker.on_F(gvs, mb_key, s)
+            elif kind == "W" or (kind == "B" and fused_backward):
+                tracker.on_W(gvs, mb_key)
+            # else: B in split-backward (zb_v) — wait for W.
+        return tracker.peak_per_rank()
 
     def analysis_mem(self):
         """Based the simulation result, analyze the memory usage"""
@@ -1246,7 +1379,11 @@ class PerfLLM(PerfBase):
                 self._analysis_mem_impl(micro_batch_num=1, model_name=FIRST_CHUNK)
             )
 
-        peak_per_rank = self._walk_schedule_for_peak()  # None on V-shaped
+        # Returns ``None`` only if the schedule cache could not be
+        # populated; in practice the lazy ``_compute_pp_total_time``
+        # call inside the walker handles that. None-fallbacks below
+        # keep things robust for unusual call orders.
+        peak_per_rank = self._walk_schedule_for_peak()
         # Pick a representative middle rank (any non-edge rank works for
         # symmetric schedules; we use 1 to keep the report close to the
         # rank that first hits steady state).

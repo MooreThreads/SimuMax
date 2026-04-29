@@ -30,7 +30,7 @@ memory model.
 
 from __future__ import annotations
 
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 
 class ActivationTracker:
@@ -46,10 +46,9 @@ class ActivationTracker:
     num_stages
         Number of independent memory accounts. For physical-rank
         schedules (1f1b, gpipe, zb_h1, zb_h2) this is ``pp_size``. For
-        virtual-stage schedules (interleaved_1f1b, zb_v) the caller
-        decides whether to track per virtual chunk and aggregate later
-        or pre-aggregate per rank — both modes are supported by the
-        tracker since it has no opinion on what a "stage" means.
+        virtual-stage schedules (interleaved_1f1b, zb_v) this is
+        ``V * pp_size`` and ``stage_to_rank`` (below) maps each virtual
+        stage onto the GPU it lives on.
     act_per_mb_nominal
         Per-stage activation cache size held by one in-flight microbatch
         at the nominal seq_len, in bytes.
@@ -65,6 +64,14 @@ class ActivationTracker:
     nominal_seq_len
         The seq_len under which ``act_per_mb_nominal`` was computed.
         Per-mb seq_len scaling uses this as the reference.
+    stage_to_rank
+        Optional per-stage mapping to a physical-rank index. When
+        supplied, the tracker also accumulates per-rank live activations
+        (sum across stages on the same rank) and tracks ``peak_per_rank``
+        — the relevant quantity for V-shaped schedules where multiple
+        virtual chunks share a GPU. Defaults to identity (stage == rank);
+        in that case ``peak_per_rank()`` returns the same tuple as
+        ``peak()`` so existing callers behave unchanged.
     """
 
     def __init__(
@@ -74,6 +81,7 @@ class ActivationTracker:
         peak_intra_mb_per_stage: Sequence[float],
         model_mem_per_stage: Sequence[float],
         nominal_seq_len: int,
+        stage_to_rank: Optional[Sequence[int]] = None,
     ) -> None:
         if num_stages <= 0:
             raise ValueError(f"num_stages must be positive, got {num_stages}")
@@ -99,11 +107,37 @@ class ActivationTracker:
         self._model_mem_per_stage = tuple(float(x) for x in model_mem_per_stage)
         self._nominal_seq_len = int(nominal_seq_len)
 
+        if stage_to_rank is None:
+            stage_to_rank = tuple(range(num_stages))
+        else:
+            if len(stage_to_rank) != num_stages:
+                raise ValueError(
+                    f"stage_to_rank has length {len(stage_to_rank)}, "
+                    f"expected {num_stages}"
+                )
+            stage_to_rank = tuple(int(r) for r in stage_to_rank)
+            if any(r < 0 for r in stage_to_rank):
+                raise ValueError(
+                    f"stage_to_rank must contain non-negative ranks, "
+                    f"got {stage_to_rank}"
+                )
+        self._stage_to_rank = stage_to_rank
+        self._num_ranks = max(stage_to_rank) + 1
+
+        # Per-rank model memory is the sum of model_mem for all stages
+        # assigned to the rank — multiple virtual chunks share one GPU.
+        rank_model_mem = [0.0] * self._num_ranks
+        for s, r in enumerate(stage_to_rank):
+            rank_model_mem[r] += self._model_mem_per_stage[s]
+        self._model_mem_per_rank = tuple(rank_model_mem)
+
         self._live = [0.0] * num_stages
+        self._live_per_rank = [0.0] * self._num_ranks
         # The peak baseline at t=0 is `model_mem` alone (no in-flight
         # activations). on_F will only raise this; if the schedule is
         # a no-op the reported peak still accounts for the resident model.
         self._peak = list(self._model_mem_per_stage)
+        self._peak_per_rank = list(self._model_mem_per_rank)
         # Stamp the activation size at F-time so on_W releases the same
         # quantity even if anything ever rescales mid-episode.
         self._mb_act: Dict[Tuple[int, int], float] = {}
@@ -128,6 +162,19 @@ class ActivationTracker:
     def peak(self) -> Tuple[float, ...]:
         """Per-stage peak memory observed so far, in bytes."""
         return tuple(self._peak)
+
+    def peak_per_rank(self) -> Tuple[float, ...]:
+        """Per-rank peak GPU memory observed so far, in bytes.
+
+        For V-shaped schedules (multiple virtual chunks per GPU) this
+        is the physically-meaningful number: at every event we sum
+        live activations across all stages on the rank and add the
+        single active op's intra-mb peak. When ``stage_to_rank`` was
+        not supplied at construction, the identity mapping makes the
+        per-rank account collapse to the per-stage account, so this
+        returns the same tuple as :meth:`peak`.
+        """
+        return tuple(self._peak_per_rank)
 
     def on_F(self, stage: int, mb: int, seq_len: int) -> None:
         """Record a forward op for ``(stage, mb)``.
@@ -175,8 +222,21 @@ class ActivationTracker:
         )
         if candidate > self._peak[stage]:
             self._peak[stage] = candidate
-        # After F finishes, the new mb's cache joins the live pool.
+        # Per-rank candidate: only the currently-running op contributes
+        # an intra spike on its rank — adjacent virtual chunks on the
+        # same GPU are idle while this stage runs F.
+        rank = self._stage_to_rank[stage]
+        rank_candidate = (
+            self._model_mem_per_rank[rank]
+            + self._live_per_rank[rank]
+            + intra
+        )
+        if rank_candidate > self._peak_per_rank[rank]:
+            self._peak_per_rank[rank] = rank_candidate
+        # After F finishes, the new mb's cache joins the live pool —
+        # both per-stage and per-rank.
         self._live[stage] += act
+        self._live_per_rank[rank] += act
         self._mb_act[key] = act
 
     def on_W(self, stage: int, mb: int) -> None:
@@ -195,8 +255,12 @@ class ActivationTracker:
             )
         act = self._mb_act.pop(key)
         self._live[stage] -= act
+        rank = self._stage_to_rank[stage]
+        self._live_per_rank[rank] -= act
         # Numerical guard: with float arithmetic, a long episode can
         # accumulate a tiny negative residual after the last release.
         # Snap to zero when within rounding of the original add.
         if -1e-6 * abs(act) <= self._live[stage] < 0.0:
             self._live[stage] = 0.0
+        if -1e-6 * abs(act) <= self._live_per_rank[rank] < 0.0:
+            self._live_per_rank[rank] = 0.0
