@@ -270,9 +270,16 @@ def plot_nominal_by_model(data: SweepData,
             for model in models:
                 row = df[(df["model"] == model)
                         & (df["pp_schedule"] == sched)]
-                heights.append(
-                    float(row[col].iloc[0]) * 100.0 if len(row) else np.nan
-                )
+                if not len(row):
+                    heights.append(np.nan)
+                    continue
+                # PP utilization is meaningless when there is no pipeline
+                # (single stage = no bubbles to fill); hide those bars.
+                if (col == "pp_utilization"
+                        and int(row["pp_size"].iloc[0]) == 1):
+                    heights.append(np.nan)
+                    continue
+                heights.append(float(row[col].iloc[0]) * 100.0)
             ax.bar(
                 x + offsets, heights, width=bar_width,
                 color=SCHEDULE_COLORS[sched],
