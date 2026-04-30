@@ -236,13 +236,24 @@ def _save_figure(fig: plt.Figure, name: str, args: argparse.Namespace) -> None:
 # Figure: nominal MFU + PP utilization, clustered by model.
 # ----------------------------------------------------------------------------
 
+_NOMINAL_BASELINE_PANELS = [
+    # (col, ylabel, panel_tag, is_percent)
+    ("mfu",            "MFU (%)",            "(a)", True),
+    ("pp_utilization", "PP utilization (%)", "(b)", True),
+    ("iter_time_s",    "Iter. time (s)",     "(c)", False),
+    ("peak_mem_gb",    "Peak memory (GB)",   "(d)", False),
+]
+
+
 def plot_nominal_by_model(data: SweepData,
                           args: argparse.Namespace) -> None:
-    """Two-panel grouped bar chart at peak (no disturbance).
+    """Four-panel grouped bar chart at peak (no disturbance).
 
-    One cluster per model, one bar per PP schedule; metrics MFU and PP
-    utilization stacked vertically with a shared x-axis. No error bars: the
-    nominal phase is a single deterministic episode.
+    One cluster per model, one bar per PP schedule; panels are MFU, PP
+    utilization, iteration time, and peak memory, stacked vertically with a
+    shared x-axis. No error bars: the nominal phase is a single deterministic
+    episode. Missing ``(model, schedule)`` cells render as gaps. PP-util bars
+    are hidden for ``pp_size == 1`` cells (no pipeline → no bubbles).
     """
     df = data.nominal
     models = _order_models(data, args)
@@ -255,15 +266,12 @@ def plot_nominal_by_model(data: SweepData,
     x = np.arange(n_models)
 
     fig, axes = plt.subplots(
-        2, 1, figsize=(args.fig_width, args.fig_height),
-        sharex=True, gridspec_kw={"hspace": 0.18},
+        len(_NOMINAL_BASELINE_PANELS), 1,
+        figsize=(args.fig_width, args.fig_height),
+        sharex=True, gridspec_kw={"hspace": 0.22},
     )
 
-    panel_specs = [
-        (axes[0], "mfu",            "MFU (\\%)",            "(a)"),
-        (axes[1], "pp_utilization", "PP utilization (\\%)", "(b)"),
-    ]
-    for ax, col, ylabel, panel in panel_specs:
+    for ax, (col, ylabel, panel, is_pct) in zip(axes, _NOMINAL_BASELINE_PANELS):
         for i, sched in enumerate(schedules):
             offsets = (i - (n_sched - 1) / 2) * bar_width
             heights = []
@@ -273,22 +281,26 @@ def plot_nominal_by_model(data: SweepData,
                 if not len(row):
                     heights.append(np.nan)
                     continue
-                # PP utilization is meaningless when there is no pipeline
-                # (single stage = no bubbles to fill); hide those bars.
-                if (col == "pp_utilization"
-                        and int(row["pp_size"].iloc[0]) == 1):
+                if col == "pp_utilization":
+                    ps = row["pp_size"].iloc[0]
+                    if not pd.isna(ps) and int(ps) == 1:
+                        heights.append(np.nan)
+                        continue
+                val = row[col].iloc[0]
+                if pd.isna(val):
                     heights.append(np.nan)
                     continue
-                heights.append(float(row[col].iloc[0]) * 100.0)
+                heights.append(float(val) * (100.0 if is_pct else 1.0))
             ax.bar(
                 x + offsets, heights, width=bar_width,
                 color=SCHEDULE_COLORS[sched],
                 edgecolor="white", linewidth=0.6,
                 label=SCHEDULE_LABELS[sched],
             )
-        ax.set_ylabel(ylabel.replace("\\%", "%"))
-        ax.set_ylim(0, 100)
-        ax.set_yticks(np.arange(0, 101, 20))
+        ax.set_ylabel(ylabel)
+        if is_pct:
+            ax.set_ylim(0, 100)
+            ax.set_yticks(np.arange(0, 101, 20))
         ax.grid(axis="y", which="major")
         ax.tick_params(axis="x", length=0)
         ax.text(
@@ -522,12 +534,14 @@ def plot_ablation_for_cell(data: SweepData,
 
 def plot_baseline_by_model(data: SweepData,
                            args: argparse.Namespace) -> None:
-    """Two-panel grouped bar chart under the full-disturbance baseline.
+    """Four-panel grouped bar chart under the full-disturbance baseline.
 
     Mirrors ``plot_nominal_by_model`` (same model order, same schedule
     legend, same colors) but heights are the mean over episodes from
     ``baseline_disturbed.parquet`` with ±1σ error bars; the underlying
-    disturbance profile is ``configs/disturbance/both.json``.
+    disturbance profile is ``configs/disturbance/both.json``. Missing
+    ``(model, schedule)`` cells render as gaps; PP-util bars are hidden for
+    ``pp_size == 1`` cells.
     """
     if data.baseline is None:
         raise SystemExit(
@@ -537,9 +551,12 @@ def plot_baseline_by_model(data: SweepData,
     models = _order_models(data, args)
     schedules = data.schedules
 
+    metric_cols = [col for col, *_ in _NOMINAL_BASELINE_PANELS]
     # Aggregate per (model, schedule); std is NaN for groups of size 1.
-    agg = (df.groupby(["model", "pp_schedule"])[["mfu", "pp_utilization"]]
+    agg = (df.groupby(["model", "pp_schedule"])[metric_cols]
               .agg(["mean", "std"]))
+    pp_size_by_cell = (df.groupby(["model", "pp_schedule"])["pp_size"]
+                         .first())
 
     n_models = len(models)
     n_sched = len(schedules)
@@ -548,29 +565,37 @@ def plot_baseline_by_model(data: SweepData,
     x = np.arange(n_models)
 
     fig, axes = plt.subplots(
-        2, 1, figsize=(args.fig_width, args.fig_height),
-        sharex=True, gridspec_kw={"hspace": 0.18},
+        len(_NOMINAL_BASELINE_PANELS), 1,
+        figsize=(args.fig_width, args.fig_height),
+        sharex=True, gridspec_kw={"hspace": 0.22},
     )
 
-    panel_specs = [
-        (axes[0], "mfu",            "MFU (%)",            "(a)"),
-        (axes[1], "pp_utilization", "PP utilization (%)", "(b)"),
-    ]
-    for ax, col, ylabel, panel in panel_specs:
+    for ax, (col, ylabel, panel, is_pct) in zip(axes, _NOMINAL_BASELINE_PANELS):
         for i, sched in enumerate(schedules):
             offsets = (i - (n_sched - 1) / 2) * bar_width
             heights, errors = [], []
             for model in models:
                 key = (model, sched)
-                if key in agg.index:
-                    mean_v = float(agg.loc[key, (col, "mean")]) * 100.0
-                    std_raw = agg.loc[key, (col, "std")]
-                    std_v = (0.0 if pd.isna(std_raw)
-                             else float(std_raw) * 100.0)
-                else:
-                    mean_v, std_v = np.nan, 0.0
-                heights.append(mean_v)
-                errors.append(std_v)
+                if key not in agg.index:
+                    heights.append(np.nan)
+                    errors.append(0.0)
+                    continue
+                if col == "pp_utilization":
+                    ps = pp_size_by_cell.get(key, np.nan)
+                    if not pd.isna(ps) and int(ps) == 1:
+                        heights.append(np.nan)
+                        errors.append(0.0)
+                        continue
+                mean_raw = agg.loc[key, (col, "mean")]
+                if pd.isna(mean_raw):
+                    heights.append(np.nan)
+                    errors.append(0.0)
+                    continue
+                std_raw = agg.loc[key, (col, "std")]
+                scale = 100.0 if is_pct else 1.0
+                heights.append(float(mean_raw) * scale)
+                errors.append(0.0 if pd.isna(std_raw)
+                              else float(std_raw) * scale)
             ax.bar(
                 x + offsets, heights, width=bar_width,
                 color=SCHEDULE_COLORS[sched],
@@ -581,8 +606,9 @@ def plot_baseline_by_model(data: SweepData,
                 label=SCHEDULE_LABELS[sched],
             )
         ax.set_ylabel(ylabel)
-        ax.set_ylim(0, 100)
-        ax.set_yticks(np.arange(0, 101, 20))
+        if is_pct:
+            ax.set_ylim(0, 100)
+            ax.set_yticks(np.arange(0, 101, 20))
         ax.grid(axis="y", which="major")
         ax.tick_params(axis="x", length=0)
         ax.text(
@@ -783,19 +809,23 @@ def parse_args() -> argparse.Namespace:
 
     p_nom = sub.add_parser(
         "nominal",
-        help="Two-panel grouped bar chart of nominal MFU and PP "
-             "utilization (clustered by model, one bar per schedule).",
+        help="Four-panel grouped bar chart of nominal MFU, PP "
+             "utilization, iteration time, and peak memory "
+             "(clustered by model, one bar per schedule).",
     )
     _add_common_args(p_nom)
+    # Four stacked panels need more vertical room than the 2-panel default.
+    p_nom.set_defaults(fig_height=8.8)
 
     p_base = sub.add_parser(
         "baseline",
-        help="Two-panel grouped bar chart under the full-disturbance "
+        help="Four-panel grouped bar chart under the full-disturbance "
              "baseline (configs/disturbance/both.json), clustered by "
              "model, one bar per schedule. Mirrors `nominal` but uses "
              "baseline_disturbed.parquet (mean ± 1σ over episodes).",
     )
     _add_common_args(p_base)
+    p_base.set_defaults(fig_height=8.8)
 
     p_abl = sub.add_parser(
         "ablation",
