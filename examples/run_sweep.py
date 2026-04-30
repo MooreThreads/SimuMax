@@ -173,6 +173,13 @@ def _row_template(job: Job, strategy_name: str, perf_model: PerfLLM,
     }
 
 
+def _peak_mem_gb(perf_model: PerfLLM) -> float:
+    """Worst-stage peak memory (GB) for the just-completed run_estimate()."""
+    mem_result = perf_model.analysis_mem()
+    peak_list = perf_model.get_pp_stage_peak_mem(mem_result, "peak_mem", toG=True)
+    return float(max(peak_list.values()))
+
+
 def _run_episodes(perf_model: PerfLLM, episodes: int, base_seed: int) -> List[Dict[str, float]]:
     """Run `episodes` episodes mutating only disturbance.seed each iteration.
 
@@ -192,6 +199,7 @@ def _run_episodes(perf_model: PerfLLM, episodes: int, base_seed: int) -> List[Di
             "mfu": float(cost["mfu"]),
             "pp_utilization": float(cost["pp_utilization"]),
             "iter_time_s": _parse_time_seconds(cost["duration_time_per_iter"]),
+            "peak_mem_gb": _peak_mem_gb(perf_model),
         })
     return out
 
@@ -240,6 +248,7 @@ def execute_job(job: Job) -> Dict[str, Any]:
                 "mfu": float(cost["mfu"]),
                 "pp_utilization": float(cost["pp_utilization"]),
                 "iter_time_s": _parse_time_seconds(cost["duration_time_per_iter"]),
+                "peak_mem_gb": _peak_mem_gb(perf_model),
             })
             rows.append(row)
         elif job.phase == "baseline":
