@@ -343,25 +343,59 @@ def _compact_schedule(name: str) -> str:
 
 def plot_ablation_for_cell(data: SweepData,
                            args: argparse.Namespace) -> None:
-    """One figure per ablation axis, in three modes:
+    """Dispatch to per-cell or batch ablation figure emission.
 
-    * Both ``--model`` and ``--schedule`` set: a single curve with the
-      detailed style (±1σ band, horizontal nominal reference line, star at
-      x=0).
-    * Only ``--model`` set: one curve per schedule (color from
-      ``SCHEDULE_COLORS``), legend identifies the schedule.
-    * Only ``--schedule`` set: one curve per model (color from ``tab20``,
-      marker from ``MODEL_MARKERS``), legend identifies the model.
+    Modes (selected by which of ``--model`` / ``--schedule`` are passed):
 
-    Each figure has two stacked panels (MFU, PP utilization). Output:
-    ``<figs-dir>/<model_or_all>_<sched_or_all>_<axis>.{pdf,png}``.
+    * Both set: one figure per axis with a single detailed curve (±1σ band,
+      dotted horizontal nominal-strategy reference).
+    * Only ``--model``: one figure per axis with one curve per schedule
+      (color from ``SCHEDULE_COLORS``).
+    * Only ``--schedule``: one figure per axis with one curve per model
+      (color from ``tab20``, marker from ``MODEL_MARKERS``).
+    * Neither: batch — emit a per-model figure set (one curve per schedule)
+      for every model in the data, then a per-schedule figure set (one
+      curve per model) for every schedule. Total =
+      ``(|models| + |schedules|) × |axes|`` figures.
+
+    Each figure has two stacked panels (MFU on top, PP utilization below).
+    Outputs land in ``<figs-dir>`` with naming
+    ``<model_or_all>_<sched_or_all>_<axis>.{pdf,png}``; batch mode produces
+    no collisions because each call uses a distinct ``out_tag``.
     """
     model = getattr(args, "model", None)
     schedule = getattr(args, "schedule", None)
     if model is None and schedule is None:
-        raise SystemExit(
-            "ablation requires at least one of --model or --schedule."
-        )
+        models = _order_models(data, args)
+        schedules = data.schedules
+        n_axes = sum(1 for a in ABLATION_AXES if a in data.ablations)
+        print(f"[batch] per-model figures "
+              f"({len(models)} models × {n_axes} axes)")
+        for m in models:
+            print(f"  --model {m}")
+            _emit_ablation_figures(data, args, model=m, schedule=None)
+        print(f"[batch] per-schedule figures "
+              f"({len(schedules)} schedules × {n_axes} axes)")
+        for s in schedules:
+            print(f"  --schedule {s}")
+            _emit_ablation_figures(data, args, model=None, schedule=s)
+        return
+    _emit_ablation_figures(data, args, model=model, schedule=schedule)
+
+
+def _emit_ablation_figures(data: SweepData, args: argparse.Namespace,
+                           *, model: Optional[str],
+                           schedule: Optional[str]) -> None:
+    """Emit the per-axis ablation figures for one (model, schedule) selection.
+
+    Curves use the ablation parquet's own ``ablation_value=0`` row as the
+    x=0 anchor (produced by run_sweep.py's shared zero-anchor shard); no
+    nominal-data prepending happens here. The dotted nominal-strategy
+    reference (``single`` mode only) shows where the *nominal-tuned*
+    strategy lands at zero disturbance for comparison.
+    """
+    if model is None and schedule is None:
+        raise ValueError("at least one of model/schedule must be set")
 
     # curve_specs: (label, color, marker, model, schedule)
     if model is not None and schedule is not None:
@@ -402,34 +436,34 @@ def plot_ablation_for_cell(data: SweepData,
 
         curves = []
         for label, color, marker, m, s in curve_specs:
-            nom = data.nominal[(data.nominal["model"] == m)
-                               & (data.nominal["pp_schedule"] == s)]
             sub = df[(df["model"] == m) & (df["pp_schedule"] == s)]
-            if nom.empty or sub.empty:
+            if sub.empty:
                 print(f"warning: skipping curve ({m}, {s}) for axis={axis}")
                 continue
+            ps = sub["pp_size"].iloc[0]
+            is_pp1 = (not pd.isna(ps)) and int(ps) == 1
             agg = (sub.groupby("ablation_value")[["mfu", "pp_utilization"]]
                        .agg(["mean", "std"]).sort_index())
-            x_sweep = np.asarray(agg.index, dtype=float)
-            mfu_mean = agg[("mfu", "mean")].to_numpy() * 100.0
-            mfu_std = np.nan_to_num(agg[("mfu", "std")].to_numpy(),
-                                    nan=0.0) * 100.0
-            util_mean = agg[("pp_utilization", "mean")].to_numpy() * 100.0
-            util_std = np.nan_to_num(
+            x = np.asarray(agg.index, dtype=float)
+            mfu = agg[("mfu", "mean")].to_numpy() * 100.0
+            mfu_s = np.nan_to_num(agg[("mfu", "std")].to_numpy(),
+                                  nan=0.0) * 100.0
+            util = agg[("pp_utilization", "mean")].to_numpy() * 100.0
+            util_s = np.nan_to_num(
                 agg[("pp_utilization", "std")].to_numpy(), nan=0.0,
             ) * 100.0
-            nom_mfu = float(nom["mfu"].iloc[0]) * 100.0
-            nom_util = float(nom["pp_utilization"].iloc[0]) * 100.0
-            x = np.concatenate(([0.0], x_sweep))
-            mfu = np.concatenate(([nom_mfu], mfu_mean))
-            mfu_s = np.concatenate(([0.0], mfu_std))
-            util = np.concatenate(([nom_util], util_mean))
-            util_s = np.concatenate(([0.0], util_std))
+            nom = data.nominal[(data.nominal["model"] == m)
+                               & (data.nominal["pp_schedule"] == s)]
+            nom_mfu = (float(nom["mfu"].iloc[0]) * 100.0
+                       if not nom.empty else None)
+            nom_util = (float(nom["pp_utilization"].iloc[0]) * 100.0
+                        if not nom.empty else None)
             curves.append({
                 "label": label, "color": color, "marker": marker,
                 "x": x, "mfu": mfu, "mfu_s": mfu_s,
                 "util": util, "util_s": util_s,
                 "nom_mfu": nom_mfu, "nom_util": nom_util,
+                "is_pp1": is_pp1,
             })
 
         if not curves:
@@ -448,6 +482,11 @@ def plot_ablation_for_cell(data: SweepData,
                         panel) in enumerate(panel_specs):
             ax = axes[panel_idx]
             for c in curves:
+                # PP utilization is trivially 100% for pp_size==1 cells
+                # (no pipeline → no bubbles), so skip those curves on the
+                # util panel — matches the convention in plot_nominal/baseline.
+                if mean_key == "util" and c["is_pp1"]:
+                    continue
                 color = c["color"]
                 marker = c["marker"]
                 x = c["x"]
@@ -455,28 +494,17 @@ def plot_ablation_for_cell(data: SweepData,
                 ystd = c[std_key]
                 nom_val = c[nom_key]
                 if mode == "single":
-                    ax.axhline(nom_val, color=color, linestyle=":",
-                               linewidth=0.8, alpha=0.55, zorder=1)
+                    if nom_val is not None:
+                        ax.axhline(nom_val, color=color, linestyle=":",
+                                   linewidth=0.8, alpha=0.55, zorder=1)
                     ax.fill_between(x, ymean - ystd, ymean + ystd,
                                     color=color, alpha=0.18, linewidth=0,
                                     zorder=2)
                 line_label = c["label"] if panel_idx == 0 else None
-                ax.plot(x[1:], ymean[1:], "-", color=color, linewidth=1.4,
+                ax.plot(x, ymean, "-", color=color, linewidth=1.4,
                         marker=marker, markersize=3.6,
                         markerfacecolor=color, markeredgecolor="white",
                         markeredgewidth=0.5, zorder=3, label=line_label)
-                ax.plot(x[:2], ymean[:2], "--", color=color, linewidth=0.9,
-                        alpha=0.55, zorder=2)
-                if mode == "single":
-                    ax.plot(x[0], ymean[0], marker="*", markersize=9,
-                            color=color, markerfacecolor=color,
-                            markeredgecolor="white", markeredgewidth=0.6,
-                            zorder=4)
-                else:
-                    ax.plot(x[0], ymean[0], marker=marker, markersize=4.5,
-                            color=color, markerfacecolor=color,
-                            markeredgecolor="white", markeredgewidth=0.5,
-                            zorder=4)
             ax.set_ylabel(ylabel)
             ax.set_ylim(0, 100)
             ax.set_yticks(np.arange(0, 101, 20))
@@ -492,10 +520,6 @@ def plot_ablation_for_cell(data: SweepData,
         if mode == "single":
             color = curves[0]["color"]
             legend_handles = [
-                plt.Line2D([0], [0], marker="*", color=color, linestyle="",
-                           markersize=9, markerfacecolor=color,
-                           markeredgecolor="white", markeredgewidth=0.6,
-                           label="nominal"),
                 plt.Line2D([0], [0], marker="o", color=color, linestyle="-",
                            linewidth=1.4, markersize=3.6,
                            markerfacecolor=color, markeredgecolor="white",
@@ -503,6 +527,9 @@ def plot_ablation_for_cell(data: SweepData,
                            label="mean over episodes"),
                 mpl.patches.Patch(facecolor=color, alpha=0.18,
                                   label=r"$\pm 1\sigma$ band"),
+                plt.Line2D([0], [0], color=color, linestyle=":",
+                           linewidth=0.8, alpha=0.55,
+                           label="nominal strategy reference"),
             ]
             axes[0].legend(
                 handles=legend_handles, ncol=3, loc="lower center",
@@ -523,9 +550,8 @@ def plot_ablation_for_cell(data: SweepData,
         written_any = True
 
     if not written_any:
-        raise SystemExit(
-            "no ablation parquet files contained data for the selection."
-        )
+        print(f"warning: no ablation parquet contained data for "
+              f"(model={model}, schedule={schedule})")
 
 
 # ----------------------------------------------------------------------------
@@ -906,8 +932,9 @@ def parse_args() -> argparse.Namespace:
         "ablation",
         help="One figure per ablation axis. Modes: pass --model and "
              "--schedule for a single cell; only --model for one curve "
-             "per schedule; only --schedule for one curve per model. At "
-             "least one of the two is required.",
+             "per schedule; only --schedule for one curve per model; "
+             "omit both to batch-generate per-model and per-schedule "
+             "figures for every cell in the data.",
     )
     _add_common_args(p_abl)
     # Column-fit defaults; tighter than the wide nominal-by-model figure.
