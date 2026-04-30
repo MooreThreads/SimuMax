@@ -1,0 +1,99 @@
+{
+    "model": "qwen3-coder-480b-a35b",
+    "schedule": "zb_h1",
+    "disturbance": "both",
+    "num_seeds": 20,
+    "seed_base": 0,
+    "candidate_top_k": 30,
+    "candidate_mfu_window": 0.1,
+    "full_seed_eval": false,
+    "gbs_target": 256,
+    "max_world": 4096,
+    "n_phase_a_candidates": 207,
+    "n_phase_a_shortlist": 2,
+    "nominal_best_mfu": 0.12036547573638454,
+    "git_rev": "b0424215bd4dea5ce8f55e488afd0e96ef0b921f",
+    "candidates": [
+        {
+            "combo": {
+                "tp": 2,
+                "pp": 16,
+                "ep": 8,
+                "dp": 8,
+                "mbn": 32,
+                "mbs": 1,
+                "etp": 1,
+                "world_size": 256,
+                "gbs_eff": 256,
+                "recompute_family": "selective_recompute",
+                "recompute_layer_num_nominal": 4,
+                "selective_flags": {
+                    "attn_recompute": false,
+                    "mla_rms_recompute": false,
+                    "mlp_recompute": true,
+                    "mlp_rms_recompute": true
+                }
+            },
+            "nominal_mfu": 0.12036547573638454,
+            "nominal_peak_mem_gb": 71.5328,
+            "n_seeds_attempted": 20,
+            "n_seeds_evaluated": 1,
+            "early_exit": true,
+            "fits_all_seeds": false,
+            "failed_at_seed": 0,
+            "peak_mem_at_failure_gb": 83.8539,
+            "n_seeds_failed_memory": 1
+        },
+        {
+            "combo": {
+                "tp": 2,
+                "pp": 16,
+                "ep": 8,
+                "dp": 8,
+                "mbn": 32,
+                "mbs": 1,
+                "etp": 1,
+                "world_size": 256,
+                "gbs_eff": 256,
+                "recompute_family": "full_block",
+                "recompute_layer_num_nominal": 2,
+                "selective_flags": null
+            },
+            "nominal_mfu": 0.11857872951431257,
+            "nominal_peak_mem_gb": 68.716,
+            "n_seeds_attempted": 20,
+            "n_seeds_evaluated": 20,
+            "early_exit": true,
+            "fits_all_seeds": true,
+            "mfu_mean": 0.06348351676351541,
+            "mfu_std": 0.007550728222653074,
+            "mfu_min": 0.045276349913254736,
+            "mfu_max": 0.0757578487041212,
+            "peak_mem_mean_gb": 66.213195,
+            "peak_mem_std_gb": 2.8618844973704767,
+            "peak_mem_max_gb": 73.5427,
+            "recompute_layer_num_max": 3
+        }
+    ],
+    "selected": {
+        "combo": {
+            "tp": 2,
+            "pp": 16,
+            "ep": 8,
+            "dp": 8,
+            "mbn": 32,
+            "mbs": 1,
+            "etp": 1,
+            "world_size": 256,
+            "gbs_eff": 256,
+            "recompute_family": "full_block",
+            "recompute_layer_num_nominal": 2,
+            "selective_flags": null
+        },
+        "mfu_mean": 0.06348351676351541,
+        "mfu_std": 0.007550728222653074,
+        "peak_mem_mean_gb": 66.213195,
+        "peak_mem_max_gb": 73.5427,
+        "recompute_layer_num_max": 3
+    }
+}

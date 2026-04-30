@@ -1,0 +1,45 @@
+{
+    "model": "qwen3-coder-480b-a35b",
+    "schedule": "zb_h2",
+    "disturbance": "both",
+    "num_seeds": 20,
+    "seed_base": 0,
+    "candidate_top_k": 30,
+    "candidate_mfu_window": 0.1,
+    "full_seed_eval": false,
+    "gbs_target": 256,
+    "max_world": 4096,
+    "n_phase_a_candidates": 192,
+    "n_phase_a_shortlist": 1,
+    "nominal_best_mfu": 0.11785199605801265,
+    "git_rev": "b0424215bd4dea5ce8f55e488afd0e96ef0b921f",
+    "candidates": [
+        {
+            "combo": {
+                "tp": 2,
+                "pp": 16,
+                "ep": 8,
+                "dp": 8,
+                "mbn": 32,
+                "mbs": 1,
+                "etp": 1,
+                "world_size": 256,
+                "gbs_eff": 256,
+                "recompute_family": "full_block",
+                "recompute_layer_num_nominal": 3,
+                "selective_flags": null
+            },
+            "nominal_mfu": 0.11785199605801265,
+            "nominal_peak_mem_gb": 69.5232,
+            "n_seeds_attempted": 20,
+            "n_seeds_evaluated": 1,
+            "early_exit": true,
+            "fits_all_seeds": false,
+            "failed_at_seed": 0,
+            "peak_mem_at_failure_gb": null,
+            "n_seeds_failed_memory": 1
+        }
+    ],
+    "selected": null,
+    "reason": "no_combo_fits_all_seeds"
+}

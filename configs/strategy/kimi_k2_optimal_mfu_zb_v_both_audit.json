@@ -1,0 +1,80 @@
+{
+    "model": "kimi-k2",
+    "schedule": "zb_v",
+    "disturbance": "both",
+    "num_seeds": 20,
+    "seed_base": 0,
+    "candidate_top_k": 30,
+    "candidate_mfu_window": 0.1,
+    "full_seed_eval": false,
+    "gbs_target": 256,
+    "max_world": 4096,
+    "n_phase_a_candidates": 61,
+    "n_phase_a_shortlist": 2,
+    "nominal_best_mfu": 0.054344270780801625,
+    "git_rev": "b0424215bd4dea5ce8f55e488afd0e96ef0b921f",
+    "candidates": [
+        {
+            "combo": {
+                "tp": 2,
+                "pp": 8,
+                "ep": 32,
+                "dp": 32,
+                "mbn": 8,
+                "mbs": 1,
+                "etp": 1,
+                "world_size": 512,
+                "gbs_eff": 256,
+                "recompute_family": "selective_recompute",
+                "recompute_layer_num_nominal": 8,
+                "selective_flags": {
+                    "attn_recompute": true,
+                    "mla_rms_recompute": true,
+                    "mlp_recompute": true,
+                    "mlp_rms_recompute": true
+                }
+            },
+            "nominal_mfu": 0.054344270780801625,
+            "nominal_peak_mem_gb": 72.5556,
+            "n_seeds_attempted": 20,
+            "n_seeds_evaluated": 1,
+            "early_exit": true,
+            "fits_all_seeds": false,
+            "failed_at_seed": 0,
+            "peak_mem_at_failure_gb": 89.3669,
+            "n_seeds_failed_memory": 1
+        },
+        {
+            "combo": {
+                "tp": 2,
+                "pp": 16,
+                "ep": 16,
+                "dp": 16,
+                "mbn": 16,
+                "mbs": 1,
+                "etp": 1,
+                "world_size": 512,
+                "gbs_eff": 256,
+                "recompute_family": "selective_recompute",
+                "recompute_layer_num_nominal": 4,
+                "selective_flags": {
+                    "attn_recompute": true,
+                    "mla_rms_recompute": true,
+                    "mlp_recompute": true,
+                    "mlp_rms_recompute": true
+                }
+            },
+            "nominal_mfu": 0.054077579209787056,
+            "nominal_peak_mem_gb": 70.6407,
+            "n_seeds_attempted": 20,
+            "n_seeds_evaluated": 1,
+            "early_exit": true,
+            "fits_all_seeds": false,
+            "failed_at_seed": 0,
+            "peak_mem_at_failure_gb": 81.1391,
+            "n_seeds_failed_memory": 1
+        }
+    ],
+    "selected": null,
+    "reason": "no_combo_fits_all_seeds"
+}

@@ -1,0 +1,75 @@
+{
+    "model": "minimax-m2",
+    "schedule": "zb_h1",
+    "disturbance": "both",
+    "num_seeds": 20,
+    "seed_base": 0,
+    "candidate_top_k": 30,
+    "candidate_mfu_window": 0.1,
+    "full_seed_eval": false,
+    "gbs_target": 256,
+    "max_world": 2048,
+    "n_phase_a_candidates": 642,
+    "n_phase_a_shortlist": 2,
+    "nominal_best_mfu": 0.22136669267120473,
+    "git_rev": "b0424215bd4dea5ce8f55e488afd0e96ef0b921f",
+    "candidates": [
+        {
+            "combo": {
+                "tp": 2,
+                "pp": 16,
+                "ep": 4,
+                "dp": 4,
+                "mbn": 64,
+                "mbs": 1,
+                "etp": 1,
+                "world_size": 128,
+                "gbs_eff": 256,
+                "recompute_family": "no_recompute",
+                "recompute_layer_num_nominal": 0,
+                "selective_flags": null
+            },
+            "nominal_mfu": 0.22136669267120473,
+            "nominal_peak_mem_gb": 65.7534,
+            "n_seeds_attempted": 20,
+            "n_seeds_evaluated": 1,
+            "early_exit": true,
+            "fits_all_seeds": false,
+            "failed_at_seed": 0,
+            "peak_mem_at_failure_gb": 81.5471,
+            "n_seeds_failed_memory": 1
+        },
+        {
+            "combo": {
+                "tp": 2,
+                "pp": 16,
+                "ep": 4,
+                "dp": 4,
+                "mbn": 64,
+                "mbs": 1,
+                "etp": 1,
+                "world_size": 128,
+                "gbs_eff": 256,
+                "recompute_family": "selective_recompute",
+                "recompute_layer_num_nominal": 4,
+                "selective_flags": {
+                    "attn_recompute": true,
+                    "mla_rms_recompute": true,
+                    "mlp_recompute": false,
+                    "mlp_rms_recompute": false
+                }
+            },
+            "nominal_mfu": 0.21360396943257737,
+            "nominal_peak_mem_gb": 62.9917,
+            "n_seeds_attempted": 20,
+            "n_seeds_evaluated": 1,
+            "early_exit": true,
+            "fits_all_seeds": false,
+            "failed_at_seed": 0,
+            "peak_mem_at_failure_gb": 79.3375,
+            "n_seeds_failed_memory": 1
+        }
+    ],
+    "selected": null,
+    "reason": "no_combo_fits_all_seeds"
+}

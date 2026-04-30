@@ -1,0 +1,53 @@
+{
+    "model": "deepseek-r1",
+    "schedule": "zb_h1",
+    "disturbance": "both",
+    "num_seeds": 20,
+    "seed_base": 0,
+    "candidate_top_k": 30,
+    "candidate_mfu_window": 0.1,
+    "full_seed_eval": false,
+    "gbs_target": 256,
+    "max_world": 4096,
+    "n_phase_a_candidates": 123,
+    "n_phase_a_shortlist": 1,
+    "nominal_best_mfu": 0.11229421794601287,
+    "git_rev": "b0424215bd4dea5ce8f55e488afd0e96ef0b921f",
+    "candidates": [
+        {
+            "combo": {
+                "tp": 2,
+                "pp": 16,
+                "ep": 8,
+                "dp": 8,
+                "mbn": 32,
+                "mbs": 1,
+                "etp": 1,
+                "world_size": 256,
+                "gbs_eff": 256,
+                "recompute_family": "full_block",
+                "recompute_layer_num_nominal": 4,
+                "selective_flags": null
+            },
+            "nominal_mfu": 0.11229421794601287,
+            "nominal_peak_mem_gb": 69.4415,
+            "n_seeds_attempted": 20,
+            "n_seeds_evaluated": 16,
+            "early_exit": true,
+            "fits_all_seeds": false,
+            "failed_at_seed": 15,
+            "peak_mem_at_failure_gb": null,
+            "n_seeds_failed_memory": 1,
+            "mfu_mean": 0.06087531996676703,
+            "mfu_std": 0.005611485927375297,
+            "mfu_min": 0.04884970497208788,
+            "mfu_max": 0.06986629390844293,
+            "peak_mem_mean_gb": 73.25928666666667,
+            "peak_mem_std_gb": 0.47406534942326906,
+            "peak_mem_max_gb": 73.8761,
+            "recompute_layer_num_max": 4
+        }
+    ],
+    "selected": null,
+    "reason": "no_combo_fits_all_seeds"
+}

@@ -19,7 +19,7 @@ SIMU_DEBUG = int(os.environ.get('SIMU_DEBUG', '0'))
 if SIMU_CHECK:
     TMP_PATH = "tmp_check"
 else:
-    TMP_PATH = "tmp" + time.strftime("_%Y%m%d_%H%M%S", time.localtime())
+    TMP_PATH = "tmp" + time.strftime("_%Y%m%d_%H%M%S", time.localtime()) + f"_{os.getpid()}"
 
 kNetOp = (
     "all_reduce",
