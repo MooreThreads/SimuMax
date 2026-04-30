@@ -644,30 +644,47 @@ STATE_COLORS: Dict[str, str] = {
 
 def plot_nominal_vs_disturbed_scatter(data: SweepData,
                                       args: argparse.Namespace) -> None:
-    """Scatter of (PP utilization, MFU) per model, paired across states.
+    """One scatter per schedule of (PP utilization, MFU), per model.
 
-    For a fixed schedule, each model contributes two points: nominal (single
-    deterministic episode) and disturbed (mean ± 1σ over episodes from the
-    full-disturbance ``baseline_disturbed.parquet``). Marker shape encodes
-    the model, color encodes the state. A faint grey segment connects each
-    pair so the reader can read each model's "fragility vector" at a glance.
+    Each model contributes two points: nominal (single deterministic
+    episode) and disturbed (mean ± 1σ over episodes from
+    ``baseline_disturbed.parquet``). Marker shape encodes the model, color
+    encodes the state. A faint grey segment connects each pair so the
+    reader can read each model's "fragility vector" at a glance.
 
-    Output: ``<figs-dir>/nominal_vs_disturbed_<schedule_compact>.{pdf,png}``.
+    Flagged markers:
+      * ``pp_size == 1`` (no pipeline → PP utilization is trivially 100%)
+        — both nominal and disturbed markers rendered hollow at their
+        real values.
+      * disturbed entry missing — disturbed marker placed at (0, 0),
+        rendered hollow with an extra ``×`` overlay to distinguish it
+        from the pp=1 case.
+
+    If ``--schedule`` is given, a single figure is produced; otherwise one
+    figure per schedule present in the data. Output(s):
+    ``<figs-dir>/nominal_vs_disturbed_<schedule_compact>.{pdf,png}``.
     """
     if data.baseline is None:
         raise SystemExit(
             "scatter figure requires baseline_disturbed.parquet."
         )
 
-    schedule = args.schedule
+    requested = getattr(args, "schedule", None)
+    schedules = [requested] if requested else data.schedules
+    for schedule in schedules:
+        _scatter_for_schedule(data, args, schedule)
+
+
+def _scatter_for_schedule(data: SweepData,
+                          args: argparse.Namespace,
+                          schedule: str) -> None:
     sched_tag = _compact_schedule(schedule)
 
     nom_df = data.nominal[data.nominal["pp_schedule"] == schedule]
     dis_df = data.baseline[data.baseline["pp_schedule"] == schedule]
-    if nom_df.empty or dis_df.empty:
-        raise SystemExit(
-            f"no rows for schedule={schedule} in nominal or baseline data."
-        )
+    if nom_df.empty:
+        print(f"warning: no nominal rows for schedule={schedule}; skipping.")
+        return
 
     models = _order_models(data, args)
     color_n = STATE_COLORS["nominal"]
@@ -675,55 +692,82 @@ def plot_nominal_vs_disturbed_scatter(data: SweepData,
 
     fig, ax = plt.subplots(figsize=(args.fig_width, args.fig_height))
 
-    pairs = []  # (model, marker, x_n, y_n, x_d, y_d, x_d_std, y_d_std)
+    # pairs entries: (model, marker,
+    #                 x_n, y_n, flag_n,
+    #                 x_d, y_d, x_d_std, y_d_std, flag_d)
+    # flag_*: None | "pp1" | "no_data"
+    pairs = []
     for i, model in enumerate(models):
         marker = MODEL_MARKERS[i % len(MODEL_MARKERS)]
         nom_row = nom_df[nom_df["model"] == model]
-        dis_rows = dis_df[dis_df["model"] == model]
-        if nom_row.empty or dis_rows.empty:
-            print(f"warning: missing nominal or baseline rows for {model} "
+        if nom_row.empty:
+            print(f"warning: missing nominal row for {model} "
                   f"({schedule}); skipping.")
             continue
+
+        ps = nom_row["pp_size"].iloc[0]
+        is_pp1 = (not pd.isna(ps)) and int(ps) == 1
+        dis_rows = dis_df[dis_df["model"] == model]
+        has_disturbed = not dis_rows.empty
+
         x_n = float(nom_row["pp_utilization"].iloc[0]) * 100.0
         y_n = float(nom_row["mfu"].iloc[0]) * 100.0
-        x_d = float(dis_rows["pp_utilization"].mean()) * 100.0
-        y_d = float(dis_rows["mfu"].mean()) * 100.0
-        x_d_std = float(dis_rows["pp_utilization"].std(ddof=1) or 0.0) * 100.0
-        y_d_std = float(dis_rows["mfu"].std(ddof=1) or 0.0) * 100.0
-        pairs.append((model, marker, x_n, y_n, x_d, y_d, x_d_std, y_d_std))
+        flag_n = None
+        if has_disturbed:
+            x_d = float(dis_rows["pp_utilization"].mean()) * 100.0
+            y_d = float(dis_rows["mfu"].mean()) * 100.0
+            x_d_std = float(
+                dis_rows["pp_utilization"].std(ddof=1) or 0.0
+            ) * 100.0
+            y_d_std = float(dis_rows["mfu"].std(ddof=1) or 0.0) * 100.0
+            flag_d = None
+        else:
+            x_d = y_d = x_d_std = y_d_std = 0.0
+            flag_d = "no_data"
+
+        # pp=1: keep real coordinates (PP utilization is trivially 100%
+        # since there is no pipeline) but flag both markers visually.
+        # pp=1 takes precedence over the "no_data" flag on the disturbed
+        # marker since the underlying issue is the degenerate topology.
+        if is_pp1:
+            flag_n = "pp1"
+            flag_d = "pp1"
+
+        pairs.append((model, marker,
+                      x_n, y_n, flag_n,
+                      x_d, y_d, x_d_std, y_d_std, flag_d))
 
     # Connector segments first so markers sit on top.
-    for _, _, x_n, y_n, x_d, y_d, *_ in pairs:
+    for _, _, x_n, y_n, _fn, x_d, y_d, *_rest in pairs:
         ax.plot([x_n, x_d], [y_n, y_d], "-", color="#888888",
                 linewidth=0.7, alpha=0.5, zorder=1)
 
-    for _, marker, x_n, y_n, x_d, y_d, x_d_std, y_d_std in pairs:
-        # Error bars only (fmt="none"): errorbar's `fmt` expects a format
-        # string, which doesn't accept tuple-spec markers like (6, 1, 0).
-        ax.errorbar(
-            x_d, y_d, xerr=x_d_std, yerr=y_d_std,
-            fmt="none", elinewidth=0.7, capsize=2,
-            ecolor=color_d, alpha=0.9, zorder=2,
-        )
-        ax.plot(
-            x_d, y_d, marker=marker, color=color_d, linestyle="",
-            markerfacecolor=color_d, markeredgecolor="white",
-            markeredgewidth=0.6, markersize=7, zorder=3,
-        )
-        ax.plot(
-            x_n, y_n, marker=marker, color=color_n, linestyle="",
-            markerfacecolor=color_n, markeredgecolor="white",
-            markeredgewidth=0.6, markersize=7, zorder=4,
-        )
+    for (_model, marker,
+         x_n, y_n, flag_n,
+         x_d, y_d, x_d_std, y_d_std, flag_d) in pairs:
+        # Disturbed: error bars only when we have real data.
+        if flag_d is None:
+            ax.errorbar(
+                x_d, y_d, xerr=x_d_std, yerr=y_d_std,
+                fmt="none", elinewidth=0.7, capsize=2,
+                ecolor=color_d, alpha=0.9, zorder=2,
+            )
+        _plot_state_marker(ax, x_d, y_d, marker, color_d,
+                           flag_kind=flag_d, zorder=3)
+        _plot_state_marker(ax, x_n, y_n, marker, color_n,
+                           flag_kind=flag_n, zorder=4)
 
     ax.set_xlabel("PP utilization (%)")
     ax.set_ylabel("MFU (%)")
-    ax.set_xlim(0, 100)
-    ax.set_ylim(0, 100)
+    # Pad past 0/100 so markers sitting on the axes aren't clipped.
+    ax.set_xlim(-2.5, 102.5)
+    ax.set_ylim(-2.5, 102.5)
     ax.set_xticks(np.arange(0, 101, 20))
     ax.set_yticks(np.arange(0, 101, 20))
     ax.grid(True, which="major")
     ax.set_aspect("equal", adjustable="box")
+    ax.set_title(f"schedule: {SCHEDULE_LABELS.get(schedule, schedule)}",
+                 fontsize=9)
 
     state_handles = [
         plt.Line2D([0], [0], marker="o", color=color_n, linestyle="",
@@ -733,6 +777,13 @@ def plot_nominal_vs_disturbed_scatter(data: SweepData,
                    markerfacecolor=color_d, markeredgecolor="white",
                    markeredgewidth=0.6, markersize=7,
                    label=r"disturbed (mean $\pm 1\sigma$)"),
+        plt.Line2D([0], [0], marker="o", color="#444444", linestyle="",
+                   markerfacecolor="none", markeredgecolor="#444444",
+                   markeredgewidth=1.0, markersize=7,
+                   label="pp=1 (no pipeline)"),
+        plt.Line2D([0], [0], marker="x", color="#444444", linestyle="",
+                   markeredgecolor="#444444", markeredgewidth=1.4,
+                   markersize=8, label="no disturbed data"),
     ]
     state_legend = ax.legend(
         handles=state_handles, loc="upper left", frameon=False,
@@ -754,6 +805,30 @@ def plot_nominal_vs_disturbed_scatter(data: SweepData,
 
     out_name = f"nominal_vs_disturbed_{sched_tag}"
     _save_figure(fig, out_name, args)
+
+
+def _plot_state_marker(ax, x: float, y: float, marker, color: str,
+                       *, flag_kind: Optional[str], zorder: int) -> None:
+    """Render one (state, model) marker.
+
+    ``flag_kind``:
+      * ``None``   — normal filled marker.
+      * ``"pp1"``  — hollow marker (open face, colored edge).
+      * ``"no_data"`` — hollow marker plus a small ``×`` overlay so the
+        reader can tell it apart from the pp=1 case.
+    """
+    if flag_kind is None:
+        ax.plot(x, y, marker=marker, color=color, linestyle="",
+                markerfacecolor=color, markeredgecolor="white",
+                markeredgewidth=0.6, markersize=7, zorder=zorder)
+        return
+    ax.plot(x, y, marker=marker, color=color, linestyle="",
+            markerfacecolor="none", markeredgecolor=color,
+            markeredgewidth=1.0, markersize=7, zorder=zorder)
+    if flag_kind == "no_data":
+        ax.plot(x, y, marker="x", color=color, linestyle="",
+                markeredgecolor=color, markeredgewidth=1.2,
+                markersize=5, zorder=zorder + 0.1)
 
 
 # ----------------------------------------------------------------------------
@@ -850,16 +925,18 @@ def parse_args() -> argparse.Namespace:
 
     p_sca = sub.add_parser(
         "scatter",
-        help="Single scatter (PP utilization × MFU) for a fixed schedule. "
-             "One marker per model, two colors (nominal vs full-disturbance "
-             "baseline) with paired connector segments.",
+        help="Scatter (PP utilization × MFU). One marker per model, two "
+             "colors (nominal vs full-disturbance baseline) with paired "
+             "connector segments. Without --schedule, produces one figure "
+             "per schedule present in the data.",
     )
     _add_common_args(p_sca)
     # Roughly square panel; smaller than the wide grouped-bar default.
     p_sca.set_defaults(fig_width=5.5, fig_height=5.0)
     p_sca.add_argument(
-        "--schedule", default="zb_h2",
-        help="PP schedule name (canonical, as in configs/pp_scheduling/).",
+        "--schedule", default=None,
+        help="PP schedule name (canonical, as in configs/pp_scheduling/). "
+             "Omit to render one figure per schedule.",
     )
 
     return parser.parse_args()
