@@ -4,31 +4,187 @@
 </p>
 
 
-# Introduction
-SimuMax relies on three core input files: system, strategy, and model. The system file defines the hardware performance parameters of a GPU cluster system, such as nominal computing power, memory access bandwidth, intra-node/inter-node bandwidth, used for evaluating computation time and network communication time.
+# System Config
 
-The system file primarily consists of three parts: Basic Information (system name and number of GPUs per node), accelerator (computing power and memory access description), and networks (network configuration and bandwidth description).
+SimuMax relies on three core input files: `system`, `strategy`, and `model`.
+The `system` file describes the machine side of the problem:
 
-A basic template is:
+- accelerator compute capability
+- memory bandwidth
+- network bandwidth / latency
+- shape-level operator efficiency
+
+A complete `system.json` always has three logical parts:
+
+- basic information: system name and GPUs per node
+- `accelerator`: compute and memory-side behavior
+- `networks`: intra-node and inter-node communication behavior
+
+Some machine families may also add extra machine-specific fields such as `FC8`, but the three parts above are the main structure you should think about first.
+
+Workflow pointers:
+
+- overview: [README.md](./README.md)
+- model fields: [model.md](./model.md)
+- strategy fields: [strategy.md](./strategy.md)
+- machine measurement: [simu_tools/efficency_test/README.md](../simu_tools/efficency_test/README.md)
+
+Important practical note:
+
+- the shared public workflow can generate operator-efficiency data automatically
+- on supported CUDA/MUSA hardware, the shared workflow also tries to auto-fill `accelerator.backend`, visible `num_per_node`, and `accelerator.mem_gbs`
+- communication fitting is still a guided manual write-back into `networks`
+- accelerator-bandwidth defaults are still starter values and should be reviewed for timing-quality analysis
+- so a newly generated `system.json` should be treated as timing-ready only after you review machine-side fields and replace the starter network values with your fitted communication numbers
+
+## When to measure your own machine
+
+Using a shipped system config is usually enough when:
+
+- the target machine is close to an existing example machine
+- communication topology is similar
+- the dominant operator shapes are already covered in `accurate_efficient_factor`
+
+You should measure your own data when:
+
+- the hardware is new
+- inter-node or intra-node bandwidth / latency is materially different
+- `system.miss_efficiency` is non-empty and the goal is timing analysis
+
+Practical rule:
+
+- for OOM feasibility, missing efficiency may still be acceptable
+- for `perf vs simulator` or `perf vs real` timing interpretation, fill missing efficiency first
+
+## Fastest way to start
+
+Do not start from an empty file unless you have to.
+
+Recommended path:
+
+1. Copy the nearest existing config under [configs/system](../configs/system).
+2. Rename `sys_name`.
+3. Update `num_per_node`, `accelerator.backend`, and `accelerator.mem_gbs`.
+4. Replace the `networks` section with the topology closest to your machine.
+5. Only then start measuring and filling `accurate_efficient_factor` and fitted communication data.
+
+If you only need approximate analysis, copying the nearest shipped system config is usually better than writing a new one from scratch.
+
+## Minimal viable template
+
+The example below is intentionally complete enough to be a real starting point. It includes a `networks` skeleton, which earlier drafts of this doc did not show clearly enough.
 
 ```json
-system_template = {
-    "sys_name": "A100",
+{
+    "sys_name": "my_system",
     "num_per_node": 8,
     "accelerator": {
         "backend": "cuda",
         "mem_gbs": 80,
-        "op" : {
-
+        "op": {
+            "default": {
+                "tflops": 312,
+                "efficient_factor": 0.75
+            }
         },
         "bandwidth": {
-            
+            "default": {
+                "efficient_factor": 0.9,
+                "gbps": 1600,
+                "latency_us": 40
+            }
         },
         "mode": "roofline"
     },
-    "FC8":true,
+    "networks": {
+        "intra_with_pcie": false,
+        "low_intra_node": {
+            "processor_usage": 0.0,
+            "bandwidth": {
+                "efficient_factor": 0.5,
+                "gbps": 300,
+                "latency_us": 10
+            },
+            "op": {
+                "all_reduce": {"scale": 2, "offset": -1},
+                "all_gather": {"scale": 1, "offset": -1},
+                "reduce_scatter": {"scale": 1, "offset": -1},
+                "p2p": {"scale": 1, "offset": 0},
+                "all2all": {"scale": 1, "offset": -1}
+            }
+        },
+        "high_intra_node": {
+            "processor_usage": 0.0,
+            "bandwidth": {
+                "efficient_factor": 0.5,
+                "gbps": 300,
+                "latency_us": 10
+            },
+            "op": {
+                "all_reduce": {"scale": 2, "offset": -1},
+                "all_gather": {"scale": 1, "offset": -1},
+                "reduce_scatter": {"scale": 1, "offset": -1},
+                "p2p": {"scale": 1, "offset": 0},
+                "all2all": {"scale": 1, "offset": -1}
+            }
+        },
+        "inter_node": {
+            "processor_usage": 0.0,
+            "bandwidth": {
+                "efficient_factor": 0.5,
+                "gbps": 200,
+                "latency_us": 30
+            },
+            "op": {
+                "all_reduce": {"scale": 2, "offset": -1},
+                "all_gather": {"scale": 1, "offset": -1},
+                "reduce_scatter": {"scale": 1, "offset": -1},
+                "p2p": {"scale": 1, "offset": 0},
+                "all2all": {"scale": 1, "offset": -1}
+            }
+        }
+    }
 }
 ```
+
+## Required fields vs common defaults
+
+Fields you should treat as required:
+
+- `sys_name`
+- `num_per_node`
+- `accelerator.backend`
+- `accelerator.mem_gbs`
+- `accelerator.op.default`
+- `accelerator.bandwidth.default`
+- `networks.intra_with_pcie`
+- the matching network groups under `networks`
+
+Fields that many users can keep close to an existing config at first:
+
+- `accelerator.mode` (`roofline` is the common default)
+- `processor_usage` (currently a reserved field in public configs)
+- operation-specific bandwidth overrides under `accelerator.bandwidth`
+- operation-specific communication overrides under `networks.*.op`
+
+For approximate analysis, it is acceptable to:
+
+- start from the nearest shipped config
+- leave many `accurate_efficient_factor` entries empty
+- use approximate network numbers from a similar machine
+
+For timing-quality analysis, you should measure:
+
+- dominant `matmul`, `group_matmul`, and attention shapes
+- intra-node and inter-node communication bandwidth / latency
+
+In other words:
+
+- `accelerator.op.*.accurate_efficient_factor` closes the operator-efficiency gap
+- `networks.*` closes the communication-timing gap
+- `num_per_node`, `accelerator.mem_gbs`, and `accelerator.bandwidth.*` still need to be reviewed against the real machine before you rely on timing
+
+See [simu_tools/efficency_test/README.md](../simu_tools/efficency_test/README.md) for the shared public measurement path.
 
 ## accelerator
 The accelerator section includes GPU memory size, memory access bandwidth, computing power, and computational efficiency for various operators.
@@ -200,7 +356,7 @@ Each network bandwidth configuration includes the following parameters:
         - latency_us，optional
     - p2p: Network bandwidth efficiency for p2p (point-to-point) operation
         - scale: 1, fixed
-        - offset: -1， fixed
+        - offset: 0， fixed
         - efficient_factor， optional
         - latency_us，optional
     - all2all: Network bandwidth efficiency for all2all operation

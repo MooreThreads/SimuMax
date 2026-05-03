@@ -1,0 +1,85 @@
+diff --git a/megatron/core/pipeline_parallel/schedules.py b/megatron/core/pipeline_parallel/schedules.py
+--- a/megatron/core/pipeline_parallel/schedules.py
++++ b/megatron/core/pipeline_parallel/schedules.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ 
+ import contextlib
++import os
+ from functools import partial
+ from typing import Callable, Iterator, List, Optional, Union
+ 
+@@ -29,6 +30,20 @@ from transformer_engine.pytorch.cpu_offload import get_fine_grained_offload_hand
+ Shape = Union[List[int], torch.Size]
+ 
+ 
++def _get_warmup_pipeline_parallel_size(real_pp_size: int) -> int:
++    """Optionally override warmup-depth modeling without changing real PP comm topology."""
++    fake_pp_size = os.environ.get("MEGATRON_FAKE_PP_SIZE_FOR_WARMUP")
++    if fake_pp_size is None:
++        return real_pp_size
++    fake_pp_size = int(fake_pp_size)
++    if fake_pp_size < real_pp_size:
++        raise ValueError(
++            "MEGATRON_FAKE_PP_SIZE_FOR_WARMUP must be >= real pipeline parallel size, "
++            f"but got fake={fake_pp_size}, real={real_pp_size}"
++        )
++    return fake_pp_size
++
++
+ def get_forward_backward_func():
+     """Retrieves the appropriate forward_backward function given the
+     configuration of parallel_state.
+@@ -114,7 +128,10 @@ def get_forward_backward_func():
+ 
+     """
+     pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+-    if pipeline_model_parallel_size > 1:
++    warmup_pipeline_parallel_size = _get_warmup_pipeline_parallel_size(
++        pipeline_model_parallel_size
++    )
++    if pipeline_model_parallel_size > 1 or warmup_pipeline_parallel_size > 1:
+         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
+             forward_backward_func = forward_backward_pipelining_with_interleaving
+         else:
+@@ -604,6 +621,7 @@ def get_pp_rank_microbatches(
+     pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+     pipeline_parallel_rank = parallel_state.get_pipeline_model_parallel_rank()
+     virtual_pipeline_parallel_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
++    warmup_pipeline_parallel_size = _get_warmup_pipeline_parallel_size(pipeline_parallel_size)
+ 
+     total_num_microbatches = num_microbatches * num_model_chunks
+     are_all_microbatches_in_warmup = False
+@@ -613,7 +631,7 @@ def get_pp_rank_microbatches(
+     elif pipeline_parallel_size > 1:
+         if virtual_pipeline_parallel_size is None:
+             # forward_backward_pipelining_without_interleaving
+-            num_warmup_microbatches = pipeline_parallel_size - pipeline_parallel_rank - 1
++            num_warmup_microbatches = warmup_pipeline_parallel_size - pipeline_parallel_rank - 1
+         else:
+             # forward_backward_pipelining_with_interleaving
+             # Run (num_model_chunks-1)*microbatch_group_size_per_vp_stage on
+@@ -621,7 +639,7 @@ def get_pp_rank_microbatches(
+             # stage ID (more forward passes for earlier stages, later stages can
+             # immediately start with 1F1B).
+             num_warmup_microbatches = (
+-                pipeline_parallel_size - pipeline_parallel_rank - 1
++                warmup_pipeline_parallel_size - pipeline_parallel_rank - 1
+             ) * 2
+             num_warmup_microbatches += (num_model_chunks - 1) * microbatch_group_size_per_vp_stage
+     else:
+@@ -1825,10 +1843,11 @@ def forward_backward_pipelining_without_interleaving(
+     disable_grad_sync()
+ 
+     # Compute number of warmup microbatches.
+-    num_warmup_microbatches = (
++    warmup_pipeline_parallel_size = _get_warmup_pipeline_parallel_size(
+         parallel_state.get_pipeline_model_parallel_world_size()
+-        - parallel_state.get_pipeline_model_parallel_rank()
+-        - 1
++    )
++    num_warmup_microbatches = (
++        warmup_pipeline_parallel_size - parallel_state.get_pipeline_model_parallel_rank() - 1
+     )
+     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
+     num_microbatches_remaining = num_microbatches - num_warmup_microbatches

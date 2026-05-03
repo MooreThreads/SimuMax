@@ -15,7 +15,40 @@ from transformer_engine.pytorch.cpp_extensions import (
     general_gemm
 )
 from simumax.utils import get_simu_model_config, get_simu_system_config, get_simu_strategy_config
-from simu_tools.efficency_test.utils import get_system_name, sync_device, get_torch_profiler, get_all_test_model_configs, get_test_seq_len_list, get_test_mbs_list, get_test_tp_list, get_test_ep_list
+try:
+    from simu_tools.efficency_test.utils import (
+        get_system_name,
+        get_efficiency_save_root,
+        sync_device,
+        get_torch_profiler,
+        get_all_test_model_configs,
+        get_test_seq_len_list,
+        get_test_mbs_list,
+        get_test_tp_list,
+        get_test_ep_list,
+        get_test_cp_list,
+        get_dtype_list,
+        get_extra_vocab_size_list,
+    )
+except ModuleNotFoundError:
+    from utils import (
+        get_system_name,
+        get_efficiency_save_root,
+        sync_device,
+        get_torch_profiler,
+        get_all_test_model_configs,
+        get_test_seq_len_list,
+        get_test_mbs_list,
+        get_test_tp_list,
+        get_test_ep_list,
+        get_test_cp_list,
+        get_dtype_list,
+        get_extra_vocab_size_list,
+    )
+try:
+    torch.musa.set_device(0)
+except:
+    pass
 
 def prepare_tensors(B: int, M: int, K: int, N: int,  dtype,  device):
     """
@@ -54,7 +87,6 @@ def run_te_gemm(B: int, M: int, K: int, N: int, dtype, device, layout, accumulat
     """
     
     out_dtype = torch.bfloat16 if out_dtype == 'bf16' else torch.float32
-    out_dtype = torch.bfloat16
 
     if layout == 'NN':
         B_matrix = torch.randn((K, N), device=device, dtype=torch.bfloat16)
@@ -84,7 +116,21 @@ def run_te_gemm(B: int, M: int, K: int, N: int, dtype, device, layout, accumulat
         A_matrix = quantizer(A_matrix)
         B_matrix = quantizer(B_matrix)
     print(f'A_matrix: {A_matrix.shape} {A_matrix.device} {A_matrix.dtype}, B_matrix: {B_matrix.shape} {B_matrix.device} {B_matrix.dtype}, output: {output.shape} {output.device} {output.dtype}')
+    """
+        GEMM A.shape=(torch.Size([1536, 5120]), torch.uint8) B.shape=(torch.Size([4096, 1, 5120]), torch.uint8), workspace=torch.Size([4194304]), out_dtype=torch.bfloat16, quantization_params=None, gelu=False, gelu_in=None, accumulate=False, layout=TN, out=(torch.Size([4096, 1, 5120]), torch.uint8), bias=None, use_split_accumulator=False, grad=False, ub=None, ub_type=None, extra_output=None, bulk_overlap=False
 
+        GEMM A.shape=(torch.Size([576, 5120]), torch.uint8) B.shape=(torch.Size([4096, 576]), torch.uint8), workspace=torch.Size([4194304]), out_dtype=torch.bfloat16, quantization_params=None, gelu=False, gelu_in=None, accumulate=False, layout=NN, out=(torch.Size([4096, 576]), torch.uint8), bias=None, use_split_accumulator=True, grad=True, ub=None, ub_type=None, extra_output=None, bulk_overlap=False
+
+        GEMM A.shape=(torch.Size([4096, 1, 5120]), torch.uint8) B.shape=(torch.Size([4096, 576]), torch.uint8), workspace=torch.Size([4194304]), out_dtype=torch.float32, quantization_params=None, gelu=False, gelu_in=None, accumulate=False, layout=NT, out=(torch.Size([4096, 576]), torch.uint8), bias=None, use_split_accumulator=True, grad=True, ub=None, ub_type=None, extra_output=None, bulk_overlap=False
+    """
+    """
+    GEMM A.shape=(torch.Size([1536, 5120]), torch.bfloat16) B.shape=(torch.Size([4096, 1, 5120]), torch.bfloat16), workspace=torch.Size([4194304]), out_dtype=torch.bfloat16, quantization_params=None, gelu=False, gelu_in=None, accumulate=False, layout=TN, out=(torch.Size([4096, 1, 5120]), torch.bfloat16), bias=None, use_split_accumulator=False, grad=False, ub=None, ub_type=None, extra_output=None, bulk_overlap=False
+
+    GEMM A.shape=(torch.Size([4096, 1536]), torch.bfloat16) B.shape=(torch.Size([4096, 24576]), torch.bfloat16), workspace=torch.Size([4194304]), out_dtype=torch.float32, quantization_params=None, gelu=False, gelu_in=None, accumulate=True, layout=NT, out=(torch.Size([4096, 24576]), torch.bfloat16), bias=tensor([], device='musa:0', dtype=torch.bfloat16), use_split_accumulator=True, grad=True, ub=None, ub_type=None, extra_output=None, bulk_overlap=False
+
+
+    GEMM A.shape=(torch.Size([4096, 5120]), torch.bfloat16) B.shape=(torch.Size([4096, 24576]), torch.bfloat16), workspace=torch.Size([4194304]), out_dtype=torch.float32, quantization_params=None, gelu=False, gelu_in=None, accumulate=False, layout=NT, out=(torch.Size([4096, 24576]), torch.bfloat16), bias=tensor([], device='musa:0', dtype=torch.bfloat16), use_split_accumulator=True, grad=True, ub=None, ub_type=None, extra_output=None, bulk_overlap=False
+    """
     assert warmup_steps < test_steps, "warmup_steps should be less than test_steps"
     print(f'B={B_matrix.shape}, A={A_matrix.shape}, out={output.shape}, layout={layout}')
     sync_device(device)
@@ -95,8 +141,8 @@ def run_te_gemm(B: int, M: int, K: int, N: int, dtype, device, layout, accumulat
             sync_device(device)
             start_time = time.time()
         general_gemm(
-            B_matrix, 
-            A_matrix, 
+            B_matrix,
+            A_matrix,
             get_workspace(),
             out_dtype=out_dtype,
             quantization_params=None,
@@ -141,9 +187,9 @@ def plot_topk(ops_info, topk, save_path):
     plt.savefig(save_path)
     plt.show()
 
-def test_gemm_efficency(gemm_shape_list, max_tflops, device, save_root, dtype, res, test_steps, warmup_steps):
-    # 遍历df每一行，拿到b, m n k， 测试gemm shape的效率，记录在efficency中 
-    efficiency_file_path = f'{save_root}/gemm_efficency.json'
+def test_gemm_efficiency(model, gemm_shape_list, max_tflops, device, save_root, dtype, res, test_steps, warmup_steps):
+    # 遍历df每一行，拿到b, m n k， 测试gemm shape的效率，记录在efficiency中 
+    efficiency_file_path = f'{save_root}/gemm_efficiency.json'
     matmul_key = 'matmul' if dtype == 'bf16' else 'fp8_matmul'
     if os.path.exists(efficiency_file_path):
         all_efficiency = json.load(open(efficiency_file_path))
@@ -200,10 +246,10 @@ def test_gemm_efficency(gemm_shape_list, max_tflops, device, save_root, dtype, r
             # Store the efficiency metric
             accurate_efficiency[shape_key] = tflops/max_tflops 
 
-            print(f"Shape {shape_key}: {tflops:.2f} TFLOPS, efficiency: {tflops/max_tflops}, execution_time={execution_time*1000} ms")
+            print(f"=== [{model} matmul] Shape {shape_key}: {tflops:.2f} TFLOPS, efficiency: {tflops/max_tflops}, execution_time={execution_time*1000} ms")
             res[shape_key] = {'efficiency': tflops/max_tflops, 'execution_time' : f'{execution_time*1000} ms'}
         else:
-            print(f'Shape {shape_key} already exists')
+            print(f'=== [{model} matmul] Shape {shape_key} already exists')
 
     avg_efficiency = sum(accurate_efficiency.values())/len(accurate_efficiency)
     all_efficiency[matmul_key]['efficient_factor'] = avg_efficiency
@@ -227,67 +273,89 @@ def parse_ops_info(perf_model:PerfLLM, save_root):
 
 def test(dtype, grad_reduce_in_bf16):
     system, device, MAX_TFLOPS = get_system_name()
-    save_root =  f'{system}_gemm_efficency'
+    save_root = get_efficiency_save_root(system, 'gemm_efficiency')
     os.makedirs(save_root, exist_ok=True)
     MODEL_CONFIGS = get_all_test_model_configs()
     MBS_LIST = get_test_mbs_list()
     SEQ_LEN_LIST = get_test_seq_len_list()
+    CP_LIST = get_test_cp_list()
+    EXTRA_VOCAB_SIZE_LIST = get_extra_vocab_size_list()
 
     res = {}
     system_config = SystemConfig.init_from_config_file(get_simu_system_config('a100_pcie'))
-    strategy_config = StrategyConfig.init_from_format_strings("tp1.ep1.tp1.pp1.mbs1.gbs8.world_size8")
+    strategy_config = StrategyConfig.init_from_format_strings(
+        "seq4096.mbs1.mbc1.gbs8.tp1.cp1.ep1.pp1.world_size:8"
+    )
     strategy_config.fp8 = False
     strategy_config.grad_reduce_in_bf16 = grad_reduce_in_bf16
     perf_model = PerfLLM()
 
     for SEQ_LEN in SEQ_LEN_LIST:
-        for model_config in MODEL_CONFIGS:
-            tp_list = [1]
-            ep_list = [1]
-            model_name = model_config.model_name
-            if model_config.model_type == 'moe':
-                model_config.moe_pad_expert_input_to_capacity = True
-                model_config.capacity = 1
-                model_config.layer_num = 10
-            elif model_config.model_type == 'dense':
-                tp_list = get_test_tp_list()
+        for cp in CP_LIST:
+            for model_config in MODEL_CONFIGS:
+                model_config: ModelConfig = model_config
+                tp_list = [1]
+                ep_list = [1]
+                model_name = model_config.model_name
+                base_vocab_size = model_config.vocab_size
+                base_padded_vocab_size = model_config.padded_vocab_size
+                base_make_vocab_size_divisible_by = model_config.make_vocab_size_divisible_by
+                if model_config.model_type == 'moe':
+                    model_config.moe_pad_expert_input_to_capacity = True
+                    model_config.capacity = 1
+                    model_config.layer_num = 10
+                elif model_config.model_type == 'dense':
+                    tp_list = get_test_tp_list()
+                
+                VOCAB_SIZE_LIST = [base_vocab_size] + EXTRA_VOCAB_SIZE_LIST
+                for vocab_size in VOCAB_SIZE_LIST:
+                    model_config.vocab_size = vocab_size
+                    model_config.padded_vocab_size = True
+                    model_config.make_vocab_size_divisible_by = 128
 
-            model_config.padded_vocab_size = True
-            model_config.make_vocab_size_divisible_by = 128
+                    for MBS in MBS_LIST:
+                        for tp in tp_list:
+                            for ep in ep_list:
+                                print(f"[{model_name} matmul] Run Test seq_len={SEQ_LEN}, cp={cp}, vocab_size={vocab_size}, mbs={MBS}, tp={tp}, ep={ep}")
+                                strategy_config.tp_size = tp
+                                strategy_config.ep_size = ep
+                                strategy_config.pp_size = 1
+                                strategy_config.micro_batch_size = MBS  # SET micro_batch_size
+                                strategy_config.world_size = max(int(tp*cp), 8, ep)
+                                strategy_config.seq_len = SEQ_LEN // cp      # SET sequence-length
+                                
+                                if strategy_config.seq_len <= 64:
+                                    continue
+                                
+                                if model_config.head_num % tp != 0 or model_config.kv_head_num % tp != 0:
+                                    return 
+                                
+                                perf_model.configure(
+                                    strategy_config=strategy_config,
+                                    model_config=model_config,
+                                    system_config=system_config
+                                )
+                                perf_model.run_estimate()
+                                perf_model.analysis()
 
-            for MBS in MBS_LIST:
-                for tp in tp_list:
-                    for ep in ep_list:
-                        strategy_config.tp_size = tp
-                        strategy_config.ep_size = ep
-                        strategy_config.pp_size = 1
-                        strategy_config.micro_batch_size = MBS  # SET micro_batch_size
-                        strategy_config.world_size = 8
-                        strategy_config.seq_len = SEQ_LEN       # SET sequence-length
-            
-                        perf_model.configure(
-                            strategy_config=strategy_config,
-                            model_config=model_config,
-                            system_config=system_config
-                        )
-                        perf_model.run_estimate()
-                        perf_model.analysis()
-
-                        ops_info = parse_ops_info(perf_model, os.path.join(save_root, model_name))
-                        test_gemm_efficency(gemm_shape_list = ops_info,
-                                            max_tflops = MAX_TFLOPS,
-                                            device = device,
-                                            save_root = save_root,
-                                            dtype = dtype,
-                                            res=res,
-                                            test_steps = 100, 
-                                            warmup_steps = 25)
+                                ops_info = parse_ops_info(perf_model, os.path.join(save_root, model_name))
+                                test_gemm_efficiency(model= model_name,
+                                                    gemm_shape_list = ops_info,
+                                                    max_tflops = MAX_TFLOPS,
+                                                    device = device,
+                                                    save_root = save_root,
+                                                    dtype = dtype,
+                                                    res=res,
+                                                    test_steps = 100, 
+                                                    warmup_steps = 25)
+                model_config.vocab_size = base_vocab_size
+                model_config.padded_vocab_size = base_padded_vocab_size
+                model_config.make_vocab_size_divisible_by = base_make_vocab_size_divisible_by
 
     with open(os.path.join(save_root, 'all_efficiency_and_duration.json'), 'w') as f:
         json.dump(res, f, indent=4)
         
 if __name__ == '__main__':
-    # test('fp8', grad_reduce_in_bf16=False)
-    # test('fp8', grad_reduce_in_bf16=True)
-    test('bf16', grad_reduce_in_bf16=False)
-    test('bf16', grad_reduce_in_bf16=True)
+    for dtype in get_dtype_list():
+        test(dtype, grad_reduce_in_bf16=False)
+        # test(dtype, grad_reduce_in_bf16=True)

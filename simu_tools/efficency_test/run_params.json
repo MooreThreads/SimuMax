@@ -11,6 +11,9 @@
                   "mixtral-8x7b"],
     "mbs_list": [1, 2, 4],
     "seq_len_list":[4096],
+    "extra_vocab_size_list": [102401],
+    "cp_list": [1, 2, 4, 8],
     "tp_list": [1, 2, 4, 8],
-    "ep_list": [1, 2, 4, 8, 16, 64]
+    "ep_list": [1, 2, 4, 8, 16, 64],
+    "dtype": ["bf16", "fp8"]
 }

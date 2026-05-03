@@ -1,0 +1,24 @@
+{
+    "model_type":"moe",
+    "model_name":"ling-1T",
+    "attention_type": "mha",
+
+    "layer_num": 80,
+    "hidden_size": 8192,
+    "intermediate_size": 18432,
+    "moe_ffn_hidden_size": 2048,
+    "moe_shared_expert_intermediate_size": 2048,
+    "vocab_size": 157184,
+    "expert_num": 256,
+    "kv_head_num": 8,
+    "head_size": 128,
+    "head_num": 64,
+    
+    "v_head_dim": 128,
+    "qk_head_dim": 128,
+    "qk_pos_emb_head_dim": 64,
+
+    "topk":8,
+    "dense_layers": 4,
+    "use_swiglu": true
+}

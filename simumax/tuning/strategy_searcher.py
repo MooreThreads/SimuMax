@@ -68,7 +68,7 @@ class StrategySearcher:
                         continue
                     if (world_size // pp_size) % etp_size != 0:
                         continue
-                    if (world_size // pp_size) % ep_size != 0:
+                    if world_size % (pp_size * ep_size * etp_size) != 0:
                         continue
                     candidate_list.append(
                         {"pp_size": pp_size, "ep_size": ep_size, "etp_size": etp_size}

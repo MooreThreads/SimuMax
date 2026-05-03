@@ -16,8 +16,9 @@ pp_size=$4
 model_type=$5
 test_type=$6
 num_layer=$7
-dtype=${8:-"bf16"}
-(( dp_size = $world_size / ($tp_size * $pp_size) ))
+cp_size=${8:-1}
+dtype=${9:-"bf16"}
+(( dp_size = $world_size / ($tp_size * $pp_size * $cp_size) ))
 (( global_batch_size = $micro_batch_size * $num_microbatches * $dp_size ))
 
 # echo -e "\033[32mdp_size: $dp_size, pp_size: $pp_size, ep_size: $ep_size, \
@@ -31,7 +32,7 @@ set -u
   work_home=$(realpath ./)
   patch_home=""
   megatron_home="./Megatron-LM"
-  example="tp${tp_size}_pp${pp_size}_dp${dp_size}_mbs${micro_batch_size}_mbc${num_microbatches}_gbs${global_batch_size}_gpus${world_size}"
+  example="tp${tp_size}_cp${cp_size}_pp${pp_size}_dp${dp_size}_mbs${micro_batch_size}_mbc${num_microbatches}_gbs${global_batch_size}_gpus${world_size}"
   data_path=${data_path:-"/home/dist/yehua/llama2_dataset/llama_00_text_document"}
   hostfile=./hostfile
   log_file=${output_dir}/$example.log
@@ -46,6 +47,7 @@ cmd_env=(
     "MEGATRON_HOME=${megatron_home}"
     "EXAMPLE=${example}"
     "HOSTFILE=${hostfile}"
+    "CP_SIZE=${cp_size}"
     "TP_SIZE=${tp_size}"
     "PP_SIZE=${pp_size}"
     "EP_SIZE=${ep_size}"
@@ -71,13 +73,37 @@ if [ -z "$hostlist" ]; then
   exit 1
 fi
 
+is_local_host() {
+  local host="$1"
+  local short_hostname
+  short_hostname=$(hostname)
+  local fqdn_hostname
+  fqdn_hostname=$(hostname -f 2>/dev/null || hostname)
+  [[ "$host" == "127.0.0.1" || "$host" == "localhost" || "$host" == "$short_hostname" || "$host" == "$fqdn_hostname" ]]
+}
+
+declare -a launch_pids=()
+declare -a launch_hosts=()
+
 for host in ${hostlist[@]}; do
-  # cmd_ssh="$cmd > ${output_dir}/$host.log 2>&1"
   cmd_ssh="$cmd > ${output_dir}/$host.log"
-  echo $cmd_ssh
-  ssh -n $host $cmd_ssh &
-  # eval $cmd_ssh
+  echo "$cmd_ssh"
+  if is_local_host "$host"; then
+    bash -lc "$cmd_ssh" &
+  else
+    ssh -n "$host" "$cmd_ssh" &
+  fi
+  launch_pids+=("$!")
+  launch_hosts+=("$host")
 done
 
-wait
-bash stop_all.sh 
+failed=0
+for idx in "${!launch_pids[@]}"; do
+  if ! wait "${launch_pids[$idx]}"; then
+    echo "Launch failed on host: ${launch_hosts[$idx]}" >&2
+    failed=1
+  fi
+done
+
+bash stop_all.sh || true
+exit "$failed"

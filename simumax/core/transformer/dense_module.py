@@ -3,15 +3,16 @@
 from copy import deepcopy
 from simumax.core.tensor import TensorSize, Float8Tensor
 from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugContext, LinearBase
-from simumax.core.base_struct import (all_gather, reduce_scatter, all_reduce, all_gather_bwd,
+from simumax.core.base_struct import (all_gather, reduce_scatter, all_reduce, all_gather_bwd, all2all_fwd, all2all_bwd,
                            AtomModel, LeafModel, FwdQue,
                            send_next, send_prev, recv_next, recv_prev,
+                           async_send_next, async_send_prev, async_recv_next, async_recv_prev, async_wait_recv_next, async_wait_recv_prev,
+                           sync_send_next, sync_send_prev, sync_wait_recv_next, sync_wait_recv_prev,
                            COM_BUFF)
 from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, AttentionRecomputeConfig, MLPRecomputeConfig, ENABLE_SIMU_GRAPH
-from simumax.core.utils import get_rank_group
+from simumax.core.utils import format_model_info_microbatch_tag, get_rank_group
 import simumax.core.transformer.simu_ops as simu_ops
 from simumax.core.transformer.function import ConcatFunction,SplitFunction
-
 
 #region ------------------ Atomic module ------------------
 class Embedding(MetaModule):
@@ -32,7 +33,7 @@ class Embedding(MetaModule):
     
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
-        model_info = f"microbatch:{args.microbatch}-name:{self.__class__.__name__}"
+        model_info = f"{format_model_info_microbatch_tag(args)}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
@@ -51,7 +52,7 @@ class Embedding(MetaModule):
             )
             self.layers.append(reduce_scatter(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank))
             state.comm_order += 1
         elif self.strategy.tp_size > 1:
             comm_size = (
@@ -67,7 +68,7 @@ class Embedding(MetaModule):
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=0))
+                                         fwd_cost=cost, bwd_cost=0, global_rank=args.rank))
             state.comm_order += 1
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
@@ -76,6 +77,9 @@ class Embedding(MetaModule):
         # [B, S, H]
         batch_size = self.output_info_.tensors[0].size(0)
         seq_len = self.output_info_.tensors[0].size(1)
+        # FIXME(sherry): seq_len is not correct for sequence parallel
+        # if self.strategy.enable_sequence_parallel:
+        #     seq_len /= self.strategy.tp_size
         hidden_size = self.output_info_.tensors[0].size(2)
         return batch_size * seq_len * hidden_size
 
@@ -127,34 +131,30 @@ class Embedding(MetaModule):
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         input_size = batch_size * seq_len * 4  
-        weight_size = self.vocab_size * self.hidden_size
+        weight_size = self.vocab_size * self.hidden_size * self.element_size
         output_size = batch_size * seq_len * self.hidden_size * self.element_size
         # FIXME: Aggregation will cause some model weight to be added repeatedly,
         # resulting in an overestimation of the peak
         
         self._act_info.fwd_peak_mem_no_cache = input_size + output_size + (0 if self.strategy.use_accm_weight else weight_size)
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = weight_size
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.vocab_size * self.hidden_size
         self._model_info.weight_numel = weight_numel * self.strategy.tp_size # Statistics the parameters of all tp ranks
         self._model_info.dense_weight_bytes = weight_numel * self.element_size
-        self._model_info.dense_grad_bytes = (
-            self._model_info.dense_weight_bytes
-            if not self.strategy.use_fp32_accum_grad
-            else self.dtype_to_element_size["fp32"] * weight_numel
-        )
+        self._model_info.dense_grad_bytes = weight_numel * self.main_grad_element_size
         self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
+        
+        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
         if self.strategy.zero_state >= 1:
-            self._model_info.dense_state_bytes /= self.strategy.dp_size
+            self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
-            self._model_info.dense_grad_bytes /= self.strategy.dp_size
+            self._model_info.dense_grad_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 3:
-            self._model_info.dense_weight_bytes /= self.strategy.dp_size
+            self._model_info.dense_weight_bytes /= optimizer_group_size
 
     def _comp_leaf_flops_info(self):
         self._compute_info.fwd_flops = 0
@@ -207,6 +207,7 @@ class LinearCol(LinearBase):
         system: SystemConfig,
         enable_fp8:bool = True,
         is_last_recompute = False,
+        use_variance_tail_model: bool = False,
         disable_tensor_parallel = False,
         specific_name='ColumnParallelLinear'
     ) -> None:
@@ -219,6 +220,7 @@ class LinearCol(LinearBase):
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
         self.is_last_recompute = is_last_recompute
+        self.use_variance_tail_model = self.use_variance_tail_model or use_variance_tail_model
         if self.is_last_recompute and self.enable_recompute:
             self.set_variance_node(True)
         if self.strategy.fp8 and enable_fp8:
@@ -233,7 +235,7 @@ class LinearCol(LinearBase):
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
-        model_info = f"microbatch:{args.microbatch}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
+        model_info = f"{format_model_info_microbatch_tag(args)}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
         if self.strategy.enable_sequence_parallel and self.strategy.tp_size > 1:
@@ -250,7 +252,7 @@ class LinearCol(LinearBase):
             )
             self.layers.append(all_gather(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))#'comm all_gather input/ bwd:rs'
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank))#'comm all_gather input/ bwd:rs'
             state.comm_order += 1
 
         elif self.strategy.tp_size > 1:
@@ -266,7 +268,7 @@ class LinearCol(LinearBase):
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=0, bwd_cost=cost))
+                                         fwd_cost=0, bwd_cost=cost, global_rank=args.rank))
             state.comm_order += 1
         #linear
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
@@ -286,7 +288,7 @@ class LinearCol(LinearBase):
             )
             self.layers.append(all_gather_bwd(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=0, bwd_cost=cost))  #gather again in bwd to save memory
+                                         fwd_cost=0, bwd_cost=cost, global_rank=args.rank))  #gather again in bwd to save memory
             state.comm_order += 1
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
@@ -420,7 +422,7 @@ class LinearCol(LinearBase):
         return weight_size, input_size, output_size
     
     def _comp_leaf_act_info_impl(self):
-        # self._act_info.activation_mem_cache = self._comp_input_cache_size() # 拿到输入的cache信息, all-gather before
+        # self._act_info.activation_mem_cache = self._comp_input_cache_size() # input cache before all-gather
         self._act_info.activation_mem_cache = (
             self.micro_hidden_state_size * self.a_element_size
         )
@@ -433,28 +435,24 @@ class LinearCol(LinearBase):
         weight_size, input_size, output_size = self._comp_gemm_mem_accessed_size()
         
         self._act_info.fwd_peak_mem_no_cache = input_size + output_size + (0 if self.strategy.use_accm_weight else weight_size)
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = input_size + output_size + (0 if self.strategy.use_accm_weight else weight_size)
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.input_size * self.output_size
         self._model_info.weight_numel = weight_numel * self.strategy.tp_size # Statistics the parameters of all tp ranks
         self._model_info.dense_weight_bytes = weight_numel * self.w_element_size # fp8_enabled = True, w_element_size=1
-        self._model_info.dense_grad_bytes = (
-            self._model_info.dense_weight_bytes
-            if not self.strategy.use_fp32_accum_grad
-            else self.dtype_to_element_size["fp32"] * weight_numel
-        )
+        self._model_info.dense_grad_bytes = weight_numel * self.main_grad_element_size
         self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel # w/m/v
         )
+        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
         if self.strategy.zero_state >= 1:
-            self._model_info.dense_state_bytes /= self.strategy.dp_size
+            self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
-            self._model_info.dense_grad_bytes /= self.strategy.dp_size
+            self._model_info.dense_grad_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 3:
-            self._model_info.dense_weight_bytes /= self.strategy.dp_size
+            self._model_info.dense_weight_bytes /= optimizer_group_size
+        self._record_te_dummy_wgrad_shape()
 
     def _comp_leaf_flops_info(self):
         base_flops = 2 * self.micro_hidden_state_size * self.output_size
@@ -524,6 +522,7 @@ class LinearRow(LinearBase):
         strategy: StrategyConfig,
         system: SystemConfig,
         is_last_recompute = False,
+        use_variance_tail_model: bool = False,
         specific_name='RowParallelLinear'
 
     ) -> None:
@@ -535,6 +534,7 @@ class LinearRow(LinearBase):
         self.use_bias = use_bias  # FIXME(for now unless)
         self.enable_recompute = enable_recompute
         self.is_last_recompute = is_last_recompute
+        self.use_variance_tail_model = self.use_variance_tail_model or use_variance_tail_model
         if self.is_last_recompute and self.enable_recompute:
             self.set_variance_node(True)
         self.has_cached_inputs = has_cached_inputs
@@ -550,7 +550,7 @@ class LinearRow(LinearBase):
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
-        model_info = f"microbatch:{args.microbatch}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
+        model_info = f"{format_model_info_microbatch_tag(args)}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
@@ -571,7 +571,7 @@ class LinearRow(LinearBase):
             
             self.layers.append(reduce_scatter(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size,  com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank))
             state.comm_order += 1
         elif self.strategy.tp_size > 1:
             comm_size = (
@@ -586,7 +586,7 @@ class LinearRow(LinearBase):
             )
             self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size,  com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=0))
+                                         fwd_cost=cost, bwd_cost=0, global_rank=args.rank))
             state.comm_order += 1
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
@@ -717,20 +717,18 @@ class LinearRow(LinearBase):
         weight_numel = self.input_size * self.output_size
         self._model_info.weight_numel = weight_numel * self.strategy.tp_size # Statistics the parameters of all tp ranks
         self._model_info.dense_weight_bytes = weight_numel * self.w_element_size # fp8_enabled = True, w_element_size=1
-        self._model_info.dense_grad_bytes = (
-            self._model_info.dense_weight_bytes
-            if not self.strategy.use_fp32_accum_grad
-            else self.dtype_to_element_size["fp32"] * weight_numel
-        )
+        self._model_info.dense_grad_bytes = weight_numel * self.main_grad_element_size
         self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
+        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
         if self.strategy.zero_state >= 1:
-            self._model_info.dense_state_bytes /= self.strategy.dp_size
+            self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
-            self._model_info.dense_grad_bytes /= self.strategy.dp_size
+            self._model_info.dense_grad_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 3:
-            self._model_info.dense_weight_bytes /= self.strategy.dp_size
+            self._model_info.dense_weight_bytes /= optimizer_group_size
+        self._record_te_dummy_wgrad_shape()
 
     def _comp_leaf_flops_info(self):
         base_flops = 2 * self.micro_hidden_state_size * self.output_size
@@ -873,9 +871,7 @@ class LayerNorm(MetaModule):
                     self.micro_hidden_state_size * self.element_size
                 )
             self._act_info.fwd_peak_mem_no_cache = input_size + output_size
-            self._act_info.fwd_peak_prev_cache_mem = 0
             self._act_info.bwd_peak_mem_no_cache = input_size + output_size + rstd_size
-            self._act_info.bwd_peak_prev_cache_mem = 0
         else:
             input_fp32_size = (
                 self.micro_hidden_state_size * self.dtype_to_element_size["fp32"]
@@ -902,10 +898,8 @@ class LayerNorm(MetaModule):
                 + output_fp32_size
                 + rstd_fp32_size
             )
-            self._act_info.fwd_peak_prev_cache_mem = 0
             # same as fwd
             self._act_info.bwd_peak_mem_no_cache = self._act_info.fwd_peak_mem_no_cache
-            self._act_info.bwd_peak_prev_cache_mem = 0
 
         self._act_info_with_recomp = self._act_info
 
@@ -913,20 +907,17 @@ class LayerNorm(MetaModule):
         weight_numel = self.norm_size
         self._model_info.weight_numel = weight_numel
         self._model_info.dense_weight_bytes = weight_numel * self.element_size
-        self._model_info.dense_grad_bytes = (
-            self._model_info.dense_weight_bytes
-            if not self.strategy.use_fp32_accum_grad
-            else self.dtype_to_element_size["fp32"] * weight_numel
-        )
+        self._model_info.dense_grad_bytes = weight_numel * self.main_grad_element_size
         self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
+        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
         if self.strategy.zero_state >= 1:
-            self._model_info.dense_state_bytes /= self.strategy.dp_size
+            self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
-            self._model_info.dense_grad_bytes /= self.strategy.dp_size
+            self._model_info.dense_grad_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 3:
-            self._model_info.dense_weight_bytes /= self.strategy.dp_size
+            self._model_info.dense_weight_bytes /= optimizer_group_size
 
     def _comp_leaf_flops_info(self):
         # ignore memory bound kernel flops for now
@@ -945,7 +936,7 @@ class LayerNorm(MetaModule):
         if self.use_fused_norm:
             # FWD
             self._compute_info.fwd_accessed_mem = input_size + weight_size + output_size
-            # 3 kernel (dx grad、dw part grad、dw sum)
+            # 3 kernels (dx grad, dw partial grad, dw reduce-sum)
             # BWD gamma
             self._compute_info.bwd_grad_w_accessed_mem = (
                 input_size + weight_size + weight_size
@@ -1039,9 +1030,7 @@ class Cat(MetaModule):
         """
         self._act_info.activation_mem_cache = 0
         self._act_info.fwd_peak_mem_no_cache = 0
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = 0
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_flops_info(self):
         """
@@ -1085,6 +1074,7 @@ class CoreAttention(MetaModule):
         system: SystemConfig,
         specific_name='DotProductAttention',
         is_last_recompute: bool = False,
+        use_variance_tail_model: bool = False,
     ) -> None:
         super().__init__(strategy, system, specific_name)
         self.use_math_sdp = use_math_sdp
@@ -1102,11 +1092,15 @@ class CoreAttention(MetaModule):
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
         self.is_last_recompute = is_last_recompute
+        self.use_variance_tail_model = self.use_variance_tail_model or use_variance_tail_model
         if self.is_last_recompute and self.enable_recompute:
             self.set_variance_node(True)
         
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
+        model_info = f"{format_model_info_microbatch_tag(args)}-name:{self.__class__.__name__}"
+        rank_info = get_rank_group(args.rank, self.strategy)
+        self._append_cp_a2a_layers(args, model_info, rank_info, com_buff=com_buff)
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
                                  bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,
                                  specific_name='AttentionScore'))
@@ -1150,13 +1144,264 @@ class CoreAttention(MetaModule):
     def get_input_shapes_desc(self, stage):
         hidden_states = self.input_info.tensors[0]
         batch, seq_len = hidden_states.shape[:2]
-        qkv_contiguous = True # TODO(sherry): get qkv_contiguous by input stride
-        shape_str = f'batch={int(batch)}, seq_len={int(seq_len)}, head_num={int(self.head_num)}, kv_head_num={int(self.kv_head_num)}, qk_head_dim={int(self.head_size)}, v_head_dim={int(self.v_head_dim)}, qkv_contiguous={qkv_contiguous}'
+        if self.strategy.cp_size > 1:
+            seq_len = seq_len * self.strategy.cp_size
+            head_num = self.head_num // self.strategy.cp_size
+            kv_head_num = self.kv_head_num//self.strategy.cp_size
+        else:
+            head_num = self.head_num
+            kv_head_num = self.kv_head_num
+        qkv_contiguous = False if 's5000' in self.system.sys_name else True # TODO(sherry): get qkv_contiguous by input stride
+        shape_str = f'batch={int(batch)}, seq_len={int(seq_len)}, head_num={int(head_num)}, kv_head_num={int(kv_head_num)}, qk_head_dim={int(self.head_size)}, v_head_dim={int(self.v_head_dim)}, qkv_contiguous={qkv_contiguous}'
         return shape_str
+
+    def _get_cp_a2a_stage_specs(self):
+        if not (self.strategy.cp_size > 1 and self.strategy.cp_comm_type == "a2a"):
+            return None
+
+        batch_size = self.input_info.tensors[0].size(0)
+        seq_len = self.input_info.tensors[0].size(1)
+        q_mem = batch_size * self.head_num * seq_len * self.head_size * self.element_size
+        k_mem = batch_size * self.kv_head_num * seq_len * self.head_size * self.element_size
+        v_mem = batch_size * self.kv_head_num * seq_len * self.v_head_dim * self.element_size
+        o_do_mem = (
+            batch_size * self.head_num * seq_len * self.v_head_dim * self.element_size
+        )
+        bwd_pre = [("Attention_BWD_CP2_DOUT", o_do_mem)]
+        if not self.strategy.te_cp_a2a_saves_pre_posta2a_output:
+            bwd_pre.insert(0, ("Attention_BWD_CP2_OUT", o_do_mem))
+        return {
+            "fwd_pre": [
+                ("Attention_FWD_CP1_Q", q_mem),
+                ("Attention_FWD_CP1_K", k_mem),
+                ("Attention_FWD_CP1_V", v_mem),
+            ],
+            "fwd_post": [("Attention_FWD_CP2", o_do_mem)],
+            "bwd_pre": bwd_pre,
+            "bwd_post": [
+                ("Attention_BWD_CP1_DQ", q_mem),
+                ("Attention_BWD_CP1_DK", k_mem),
+                ("Attention_BWD_CP1_DV", v_mem),
+            ],
+        }
+
+    def _append_cp_a2a_layers(self, args, model_info, rank_info, com_buff=None):
+        stage_specs = self._get_cp_a2a_stage_specs()
+        if stage_specs is None:
+            return
+
+        state = args.thread_state
+        cp_rank = rank_info.get(
+            "cp_rank", (args.rank // self.strategy.tp_size) % self.strategy.cp_size
+        )
+        cp_group_id = rank_info.get(
+            "cp_group_id",
+            f"tp:{rank_info['tp_rank']}-pp:{rank_info['pp_rank']}-dp:{rank_info['dp_rank']}",
+        )
+
+        def append_comm(comm_cls, stage_name, comm_size):
+            cost = self.system.compute_net_op_time(
+                "all2all",
+                comm_size,
+                comm_num=self.strategy.cp_size,
+                net=self.strategy.cp_net,
+                comm_stage=stage_name,
+            )
+            fwd_cost = cost if comm_cls is all2all_fwd else 0
+            bwd_cost = cost if comm_cls is all2all_bwd else 0
+            self.layers.append(
+                comm_cls(
+                    f"{state.comm_order}-{model_info}-cp_group:{cp_group_id}-stage:{stage_name}",
+                    cp_rank,
+                    self.strategy.cp_size,
+                    com_buff=com_buff,
+                    fwd_cost=fwd_cost,
+                    bwd_cost=bwd_cost,
+                    global_rank=args.rank,
+                )
+            )
+            state.comm_order += 1
+
+        for stage_name, comm_size in stage_specs["fwd_pre"]:
+            append_comm(all2all_fwd, stage_name, comm_size)
+        for stage_name, comm_size in reversed(stage_specs["bwd_post"]):
+            append_comm(all2all_bwd, stage_name, comm_size)
+        for stage_name, comm_size in stage_specs["fwd_post"]:
+            append_comm(all2all_fwd, stage_name, comm_size)
+        for stage_name, comm_size in reversed(stage_specs["bwd_pre"]):
+            append_comm(all2all_bwd, stage_name, comm_size)
+
+    @property
+    def cp_a2a_mode(self):
+        return getattr(self.strategy, "cp_a2a_mode", "async_cp")
+
+    @property
+    def cp_a2a_saved_output_is_independent(self):
+        return (
+            self.strategy.cp_size > 1
+            and self.strategy.cp_comm_type == "a2a"
+            and self.strategy.te_cp_a2a_saves_pre_posta2a_output
+        )
+
+    def _saved_output_cache_mem(self, out_mem):
+        # The normal W_o cache keeps the post-attention output consumed by the
+        # following linear. TE >= v2.8 additionally saves pre-PostA2A O
+        # (`out_part`) for CP A2A backward, so that cache is independent.
+        #
+        # `cache_outputs` covers other distinct-output cases such as fp8 where
+        # attention and W_o keep different representations.
+        return (
+            out_mem
+            if (self.cache_outputs or self.cp_a2a_saved_output_is_independent)
+            else 0
+        )
+
+    def _cp_a2a_three_tensor_peak(self, first_mem, second_mem, third_mem):
+        total_mem = first_mem + second_mem + third_mem
+        if self.cp_a2a_mode == "sync_cp":
+            # Serial q -> k -> v helper peak is not symmetric. The sync_cp real
+            # snapshot peaks when:
+            # - original inputs are still live
+            # - reordered send buffers for q/k/v are all live
+            # - raw recv buffers for k/v are still live
+            # - returned / reordered outputs for q/k are already materialized
+            # i.e. orig + send + raw_suffix(second+third) + returned_prefix(first+second).
+            return 2 * total_mem + (second_mem + third_mem) + (first_mem + second_mem)
+        return 4 * total_mem
+
+    def _cp_a2a_two_tensor_peak(self, first_mem, second_mem):
+        total_mem = first_mem + second_mem
+        if self.cp_a2a_mode == "sync_cp":
+            # For sync_cp with two tensors [x0, x1], the helper runs serially but
+            # the caller-side originals remain live until the tuple assignment
+            # `x0, x1 = flash_attn_a2a_communicate([x0, x1], ...)` completes.
+            # The sync peak therefore includes:
+            #   original(x0, x1)
+            # + send(x0, x1)
+            # + raw(x1)
+            # + returned(x0)
+            # which simplifies to 3 * (x0 + x1) + max(x0, x1).
+            return 3 * total_mem + max(first_mem, second_mem)
+        return 4 * total_mem
+
+    def _cp_a2a_one_tensor_peak(self, tensor_mem):
+        # Single-tensor A2A keeps caller input, send buffer, raw recv, and
+        # returned/reordered output live at the helper peak.
+        return 4 * tensor_mem
+
+    def _comp_cp_a2a_flash_peak_info(self, q_mem, k_mem, v_mem, out_mem):
+        qkv_mem = q_mem + k_mem + v_mem
+        saved_output_cache_mem = self._saved_output_cache_mem(out_mem)
+        saves_pre_posta2a_output = self.cp_a2a_saved_output_is_independent
+        peak_fwd_prea2a = self._cp_a2a_three_tensor_peak(q_mem, k_mem, v_mem)
+        peak_fwd_fa = 3 * qkv_mem + out_mem
+        # Forward PostA2A only moves a single tensor, so sync/async share the same peak.
+        peak_fwd_posta2a = 2 * qkv_mem + 4 * out_mem
+        if saves_pre_posta2a_output:
+            # TE >= v2.8 saves pre-PostA2A O for backward. Backward only needs
+            # to move dO back to the attention layout; saved O is already there.
+            peak_bwd_prea2a = (
+                saved_output_cache_mem + self._cp_a2a_one_tensor_peak(out_mem)
+            )
+            out_like_baseline = saved_output_cache_mem + 2 * out_mem
+        else:
+            # Older TE paths save post-A2A O, so both saved O and incoming dO
+            # are moved before flash-attention backward.
+            peak_bwd_prea2a = self._cp_a2a_two_tensor_peak(out_mem, out_mem)
+            out_like_baseline = 4 * out_mem
+        # Backward FA is modeled as stage-local max:
+        #   prepare -> kernel -> finalize.
+        # Old TE path keeps saved post-A2A O, incoming dO, helper O_part, and
+        # helper dO_part live. TE >= v2.8 keeps saved pre-A2A O in cache and
+        # only helper-produces dO_part; the caller dO remains live.
+        peak_bwd_fa_prepare = qkv_mem + out_like_baseline
+        peak_bwd_fa_kernel = 2 * qkv_mem + out_like_baseline + q_mem + k_mem
+        peak_bwd_fa_finalize = qkv_mem + out_like_baseline
+        peak_bwd_fa = max(
+            peak_bwd_fa_prepare,
+            peak_bwd_fa_kernel,
+            peak_bwd_fa_finalize,
+        )
+        peak_bwd_posta2a = out_like_baseline + self._cp_a2a_three_tensor_peak(
+            q_mem, k_mem, v_mem
+        )
+        return {
+            "peak_fwd_prea2a": peak_fwd_prea2a,
+            "peak_fwd_fa": peak_fwd_fa,
+            "peak_fwd_posta2a": peak_fwd_posta2a,
+            "peak_bwd_prea2a": peak_bwd_prea2a,
+            "peak_bwd_fa_prepare": peak_bwd_fa_prepare,
+            "peak_bwd_fa_kernel": peak_bwd_fa_kernel,
+            "peak_bwd_fa_finalize": peak_bwd_fa_finalize,
+            "peak_bwd_fa": peak_bwd_fa,
+            "peak_bwd_posta2a": peak_bwd_posta2a,
+        }
 
 
     def _comp_leaf_intra_net_info(self):
-        pass
+        if self.strategy.cp_size > 1:
+            batch_size = self.input_info.tensors[0].size(0)
+            seq_len = self.input_info.tensors[0].size(1)
+            
+            q_size = batch_size * self.head_num * seq_len * self.head_size
+            # repeat kv
+            k_size = batch_size * self.kv_head_num * seq_len * self.head_size  # batch_size * self.kv_head_num * seq_len * self.head_size
+            v_size = batch_size * self.kv_head_num * seq_len * self.v_head_dim   # batch_size * self.kv_head_num * seq_len * self.head_size
+            o_do_size = batch_size * self.head_num * seq_len * self.v_head_dim # attention output and do
+            qkv_mem = (q_size + k_size + v_size) * self.element_size
+            kv_mem = (k_size + v_size) * self.element_size
+            o_do_mem = o_do_size * self.element_size 
+            if self.strategy.cp_comm_type == "a2a":                
+                stage_specs = self._get_cp_a2a_stage_specs()
+                for bucket, stage_group in (
+                    ("fwd_net_time", stage_specs["fwd_pre"] + stage_specs["fwd_post"]),
+                    ("bwd_grad_act_net_time", stage_specs["bwd_post"] + stage_specs["bwd_pre"]),
+                ):
+                    for stage_name, comm_size in stage_group:
+                        setattr(
+                            self._cost_info,
+                            bucket,
+                            getattr(self._cost_info, bucket)
+                            + self.system.compute_net_op_time(
+                                "all2all",
+                                comm_size,
+                                comm_num=self.strategy.cp_size,
+                                net=self.strategy.cp_net,
+                                comm_stage=stage_name,
+                            ),
+                        )
+            elif self.strategy.cp_comm_type == "all_gather":
+                # 1. forward ag x 1
+                fwd_comm_size = (
+                    (kv_mem) * self.strategy.cp_size # get the full kv chunks by ag
+                    * self.dtype_to_element_size[self.strategy.dtype]
+                )
+                self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                    "all_gather",
+                    fwd_comm_size,
+                    comm_num=self.strategy.cp_size,
+                    net=self.strategy.cp_net,
+                    comm_stage="Attention_FWD_CP"
+                )
+                # 2. backward ag x1 + ag x 1
+                bwd_comm_size1 = fwd_comm_size # repeat fwd ag to get the full kv chunks(needed by attention bwd)
+                bwd_comm_size2 = fwd_comm_size # dgrad of full kv chunks, rs to each cp rank
+                self._cost_info.bwd_net_time += self.system.compute_net_op_time(
+                    "all_gather",
+                    bwd_comm_size1,
+                    comm_num=self.strategy.cp_size,
+                    net=self.strategy.cp_net,
+                    comm_stage="Attention_BWD_CP1"
+                )
+                self._cost_info.bwd_net_time += self.system.compute_net_op_time( 
+                    "reduce_scatter",
+                    bwd_comm_size2,
+                    comm_num=self.strategy.cp_size,
+                    net=self.strategy.cp_net,
+                    comm_stage="Attention_BWD_CP2"
+                )
+            else:
+                raise NotImplementedError(f"cp_comm_type {self.strategy.cp_comm_type} not implemented yet.")   
 
     def _comp_leaf_act_info_impl(self):
         batch_size = self.input_info.tensors[0].size(0)
@@ -1168,20 +1413,71 @@ class CoreAttention(MetaModule):
         k_size = batch_size * self.kv_head_num * seq_len * self.head_size  # batch_size * self.kv_head_num * seq_len * self.head_size
         v_size = batch_size * self.kv_head_num * seq_len * self.head_size   # batch_size * self.kv_head_num * seq_len * self.head_size
         lse_size = batch_size * self.head_num * seq_len
+
         # output_grad_size = batch_size * seq_len * hidden_size  
         output_grad_size = batch_size * seq_len * self.head_size * self.head_num
         qkv_mem = (q_size + k_size + v_size) * self.element_size
         if self.use_flash_sdp:
-            
-            self._act_info.activation_mem_cache = qkv_mem + lse_size * self.element_size
+            lse_mem = lse_size * self.element_size
+            out_mem = output_grad_size * self.element_size
+            saved_output_cache_mem = self._saved_output_cache_mem(out_mem)
+            self._act_info.activation_mem_cache = (
+                qkv_mem + lse_mem + saved_output_cache_mem
+            )
             if self.has_cached_inputs:
                 self._act_info.activation_mem_cache -= qkv_mem
-            self._act_info.fwd_peak_mem_no_cache = qkv_mem  + (lse_size + output_grad_size) * self.element_size
-            self._act_info.fwd_peak_prev_cache_mem = 0
+
+            self._act_info.fwd_peak_mem_no_cache = qkv_mem + lse_mem + out_mem
             self._act_info.bwd_peak_mem_no_cache = (
                 2 * q_size + 2 * k_size + 2 * v_size + lse_size + output_grad_size
-            ) * self.element_size
-            self._act_info.bwd_peak_prev_cache_mem = 0
+            ) * self.element_size - saved_output_cache_mem
+
+            if self.strategy.cp_size > 1 and self.strategy.cp_comm_type == "a2a":
+                # Peak semantics in SimuMax:
+                # - fwd_peak_mem_no_cache is measured before this module's cache is folded into
+                #   global_cache_mem, so the current module's saved cache may contribute here.
+                # - bwd_peak_mem_no_cache is measured while this module's saved cache is already
+                #   included in global_cache_mem, so saved cache must not be counted again.
+                #
+                # For cp=a2a + flash attention, model the module as:
+                #   caller_qkv -> PreA2A -> q_cp/k_cp/v_cp -> FA -> out_cp -> PostA2A -> out
+                # and take the max over the stage-local live sets.
+                # Forward candidates.
+                peak_info = self._comp_cp_a2a_flash_peak_info(
+                    q_size * self.element_size,
+                    k_size * self.element_size,
+                    v_size * self.element_size,
+                    out_mem,
+                )
+                peak_fwd_save = (
+                    qkv_mem + self._act_info.activation_mem_cache
+                )
+                self._act_info.fwd_peak_mem_no_cache = max(
+                    peak_info["peak_fwd_prea2a"],
+                    peak_info["peak_fwd_fa"],
+                    peak_info["peak_fwd_posta2a"],
+                    peak_fwd_save,
+                )
+
+                # Backward candidates exclude this module's saved cache, because it is already
+                # included in global_cache_mem before bwd_peak_mem_no_cache is evaluated.
+                #
+                # Important nuance for flash attention:
+                # - Forward saves the FA output before PostA2A (`out_part`) for backward.
+                # - Backward evaluates bwd_peak_mem_no_cache with cache_for_bwd_mem already
+                #   in global_cache_mem, so the saved `out_part` must be excluded here.
+                # - Helper-produced tensors outside cache (e.g. `dout_part` / A2A helpers)
+                #   stay in bwd_peak_mem_no_cache as temporary/live memory.
+                self._act_info.bwd_peak_mem_no_cache = max(
+                    peak_info["peak_bwd_prea2a"],
+                    peak_info["peak_bwd_fa"],
+                    peak_info["peak_bwd_posta2a"],
+                ) - saved_output_cache_mem
+
+            elif self.strategy.cp_size > 1 and self.strategy.cp_comm_type == "all_gather":
+                kv_mem = (k_size + v_size) * self.element_size
+                self._act_info.fwd_peak_mem_no_cache += kv_mem * (self.strategy.cp_size -1) # Forward temporary peak memory, which is the temporary memory after ag
+                self._act_info.bwd_peak_mem_no_cache += 2 *kv_mem * (self.strategy.cp_size -1) 
             # TODO(sherry): add cache outputs   
             return
         # kv repeat
@@ -1195,14 +1491,15 @@ class CoreAttention(MetaModule):
                 q_size + k_size + v_size
             ) * self.element_size
         self._act_info.fwd_peak_mem_no_cache = 2 * softmax_size * self.element_size
-        self._act_info.fwd_peak_prev_cache_mem = (q_size + k_size) * self.element_size
         bwd_soft_factor = 3  # naive impl: softmax output + output grad + input grad
         # TODO: mask and dropout will be added later
         if self.system.accelerator.backend == "cuda":
             # The sdp interface of a certain pytorch will use an extra memory,
             # not sure if it is fixed now
             bwd_soft_factor += 1
-        self._act_info.bwd_peak_prev_cache_mem = (q_size + k_size) * self.element_size
+        elif self.use_math_sdp and self.system.accelerator.backend == "musa":
+            # torch_musa sdp kernel reuse the output grad memory
+            bwd_soft_factor -= 1
         self._act_info.bwd_peak_mem_no_cache = (
             bwd_soft_factor * softmax_size * self.element_size
         )
@@ -1214,9 +1511,22 @@ class CoreAttention(MetaModule):
 
     def _comp_leaf_flops_info(self):
         seq_len = self.input_info.tensors[0].size(1)
+        if self.strategy.cp_size > 1:
+            if self.strategy.cp_comm_type == "a2a":
+                assert self.head_num % self.strategy.cp_size == 0, (
+                    f"head_num {self.head_num} must be divisible by cp_size {self.strategy.cp_size}"
+                )
+                seq_len = seq_len * self.strategy.cp_size
+                head_num = self.head_num // self.strategy.cp_size
+            elif self.strategy.cp_comm_type == "all_gather":
+                raise NotImplementedError(f"cp_comm_type {self.strategy.cp_comm_type} not implemented yet.")
+            else:
+                raise NotImplementedError(f"cp_comm_type {self.strategy.cp_comm_type} not implemented yet.")
+        else:
+            head_num = self.head_num
         batch_size = self.input_info.tensors[0].size(0)
         base_flops = (
-            2 * batch_size * self.head_num * self.head_size * seq_len * seq_len
+            2 * batch_size * head_num * self.head_size * seq_len * seq_len
         )  # 1 bmm
         base_flops *= 1 - self.attention_sparse_ratio
         # fwd is calculated by 2 bmm, bwd is calculated by 4 bmm
@@ -1309,10 +1619,12 @@ class MLACoreAttention(CoreAttention):
         system: SystemConfig,
         specific_name='DotProductAttention',
         is_last_recompute: bool = False,
+        use_variance_tail_model: bool = False,
         v_head_dim: int=None,
     ) -> None:
-        super().__init__(head_size,head_num,kv_head_num,use_math_sdp,use_flash_sdp,
-                         has_cached_inputs,enable_recompute,strategy,system,specific_name, is_last_recompute)
+        super().__init__(head_size, head_num,kv_head_num,use_math_sdp,use_flash_sdp,
+                         has_cached_inputs,enable_recompute,strategy,system,specific_name, is_last_recompute,
+                         use_variance_tail_model=use_variance_tail_model)
         self.v_head_dim = v_head_dim
     
     
@@ -1321,11 +1633,20 @@ class MLACoreAttention(CoreAttention):
         # query: [s, b, n, 192]
         # key: [s, b, n, 192]
         # key: [s, b, n, 128]
+        
         seq_len = self.input_info.tensors[0].size(1) # b
+        if self.strategy.cp_size > 1:
+            assert self.head_num % self.strategy.cp_size == 0, (
+                f"head_num {self.head_num} must be divisible by cp_size {self.strategy.cp_size}"
+            )
+            seq_len = seq_len * self.strategy.cp_size
+            head_num = self.head_num // self.strategy.cp_size
+        else:
+            head_num = self.head_num
         batch_size = self.input_info.tensors[0].size(0) # s
         base_flops = (
-            batch_size * self.head_num * self.head_size * seq_len * seq_len + 
-            batch_size * self.head_num * self.v_head_dim * seq_len * seq_len
+            batch_size * head_num * self.head_size * seq_len * seq_len + 
+            batch_size * head_num * self.v_head_dim * seq_len * seq_len
         )  # 1 bmm
         base_flops *= 1 - self.attention_sparse_ratio
         # fwd is calculated by 2 bmm, bwd is calculated by 4 bmm
@@ -1368,25 +1689,50 @@ class MLACoreAttention(CoreAttention):
         # output_grad_size = batch_size * seq_len * hidden_size  
         output_grad_size = batch_size * seq_len * self.v_head_dim * self.head_num #same as _comp_leaf_mem_accessed_info
         if self.use_flash_sdp:
-            self._act_info.activation_mem_cache = (
+            qkv_lse_cache_mem = (
                 q_size + k_size + v_size + lse_size
             ) * self.element_size
+            out_mem = output_grad_size * self.element_size
+            saved_output_cache_mem = self._saved_output_cache_mem(out_mem)
+            self._act_info.activation_mem_cache = (
+                qkv_lse_cache_mem
+                + saved_output_cache_mem
+            )
             if self.has_cached_inputs:
                 self._act_info.activation_mem_cache -= (
                     q_size + k_size + v_size
                 ) * self.element_size
-            self._act_info.fwd_peak_mem_no_cache = (
-                q_size + k_size + v_size + lse_size + output_grad_size
-            ) * self.element_size
-            self._act_info.fwd_peak_prev_cache_mem = 0
+
+            q_mem = q_size * self.element_size
+            k_mem = k_size * self.element_size
+            v_mem = v_size * self.element_size
+            qkv_mem = q_mem + k_mem + v_mem
+            lse_mem = lse_size * self.element_size
+            self._act_info.fwd_peak_mem_no_cache = qkv_mem + lse_mem + out_mem
             self._act_info.bwd_peak_mem_no_cache = (
                 2 * q_size + 2 * k_size + 2 * v_size + lse_size + output_grad_size
-            ) * self.element_size
-            self._act_info.bwd_peak_prev_cache_mem = 0
-            # TODO(sherry): add cache outputs
-            # if self.cache_outputs:
-            #     print(f"~~~~~~~ CoreAttention, FA cache output! mem={output_grad_size * self.element_size/1024/1024}MB, self.element_size={self.element_size}")
-            #     self._act_info.activation_mem_cache += output_grad_size* self.element_size # TODO(sherry)：check this, fa，需要cache output
+            ) * self.element_size - saved_output_cache_mem
+
+            if self.strategy.cp_size > 1 and self.strategy.cp_comm_type == "a2a":
+                peak_info = self._comp_cp_a2a_flash_peak_info(
+                    q_mem,
+                    k_mem,
+                    v_mem,
+                    out_mem,
+                )
+                peak_fwd_save = qkv_mem + self._act_info.activation_mem_cache
+                self._act_info.fwd_peak_mem_no_cache = max(
+                    peak_info["peak_fwd_prea2a"],
+                    peak_info["peak_fwd_fa"],
+                    peak_info["peak_fwd_posta2a"],
+                    peak_fwd_save,
+                )
+
+                self._act_info.bwd_peak_mem_no_cache = max(
+                    peak_info["peak_bwd_prea2a"],
+                    peak_info["peak_bwd_fa"],
+                    peak_info["peak_bwd_posta2a"],
+                ) - saved_output_cache_mem
             return
         # kv repeat
         softmax_size = batch_size * self.head_num * seq_len * seq_len
@@ -1399,14 +1745,15 @@ class MLACoreAttention(CoreAttention):
                 q_size + k_size + v_size
             ) * self.element_size
         self._act_info.fwd_peak_mem_no_cache = 2 * softmax_size * self.element_size
-        self._act_info.fwd_peak_prev_cache_mem = (q_size + k_size) * self.element_size
         bwd_soft_factor = 3  # naive impl: softmax output + output grad + input grad
         # TODO: mask and dropout will be added later
         if self.system.accelerator.backend == "cuda":
             # The sdp interface of a certain pytorch will use an extra memory,
             # not sure if it is fixed now
             bwd_soft_factor += 1
-        self._act_info.bwd_peak_prev_cache_mem = (q_size + k_size) * self.element_size
+        elif self.use_math_sdp and self.system.accelerator.backend == "musa":
+            # torch_musa sdp kernel reuse the output grad memory
+            bwd_soft_factor -= 1
         self._act_info.bwd_peak_mem_no_cache = (
             bwd_soft_factor * softmax_size * self.element_size
         )
@@ -1496,9 +1843,7 @@ class RotaryEmbedding(MetaModule):
         """
         self._act_info.activation_mem_cache = 0
         self._act_info.fwd_peak_mem_no_cache = 0
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = 0
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_flops_info(self):
         self._compute_info.fwd_flops = 0
@@ -1593,9 +1938,7 @@ class Swiglu(MetaModule):
         if self.has_cached_inputs:
             self._act_info.activation_mem_cache -= 2 * output_size
         self._act_info.fwd_peak_mem_no_cache = input_size + output_size
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = input_size + output_size
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
         if self.is_weighted_silu:
             probs_mem = self.input_info.tensors[1].numel() * 8
@@ -1710,9 +2053,7 @@ class Gelu(MetaModule):
             self._act_info.activation_mem_cache -= input_size
 
         self._act_info.fwd_peak_mem_no_cache = input_size + output_size
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = input_size + output_size
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
         self._model_info.dense_weight_bytes = 0
@@ -1764,7 +2105,7 @@ class ParallelCE(MetaModule):
         self.call_stk = call_stk + self.call_stk
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
                                  bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time))
-        model_info = f"microbatch:{args.microbatch}-name:{self.__class__.__name__}"
+        model_info = f"{format_model_info_microbatch_tag(args)}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
         batch_size = self.input_info.tensors[0].size(0)
@@ -1774,8 +2115,10 @@ class ParallelCE(MetaModule):
             batch_size*seq_len*
             self.dtype_to_element_size["fp32"]
         )
+        # Megatron only all-reduces the target-token predicted logit, not the
+        # full local-vocab logits tensor, so this payload is also [B, S] fp32.
         comm_size2 = (
-            batch_size*seq_len*vocab_size*
+            batch_size*seq_len*
             self.dtype_to_element_size["fp32"]
         )
         # comm_size1=comm_size2=1
@@ -1795,17 +2138,30 @@ class ParallelCE(MetaModule):
         # comm_size = "B*S"
         self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                 rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                fwd_cost=cost1, bwd_cost=0))
+                                fwd_cost=cost1, bwd_cost=0, global_rank=args.rank))
         state.comm_order += 1
-        # comm_size = "B*S*V"
-        self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
-                                rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                fwd_cost=cost2, bwd_cost=0))
-        state.comm_order += 1
-        # comm_size = "B*S"
-        self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
-                                rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                fwd_cost=cost1, bwd_cost=0))
+        if self.strategy.cross_entropy_loss_fusion:
+            # Fused CE batches predicted_logits and sum_exp_logits into one
+            # collective. Payload is unchanged, but one launch/latency is saved.
+            cost2 = self.system.compute_net_op_time(
+                "all_reduce",
+                comm_size2 * 2,
+                comm_num=self.strategy.tp_size,
+                net=self.strategy.tp_net,
+            )
+            self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
+                                    rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
+                                    fwd_cost=cost2, bwd_cost=0, global_rank=args.rank))
+        else:
+            # comm_size = "B*S*V"
+            self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
+                                    rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
+                                    fwd_cost=cost2, bwd_cost=0, global_rank=args.rank))
+            state.comm_order += 1
+            # comm_size = "B*S"
+            self.layers.append(all_reduce(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
+                                    rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
+                                    fwd_cost=cost1, bwd_cost=0, global_rank=args.rank))
         state.comm_order += 1
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff=com_buff)
@@ -1817,49 +2173,98 @@ class ParallelCE(MetaModule):
     def _comp_leaf_intra_net_info(self):
         # FWD
         if self.strategy.tp_size > 1:
-            comm_size = 1
-            # logits_max = 0  # all_reduce
-            # all_reduce for logits_max [b x s]
+            batch_size = self.input_info.tensors[0].size(0)
+            seq_len = self.input_info.tensors[0].size(1)
+            vocab_size = self.input_info.tensors[0].size(2)
+            scalar_comm_size = batch_size * seq_len * self.dtype_to_element_size["fp32"]
+            logits_comm_size = scalar_comm_size
+            # all_reduce for logits_max [B x S]
             self._cost_info.fwd_net_time += self.system.compute_net_op_time(
                 "all_reduce",
-                comm_size,
+                scalar_comm_size,
                 comm_num=self.strategy.tp_size,
                 net=self.strategy.tp_net,
                 comm_stage="ParallelCE_FWD_TP"
             )
-            # all_reduce for predicted_logits [b x s]
-            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all_reduce",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-                comm_stage="ParallelCE_FWD_TP"
-            )
-            # all reduce for sum_exp_logits [b x s]
-            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all_reduce",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-                comm_stage="ParallelCE_FWD_TP"
-            )
+            if self.strategy.cross_entropy_loss_fusion:
+                # Fused CE batches predicted_logits and sum_exp_logits into one
+                # collective. Payload is still two [B x S] fp32 tensors.
+                self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                    "all_reduce",
+                    logits_comm_size + scalar_comm_size,
+                    comm_num=self.strategy.tp_size,
+                    net=self.strategy.tp_net,
+                    comm_stage="ParallelCE_FWD_TP"
+                )
+            else:
+                # all_reduce for predicted_logits [B x S]
+                self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                    "all_reduce",
+                    logits_comm_size,
+                    comm_num=self.strategy.tp_size,
+                    net=self.strategy.tp_net,
+                    comm_stage="ParallelCE_FWD_TP"
+                )
+                # all_reduce for sum_exp_logits [B x S]
+                self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+                    "all_reduce",
+                    scalar_comm_size,
+                    comm_num=self.strategy.tp_size,
+                    net=self.strategy.tp_net,
+                    comm_stage="ParallelCE_FWD_TP"
+                )
 
     def _comp_leaf_act_info_impl(self):
-        # save exp_logits and mask
         batch_size = self.input_info.tensors[0].size(0)
         seq_len = self.input_info.tensors[0].size(1)
         vocab_size = self.input_info.tensors[0].size(2)
 
+        if self.strategy.cross_entropy_loss_fusion:
+            # TE fused CE saves the input logits shard for backward and uses
+            # O(B*S) fp32 work buffers in forward (`loss_1d`, `m_d_X_y`, and
+            # optionally gathered `m_d_X_y` when TP > 1). It does not keep the
+            # full unfused fp32 CE pipeline as persistent cache.
+            logits_cache = (
+                batch_size
+                * seq_len
+                * vocab_size
+                * self.dtype_to_element_size[self.strategy.dtype]
+            )
+            loss_buf = batch_size * seq_len * self.dtype_to_element_size["fp32"]
+            mdxy_local = 3 * batch_size * seq_len * self.dtype_to_element_size["fp32"]
+            mdxy_gather = (
+                3
+                * batch_size
+                * seq_len
+                * self.strategy.tp_size
+                * self.dtype_to_element_size["fp32"]
+                if self.strategy.tp_size > 1
+                else 0
+            )
+            self._act_info.activation_mem_cache = logits_cache
+            self._act_info.fwd_peak_mem_no_cache = (
+                logits_cache + loss_buf + mdxy_local + mdxy_gather
+            )
+            # Backward updates the saved logits shard in-place and may only
+            # need a small grad_output view/contiguous buffer, which we treat
+            # as negligible at module level.
+            self._act_info.bwd_peak_mem_no_cache = 0
+            self._act_info_with_recomp = self._act_info
+            return
+
+        # Unfused CE saves the fp32 CE pipeline intermediates.
         ce_cache = (
             batch_size * seq_len * vocab_size * self.dtype_to_element_size["fp32"]
         )
         self._act_info.activation_mem_cache = ce_cache
-        ce_fwd_peak_no_cache = 2 * ce_cache
-        # self._act_info.fwd_peak_mem_no_cache = ce_fwd_peak_no_cache # FIXME(sherry): why double?
-        self._act_info.fwd_peak_mem_no_cache = ce_cache 
-        self._act_info.fwd_peak_prev_cache_mem = 0
-        self._act_info.bwd_peak_mem_no_cache = ce_cache # FIXME(sherry)：需要double吗？
-        self._act_info.bwd_peak_prev_cache_mem = 0
+        self._act_info.fwd_peak_mem_no_cache = (
+            ce_cache
+            + batch_size
+            * seq_len
+            * vocab_size
+            * self.dtype_to_element_size[self.strategy.dtype]
+        )
+        self._act_info.bwd_peak_mem_no_cache = 0
         self._act_info_with_recomp = self._act_info
 
     def _comp_leaf_model_info_impl(self):
@@ -1882,6 +2287,25 @@ class ParallelCE(MetaModule):
         vocab_size = self.input_info.tensors[0].size(2)
         # fwd: 1.max(logits) 2.logits - max 3.exp 4.sum 5.exp/sum_exp_logits
         logtis_size = batch_size * seq_len * vocab_size
+        if self.strategy.cross_entropy_loss_fusion:
+            # TE fused CE does not materialize the full unfused fp32 pipeline.
+            # Keep the model on a simple observable I/O basis: fwd reads bf16
+            # logits, writes a saved/probability-sized buffer and loss; bwd
+            # reads that saved buffer and writes bf16 grad_input.
+            loss_size = batch_size * seq_len
+            self._compute_info.fwd_accessed_mem = (
+                2 * logtis_size * self.dtype_to_element_size[self.strategy.dtype]
+                + loss_size * self.dtype_to_element_size["fp32"]
+            )
+            self._compute_info.bwd_grad_act_accessed_mem = (
+                2 * logtis_size * self.dtype_to_element_size[self.strategy.dtype]
+                + loss_size * self.dtype_to_element_size["fp32"]
+            )
+            self._compute_info.bwd_grad_w_accessed_mem = 0
+            self._compute_info.recompute_accessed_mem = (
+                self._compute_info.fwd_accessed_mem if self.enable_recompute else 0
+            )
+            return
 
         self._compute_info.fwd_accessed_mem = (logtis_size * self.dtype_to_element_size['fp32'] + 
                                                 logtis_size * self.dtype_to_element_size['bf16'])
@@ -1930,9 +2354,10 @@ class ParallelCE(MetaModule):
         )
 
     def _comp_cost_info(self):
+        ce_op = "ce_fusion" if self.strategy.cross_entropy_loss_fusion else "ce"
         self._comp_cost_info_impl(
-            fwd_op="ce",
-            bwd_grad_act_op="default",
+            fwd_op=ce_op,
+            bwd_grad_act_op=ce_op,
             bwd_grad_w_op="default",
             enable_recompute=self.enable_recompute,
         )
@@ -1954,9 +2379,7 @@ class Float8Quantizer(MetaModule):
     def _comp_leaf_act_info_impl(self):
         self._act_info.activation_mem_cache = 0.0
         self._act_info.fwd_peak_mem_no_cache = self.all_input_element_num() + self.all_output_element_num()
-        self._act_info.fwd_peak_prev_cache_mem = 0.0
         self._act_info.bwd_peak_mem_no_cache = 0.0
-        self._act_info.bwd_peak_prev_cache_mem = 0.0
 
     def _comp_leaf_mem_accessed_info(self):
         self._compute_info.fwd_accessed_mem = self.all_input_element_num() + self.all_output_element_num()
@@ -1982,6 +2405,7 @@ class QuantizedColLinear(MetaModule):
                  strategy, 
                  system, 
                  is_last_recompute = False,
+                 use_variance_tail_model: bool = False,
                  disable_tensor_parallel = False,
                  specific_name='QuantizedColLinear'):
         super().__init__(strategy, system, specific_name, parent_module=None)
@@ -1989,6 +2413,7 @@ class QuantizedColLinear(MetaModule):
         self.quntizer = Float8Quantizer(enable_recompute=enable_recompute, strategy=strategy, system=system)
         self.linear = LinearCol(layer_idx, input_size, output_size, use_bias, has_cached_inputs, enable_recompute, strategy, system, 
                                 is_last_recompute = is_last_recompute, 
+                                use_variance_tail_model=use_variance_tail_model,
                                 disable_tensor_parallel = disable_tensor_parallel)
     
     def set_breakpoints(self, status):
@@ -2009,12 +2434,14 @@ class QuantizedRowLinear(MetaModule):
                  strategy, 
                  system, 
                  is_last_recompute = False,
+                 use_variance_tail_model: bool = False,
                  specific_name='QuantizedColLinear'):
         super().__init__(strategy, system, specific_name, parent_module=None)
         assert self.strategy.fp8, 'QuantizedColLinear only support fp8'
         self.quntizer = Float8Quantizer(enable_recompute=enable_recompute, strategy=strategy, system=system)
         self.linear = LinearRow(layer_idx, input_size, output_size, use_bias, has_cached_inputs, enable_recompute, strategy, system, 
-                                is_last_recompute = is_last_recompute)
+                                is_last_recompute = is_last_recompute,
+                                use_variance_tail_model=use_variance_tail_model)
 
     def set_breakpoints(self, status):
         self.linear.set_breakpoints(status)
@@ -2061,14 +2488,17 @@ class Attention(MetaModule):
         # support selective recompute
         LinearCol_ = QuantizedColLinear if self.strategy.fp8 else LinearCol
         LinearRow_ = QuantizedRowLinear if self.strategy.fp8 else LinearRow
+        megatron_layernorm_tail = attention_recompute_conf.megatron_layernorm
 
         self.linear_qkv = LinearCol_(
                 layer_idx=layer_idx,
                 input_size=self.config.hidden_size,
                 output_size=output_size,
                 use_bias=False,
-                has_cached_inputs=False,
-                enable_recompute=attention_recompute_conf.q_up_recompute,
+                has_cached_inputs=megatron_layernorm_tail,
+                enable_recompute=attention_recompute_conf.q_up_recompute or megatron_layernorm_tail,
+                is_last_recompute=megatron_layernorm_tail,
+                use_variance_tail_model=megatron_layernorm_tail,
                 strategy=strategy,
                 system=system
             )
@@ -2096,9 +2526,7 @@ class Attention(MetaModule):
                 strategy=strategy,
                 system=system
             )
-
-        is_bf16_and_next_recompute = (not self.strategy.fp8 and self.linear_out.enable_recompute)
-        self.attention.cache_outputs = self.strategy.use_flash_sdp and (self.strategy.fp8 or is_bf16_and_next_recompute) # FIXME(sherry)：bf16
+        self.attention.cache_outputs = self.strategy.use_flash_sdp and self.strategy.fp8
 
     def forward(self, input_info:InputOutputInfo, path_debug_context:PathDebugContext):
         qkv = self.linear_qkv(input_info, path_debug_context)
@@ -2159,6 +2587,22 @@ class MLAAttention(MetaModule):
         self.system = system
         self.attention_recompute_conf = attention_recompute_conf  # for old version 
         self.enable_recompute = enable_recompute 
+        megatron_layernorm_tail = attention_recompute_conf.megatron_layernorm
+        # Under CP A2A, TE keeps reordered attention tensors for backward.
+        # Treating core_attention as an output-discard tail in this case is too aggressive.
+        cp_a2a_mla_tail_bypass = (
+            attention_recompute_conf.megatron_mla_up_proj
+            and self.strategy.cp_size > 1
+            and self.strategy.cp_comm_type == "a2a"
+        )
+        megatron_mla_up_proj_tail = (
+            attention_recompute_conf.megatron_mla_up_proj
+            and not cp_a2a_mla_tail_bypass
+        )
+        megatron_mla_up_proj_core_attn_recompute = (
+            attention_recompute_conf.core_attn_recompute
+            and not cp_a2a_mla_tail_bypass
+        )
         query_projection_size = self.config.v_head_dim * self.config.head_num
         self.q_head_dim = self.config.qk_head_dim + self.config.qk_pos_emb_head_dim
         self.num_attention_heads_per_partition = self.config.head_num // self.strategy.tp_size
@@ -2192,9 +2636,10 @@ class MLAAttention(MetaModule):
                 input_size=self.config.hidden_size,
                 output_size=self.config.q_lora_rank,
                 use_bias=False,
-                has_cached_inputs=False,
+                has_cached_inputs=megatron_layernorm_tail,
                 enable_recompute=attention_recompute_conf.q_down_recompute,
                 is_last_recompute = True,
+                use_variance_tail_model=megatron_layernorm_tail,
                 # disable_tensor_parallel=True,
                 strategy=strategy,
                 system=system
@@ -2228,6 +2673,7 @@ class MLAAttention(MetaModule):
                 has_cached_inputs=True,
                 enable_recompute=attention_recompute_conf.kv_down_recompute,
                 is_last_recompute = True,
+                use_variance_tail_model=megatron_layernorm_tail,
                 strategy=strategy,
                 system=system
             )
@@ -2266,14 +2712,15 @@ class MLAAttention(MetaModule):
                 kv_head_num=config.kv_head_num,
                 use_math_sdp=self.strategy.use_math_sdp,
                 use_flash_sdp=self.strategy.use_flash_sdp,
-                has_cached_inputs=False,
-                enable_recompute=attention_recompute_conf.core_attn_recompute,
+                has_cached_inputs=megatron_mla_up_proj_tail,
+                enable_recompute=megatron_mla_up_proj_core_attn_recompute,
                 is_last_recompute = True,
+                use_variance_tail_model=megatron_mla_up_proj_tail,
                 strategy=strategy,
                 system=system,
                 v_head_dim=config.v_head_dim
             )
-        # TODO(sherry)：selective_recompute中，linear_out不做recompute
+        # TODO(sherry): in selective recompute, linear_out does not recompute yet
         self.linear_out_proj = LinearCol_(
                 layer_idx=layer_idx,
                 input_size=query_projection_size,
@@ -2287,15 +2734,19 @@ class MLAAttention(MetaModule):
         if ENABLE_SIMU_GRAPH:
             ...
         else:
-            if self.strategy.mla_rms_recompute and self.strategy.recompute_granularity == "selective_recompute":
+            if (
+                (self.strategy.mla_rms_recompute or attention_recompute_conf.megatron_layernorm)
+                and self.strategy.recompute_granularity == "selective_recompute"
+            ):
                 if self.config.q_lora_rank is not None:
                     self.linear_q_down_proj.set_breakpoints(True)
                 self.linear_kv_down_proj.set_breakpoints(True)
             if self.linear_out_proj.enable_recompute and self.strategy.recompute_granularity == "selective_recompute":
                 self.linear_out_proj.is_breakpoints = True
             
-            is_bf16_and_next_recompute = (not self.strategy.fp8 and self.linear_out_proj.enable_recompute)
-            self.core_attention.cache_outputs = self.strategy.use_flash_sdp and (self.strategy.fp8 or is_bf16_and_next_recompute) # FIXME(sherry)：bf16
+            self.core_attention.cache_outputs = (
+                self.strategy.use_flash_sdp and self.strategy.fp8
+            )
 
     def forward(self, hidden_states:TensorSize, path_debug_context:PathDebugContext):
         # ref: Megatron-LM/megatron/core/transformer/multi_latent_attention.py:306
@@ -2321,7 +2772,7 @@ class MLAAttention(MetaModule):
         # q: [s, b, n, 192]
         query = q.view(q_len, bsz, self.num_attention_heads_per_partition, self.q_head_dim)
         # q: [s, b, n, 128], q_pos_emb: [s, b, n, 64]
-        # q_no_pe, q_pos_emb = simu_ops.split( # TODO(sherry): 新增simu_ops.split
+        # q_no_pe, q_pos_emb = simu_ops.split( # TODO(sherry): add simu_ops.split
         #     q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
         # )
 
@@ -2451,7 +2902,14 @@ class MLP(MetaModule):
         self.strategy = strategy
         self.system = system
         self.enable_recompute = enable_recompute # for old version 
-        if not mlp_recompute_conf.linear_recompute:
+        is_shared_expert = isinstance(layer_idx, str) and ('shareExpert' in layer_idx)
+        dense_mlp_checkpoint = mlp_recompute_conf.linear_recompute or (
+            mlp_recompute_conf.megatron_mlp and not is_shared_expert
+        )
+        shared_expert_checkpoint = mlp_recompute_conf.shared_linear_recompute or (
+            mlp_recompute_conf.megatron_moe and is_shared_expert
+        )
+        if not (dense_mlp_checkpoint or shared_expert_checkpoint):
             self.recompute_granularity = "submodule"
         
         local_intermediate_size = (intermediate_size if intermediate_size is not None 
@@ -2465,14 +2923,17 @@ class MLP(MetaModule):
         LinearRow_ = QuantizedRowLinear if self.strategy.fp8 else LinearRow
 
         # support selective recompute
-        enable_recompute = mlp_recompute_conf.shared_linear_recompute if isinstance(layer_idx, str) and ('shareExpert' in layer_idx) else mlp_recompute_conf.linear_recompute
+        enable_recompute = shared_expert_checkpoint if is_shared_expert else dense_mlp_checkpoint
+        megatron_layernorm_tail = mlp_recompute_conf.megatron_layernorm and not is_shared_expert
         self.linear_fc1 = LinearCol_(
                 layer_idx=layer_idx,
                 input_size=self.config.hidden_size,
                 output_size=intermediate_size,
                 use_bias=False,
-                has_cached_inputs=False,
-                enable_recompute=enable_recompute,
+                has_cached_inputs=megatron_layernorm_tail,
+                enable_recompute=enable_recompute or megatron_layernorm_tail,
+                is_last_recompute=megatron_layernorm_tail,
+                use_variance_tail_model=megatron_layernorm_tail,
                 strategy=strategy,
                 system=system,
             )
@@ -2502,6 +2963,12 @@ class MLP(MetaModule):
                     strategy=strategy,
                     system=system,
                 )
+        if (
+            self.strategy.recompute_granularity == "selective_recompute"
+            and mlp_recompute_conf.megatron_layernorm
+            and enable_recompute
+        ):
+            self.linear_fc1.set_breakpoints(True)
 
     def forward(self, input_info:InputOutputInfo, path_debug_context: PathDebugContext):
         x = self.activation_layer(self.linear_fc1(input_info, path_debug_context), path_debug_context)
@@ -2517,200 +2984,5 @@ class MLP(MetaModule):
 #endregion 
 
 #region ---------------- optim and schedule ----------------
-class OptimizerSimulator(MetaModule):
-    """normal mlp layers"""
-
-    def __init__(self, strategy:StrategyConfig, system, model_info) -> None:
-        super().__init__(strategy, system)
-        state_weight_bytes = model_info.state_bytes
-        chunk_weight_accessed_time = 3 * state_weight_bytes
-        self.optim_time = self.system.compute_mem_access_time(chunk_weight_accessed_time)
-        self.model_info = model_info
-
-    def prefill(self, args, call_stk='', com_buff=None):
-        self.call_stk = f"rank{args.rank}-microbatch{args.microbatch}{call_stk}{self.call_stk}"
-        self.layers.append(AtomModel(fwd_cost=self.optim_time, bwd_cost=0))
-        state = args.thread_state
-        rank_info = get_rank_group(args.rank, self.strategy)
-        
-        comm_size = self.model_info.grad_bytes  # FIXME: moe need to be handled separately
-        dp_net = self.strategy.dp_net
-        bucket_size = (
-            max(40000000, 1000000 * self.strategy.dp_size) * 4
-        )  # consider bucket size
-        num_bucket = (comm_size - 1) // bucket_size + 1
-        if self.strategy.zero_state >= 1:
-            cost = num_bucket * self.system.compute_net_op_time(
-                "all_gather", bucket_size, comm_num=self.strategy.dp_size, net=dp_net
-            )
-            self.layers.append(all_gather(f"{state.comm_order}-dp_group:{rank_info['dp_group_id']}", 
-                                rank_info['dp_rank'], self.strategy.dp_size,  com_buff=com_buff,
-                                fwd_cost=cost))
-            state.comm_order += 1
-            cost = num_bucket * self.system.compute_net_op_time(
-                "reduce_scatter",
-                bucket_size,
-                comm_num=self.strategy.dp_size,
-                net=dp_net,
-            )
-            self.layers.append(reduce_scatter(f"{state.comm_order}-dp_group:{rank_info['dp_group_id']}", 
-                                rank_info['dp_rank'], self.strategy.dp_size,  com_buff=com_buff,
-                                fwd_cost=cost))
-            state.comm_order += 1
-        else:
-            cost = num_bucket * self.system.compute_net_op_time(
-                "all_reduce", bucket_size, comm_num=self.strategy.dp_size, net=dp_net
-            )
-            self.layers.append(all_reduce(f"{state.comm_order}-dp_group:{rank_info['dp_group_id']}", 
-                                rank_info['dp_rank'], self.strategy.dp_size,  com_buff=com_buff,
-                                fwd_cost=cost))
-            state.comm_order += 1
-
-        for layer in self.layers:
-            layer.prefill(args, self.call_stk, com_buff=com_buff)
-
-class PpSchedule(MetaModule):
-    """normal mlp layers"""
-    def __init__(self, strategy:StrategyConfig, system, model) -> None:
-        super().__init__(strategy, system)
-        self.model=model
-
-    def prefill_batch(self, args, com_buff=None):
-        job = []
-        rank_info = get_rank_group(args.rank, self.strategy)
-        pp_size = self.strategy.pp_size
-        pp_rank = rank_info['pp_rank']
-        pp_group = rank_info['pp_group_id']
-        hidden_states_size = (
-            self.strategy.micro_batch_size
-            * self.strategy.seq_len
-            * self.model.model_config.hidden_size
-        )
-        pp_comm_size = (
-            hidden_states_size
-            * self.dtype_to_element_size[self.strategy.dtype]
-        )
-        pp_comm_size = (
-            pp_comm_size / self.strategy.tp_size
-            if self.strategy.enable_sequence_parallel
-            else pp_comm_size
-        )
-        pp_cost = self.system.compute_net_op_time(
-            "p2p", pp_comm_size, 2, net=self.strategy.pp_net
-        )  # p2p
-        
-        num_warmup_microbatches = (
-            self.strategy.pp_size
-            - rank_info['pp_rank']
-            - 1
-        )
-        num_warmup_microbatches = min(num_warmup_microbatches, self.strategy.micro_batch_num)
-        num_microbatches_remaining = self.strategy.micro_batch_num - num_warmup_microbatches
-        fwd_stk = []
-        fwd_idx = 0  #increase happened immediately after send forward, even no need to send in rank pp-1
-        bwd_idx = 0  #increase happened immediately after send bwd, even no need to send in rank 0
-        args.microbatch = 0
-        for i in range(num_warmup_microbatches):
-            if not pp_rank==0:
-                cost = pp_cost
-                comm = recv_prev(id=f'forward-{fwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
-                
-                comm_que = FwdQue(call_stk=f"{args.rank}",que=[comm])
-                job.append(comm_que)
-                #recv_forward(recv_tensor_shapes, config)
-            model = deepcopy(self.model)
-            model.prefill(args, com_buff=com_buff)
-            args.microbatch += 1
-            job.append(model.prefill_fwd())
-            fwd_stk.append(model)
-
-            if not pp_rank==pp_size-1:
-                #send_forward(output_tensor, send_tensor_shapes, config)
-                cost = pp_cost
-                comm = send_next(id=f'forward-{fwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
-                comm_que = FwdQue(que=[comm])
-                job.append(comm_que)
-            fwd_idx += 1
-        if num_microbatches_remaining > 0:
-            if not pp_rank==0:
-                cost = pp_cost
-                comm = recv_prev(id=f'forward-{fwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
-                comm_que = FwdQue(que=[comm])
-                job.append(comm_que)
-                #input_tensor = recv_forward(recv_tensor_shapes, config)
-
-        for i in range(num_microbatches_remaining):
-            last_iteration = i == (num_microbatches_remaining - 1)
-            model = deepcopy(self.model)
-            model.prefill(args, com_buff=com_buff)
-            args.microbatch += 1
-            job.append(model.prefill_fwd())
-            fwd_stk.append(model)
-
-            # send_forward_recv_backward(output_tensor, send_tensor_shapes, config)
-            cost = pp_cost
-            que = []
-            if not pp_rank==pp_size-1:
-                comm1 = send_next(id=f'forward-{fwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size,global_rank=args.rank, call_stk=f"rank{args.rank}")
-                que.append(comm1)
-                comm2 = recv_next(id=f'backward-{bwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
-                que.append(comm2)
-                if pp_rank%2:
-                    # send then recv
-                    comm_que = FwdQue(que=que)
-                else:
-                    # recv then send
-                    comm_que = FwdQue(que=que[::-1])
-                job.append(comm_que)
-            fwd_idx += 1
-
-            model=fwd_stk.pop()
-            job.append(model.prefill_bwd())
-
-
-            cost = pp_cost
-            if last_iteration:
-                # send_backward(input_tensor_grad, recv_tensor_shapes, config)
-                if not pp_rank==0:
-                    comm1 = send_prev(id=f'backward-{bwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
-                    comm_que = FwdQue(que=[comm1])
-                    job.append(comm_que)
-                bwd_idx += 1
-            else:
-                # send_backward_recv_forward(input_tensor_grad, recv_tensor_shapes, config)
-                que = []
-                if not pp_rank==0:
-                    comm1 = send_prev(id=f'backward-{bwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
-                    que.append(comm1)
-                    comm2 = recv_prev(id=f'forward-{fwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
-                    que.append(comm2)
-                    if pp_rank%2:
-                        # send then recv
-                        comm_que = FwdQue(que=que)
-                    else:
-                        # recv then send
-                        comm_que = FwdQue(que=que[::-1])
-                    job.append(comm_que)
-                bwd_idx += 1
-                
-        for i in range(num_warmup_microbatches):
-            #recv_backward
-            if not pp_rank==pp_size-1:
-                cost = pp_cost
-                comm = recv_next(id=f'backward-{bwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
-                comm_que = FwdQue(que=[comm])
-                job.append(comm_que)
-
-            model=fwd_stk.pop()
-            job.append(model.prefill_bwd())
-
-            # send_backward
-            if not pp_rank==0:
-                cost = pp_cost
-                comm = send_prev(id=f'backward-{bwd_idx}-pp_group:{pp_group}-', rank=pp_rank, com_buff=com_buff, fwd_cost=cost, pp_size=pp_size, global_rank=args.rank, call_stk=f"rank{args.rank}")
-                comm_que = FwdQue(que=[comm])
-                job.append(comm_que)
-
-            bwd_idx += 1
-        return job
+from simumax.core.transformer.pipeline_schedule import OptimizerSimulator, PpSchedule
 #endregion

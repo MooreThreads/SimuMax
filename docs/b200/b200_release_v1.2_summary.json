@@ -1,0 +1,3034 @@
+{
+  "generated_at": "2026-05-01T00:00:00+00:00",
+  "system_rel": "configs/system/b200_bf16_ceperm.json",
+  "scope": "formal_release_results",
+  "notes": [
+    "Canonical formal result table for current B200 work.",
+    "Includes only non-VPP perf-vs-real rows and dense CP long-seq a2a perf-vs-real rows.",
+    "DeepSeekV2 CP real-only exploratory rows are intentionally excluded from the formal table.",
+    "perf_alloc_gib and alloc_err_pct refreshed on 2026-04-27 after enabling row-linear dummy-wgrad tracking and removing overlap-grad-reduce gating from dummy shape tracking.",
+    "perf_alloc_gib and alloc_err_pct refreshed on 2026-04-27 after updating CE-fusion cache/peak modeling in ParallelCE.",
+    "CP long-seq perf_alloc_gib and alloc_err_pct refreshed on 2026-04-27 after attention saved-output cache modeling for CP A2A / FP8 alignment.",
+    "CP long-seq perf_ms and rel_err_pct refreshed on 2026-05-01 with B200 TE2.11.0 replay; TE >= v2.8 CP A2A backward only all-to-alls dO on the O side.",
+    "B200 JSON detail fields perf_peak_reserved_gib and peak_alloc_by_stage_gib refreshed on 2026-05-01 with the same replay config; DeepSeekV3 formal rows use dense_layers=1."
+  ],
+  "excluded": {
+    "vpp_rows": [
+      {
+        "case": "llama3_70b_l8_tp1_pp4_vp2_dp2_mbc8_sync_cef",
+        "status": "ok"
+      },
+      {
+        "case": "llama3_70b_l8_tp1_pp4_vp2_dp2_mbc8_async_cef",
+        "status": "ok"
+      },
+      {
+        "case": "llama3_70b_l24_tp1_pp4_vp2_dp2_mbc8_sync_cef",
+        "status": "ok"
+      },
+      {
+        "case": "llama3_70b_l24_tp1_pp4_vp2_dp2_mbc8_async_cef",
+        "status": "ok"
+      }
+    ],
+    "exploratory_cp_rows": [
+      {
+        "case": "deepseekv2_tp1_cp2_ep4_pp1_dp1_l4_seq32768_mbc4_cef",
+        "status": "real_only_perf_unsupported"
+      },
+      {
+        "case": "deepseekv2_tp1_cp2_ep4_pp1_dp1_l4_seq131072_mbc4_cef",
+        "status": "real_only_perf_unsupported"
+      }
+    ]
+  },
+  "rows": [
+    {
+      "case": "llama3_70b_l12_tp1_pp2_dp4_mbc4_cef",
+      "model": "llama3-70b",
+      "parallel": "tp1pp2",
+      "layer_num": 12,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 828.76,
+      "perf_alloc_gib": 66.44,
+      "perf_peak_reserved_gib": 70.68,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 66.4383,
+        "last_stage": 62.8398
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:05:00.521555+00:00",
+      "ended_at": "2026-04-24T07:05:32.892848+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 843.0,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 66.55,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 68149.19873046875,
+          "max_reserved_mb": 70730.0
+        },
+        "1": {
+          "max_allocated_mb": 68147.32275390625,
+          "max_reserved_mb": 71592.0
+        },
+        "2": {
+          "max_allocated_mb": 68146.29248046875,
+          "max_reserved_mb": 72586.0
+        },
+        "3": {
+          "max_allocated_mb": 68146.29248046875,
+          "max_reserved_mb": 70896.0
+        },
+        "4": {
+          "max_allocated_mb": 64479.4794921875,
+          "max_reserved_mb": 65762.0
+        },
+        "5": {
+          "max_allocated_mb": 64478.5498046875,
+          "max_reserved_mb": 65430.0
+        },
+        "6": {
+          "max_allocated_mb": 64478.6904296875,
+          "max_reserved_mb": 64938.0
+        },
+        "7": {
+          "max_allocated_mb": 64478.5498046875,
+          "max_reserved_mb": 64990.0
+        }
+      },
+      "rel_err_pct": -1.69,
+      "alloc_err_pct": -0.17,
+      "memory_source_case": "llama3_70b_l12_tp1_pp2_dp4_mbc4_cef",
+      "memory_group_name": "llama3_70b_l12_tp1_pp2_dp4_mbcX_cef",
+      "real_reserved_gib": 70.88
+    },
+    {
+      "case": "llama3_70b_tp2_pp1_dp4_l12_mbc4_cef",
+      "model": "llama3-70b",
+      "parallel": "tp2pp1",
+      "layer_num": 12,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 698.81,
+      "perf_alloc_gib": 60.51,
+      "perf_peak_reserved_gib": 64.38,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 60.5134
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:05:33.013583+00:00",
+      "ended_at": "2026-04-24T07:06:07.131407+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 725.5,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 60.68,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 63914.0
+        },
+        "1": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 63914.0
+        },
+        "2": {
+          "max_allocated_mb": 62136.40185546875,
+          "max_reserved_mb": 63560.0
+        },
+        "3": {
+          "max_allocated_mb": 62136.40185546875,
+          "max_reserved_mb": 63560.0
+        },
+        "4": {
+          "max_allocated_mb": 62136.27685546875,
+          "max_reserved_mb": 63776.0
+        },
+        "5": {
+          "max_allocated_mb": 62136.27685546875,
+          "max_reserved_mb": 63776.0
+        },
+        "6": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 64026.0
+        },
+        "7": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 64026.0
+        }
+      },
+      "rel_err_pct": -3.68,
+      "alloc_err_pct": -0.28,
+      "memory_source_case": "llama3_70b_tp2_pp1_dp4_l12_mbc4_cef",
+      "memory_group_name": "llama3_70b_tp2_pp1_dp4_l12_mbcX_cef",
+      "real_reserved_gib": 62.53
+    },
+    {
+      "case": "llama3_70b_l12_tp4_pp1_dp2_mbc4_cef",
+      "model": "llama3-70b",
+      "parallel": "tp4pp1",
+      "layer_num": 12,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 395.23,
+      "perf_alloc_gib": 38.94,
+      "perf_peak_reserved_gib": 41.43,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 38.9422
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:06:07.280406+00:00",
+      "ended_at": "2026-04-24T07:06:45.228870+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 409.8,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 39.07,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41076.0
+        },
+        "1": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41048.0
+        },
+        "2": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41048.0
+        },
+        "3": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41048.0
+        },
+        "4": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41080.0
+        },
+        "5": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41140.0
+        },
+        "6": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41080.0
+        },
+        "7": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41140.0
+        }
+      },
+      "rel_err_pct": -3.56,
+      "alloc_err_pct": -0.33,
+      "memory_source_case": "llama3_70b_l12_tp4_pp1_dp2_mbc4_cef",
+      "memory_group_name": "llama3_70b_l12_tp4_pp1_dp2_mbcX_cef",
+      "real_reserved_gib": 40.18
+    },
+    {
+      "case": "llama3_70b_l12_tp8_pp1_dp1_mbc4_cef",
+      "model": "llama3-70b",
+      "parallel": "tp8pp1",
+      "layer_num": 12,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 255.71,
+      "perf_alloc_gib": 28.17,
+      "perf_peak_reserved_gib": 29.96,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 28.1663
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:06:45.350553+00:00",
+      "ended_at": "2026-04-24T07:07:20.846684+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 280.9,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 28.29,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "1": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "2": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "3": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "4": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "5": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "6": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "7": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        }
+      },
+      "rel_err_pct": -8.97,
+      "alloc_err_pct": -0.42,
+      "memory_source_case": "llama3_70b_l12_tp8_pp1_dp1_mbc4_cef",
+      "memory_group_name": "llama3_70b_l12_tp8_pp1_dp1_mbcX_cef",
+      "real_reserved_gib": 29.12
+    },
+    {
+      "case": "deepseekv2_tp1_ep8_pp1_dp8_l4_mbc4_cef",
+      "model": "deepseekv2",
+      "parallel": "tp1ep8pp1",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 343.59,
+      "perf_alloc_gib": 45.4,
+      "perf_peak_reserved_gib": 48.3,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 45.4024
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:09:29.403757+00:00",
+      "ended_at": "2026-04-24T07:10:27.170702+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 366.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 45.63,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 46726.216796875,
+          "max_reserved_mb": 49942.0
+        },
+        "1": {
+          "max_allocated_mb": 46726.216796875,
+          "max_reserved_mb": 49942.0
+        },
+        "2": {
+          "max_allocated_mb": 46727.47412109375,
+          "max_reserved_mb": 49846.0
+        },
+        "3": {
+          "max_allocated_mb": 46730.00146484375,
+          "max_reserved_mb": 49818.0
+        },
+        "4": {
+          "max_allocated_mb": 46724.99560546875,
+          "max_reserved_mb": 49962.0
+        },
+        "5": {
+          "max_allocated_mb": 46727.80859375,
+          "max_reserved_mb": 49816.0
+        },
+        "6": {
+          "max_allocated_mb": 46726.216796875,
+          "max_reserved_mb": 49942.0
+        },
+        "7": {
+          "max_allocated_mb": 46726.8759765625,
+          "max_reserved_mb": 49942.0
+        }
+      },
+      "rel_err_pct": -6.28,
+      "alloc_err_pct": -0.5,
+      "memory_source_case": "deepseekv2_tp1_ep8_pp1_dp8_l4_mbc4_cef",
+      "memory_group_name": "deepseekv2_tp1_ep8_pp1_dp8_l4_mbcX_cef",
+      "real_reserved_gib": 48.79
+    },
+    {
+      "case": "deepseekv2_tp1_ep4_pp2_dp4_l4_mbc4_cef",
+      "model": "deepseekv2",
+      "parallel": "tp1ep4pp2",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 251.91,
+      "perf_alloc_gib": 44.37,
+      "perf_peak_reserved_gib": 47.21,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 30.7624,
+        "last_stage": 44.3749
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:10:42.672917+00:00",
+      "ended_at": "2026-04-24T07:11:45.491232+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 282.1,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 44.7,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 32342.72216796875,
+          "max_reserved_mb": 34646.0
+        },
+        "1": {
+          "max_allocated_mb": 32343.42919921875,
+          "max_reserved_mb": 34648.0
+        },
+        "2": {
+          "max_allocated_mb": 32342.27685546875,
+          "max_reserved_mb": 34762.0
+        },
+        "3": {
+          "max_allocated_mb": 32342.68310546875,
+          "max_reserved_mb": 34694.0
+        },
+        "4": {
+          "max_allocated_mb": 45774.5693359375,
+          "max_reserved_mb": 48176.0
+        },
+        "5": {
+          "max_allocated_mb": 45774.5693359375,
+          "max_reserved_mb": 48176.0
+        },
+        "6": {
+          "max_allocated_mb": 45774.3212890625,
+          "max_reserved_mb": 48094.0
+        },
+        "7": {
+          "max_allocated_mb": 45775.80126953125,
+          "max_reserved_mb": 48152.0
+        }
+      },
+      "rel_err_pct": -10.7,
+      "alloc_err_pct": -0.74,
+      "memory_source_case": "deepseekv2_tp1_ep4_pp2_dp4_l4_mbc4_cef",
+      "memory_group_name": "deepseekv2_tp1_ep4_pp2_dp4_l4_mbcX_cef",
+      "real_reserved_gib": 47.05
+    },
+    {
+      "case": "deepseekv3_l4_tp1_ep8_pp1_dp8_mbc4_cef",
+      "model": "deepseekv3",
+      "parallel": "tp1ep8pp1",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 584.91,
+      "perf_alloc_gib": 103.52,
+      "perf_peak_reserved_gib": 110.12,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 103.5153
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:11:45.608993+00:00",
+      "ended_at": "2026-04-24T07:12:49.309869+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 603.2,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 104.3,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 106801.1953125,
+          "max_reserved_mb": 112712.0
+        },
+        "1": {
+          "max_allocated_mb": 106800.8193359375,
+          "max_reserved_mb": 112768.0
+        },
+        "2": {
+          "max_allocated_mb": 106803.63720703125,
+          "max_reserved_mb": 112630.0
+        },
+        "3": {
+          "max_allocated_mb": 106803.8046875,
+          "max_reserved_mb": 112518.0
+        },
+        "4": {
+          "max_allocated_mb": 106801.52783203125,
+          "max_reserved_mb": 112726.0
+        },
+        "5": {
+          "max_allocated_mb": 106801.38916015625,
+          "max_reserved_mb": 112766.0
+        },
+        "6": {
+          "max_allocated_mb": 106800.81787109375,
+          "max_reserved_mb": 112824.0
+        },
+        "7": {
+          "max_allocated_mb": 106800.81982421875,
+          "max_reserved_mb": 112824.0
+        }
+      },
+      "rel_err_pct": -3.03,
+      "alloc_err_pct": -0.75,
+      "memory_source_case": "deepseekv3_l4_tp1_ep8_pp1_dp8_mbc4_cef",
+      "memory_group_name": "deepseekv3_l4_tp1_ep8_pp1_dp8_mbcX_cef",
+      "real_reserved_gib": 110.18
+    },
+    {
+      "case": "deepseekv3_l4_tp1_ep4_pp2_dp4_mbc4_cef",
+      "model": "deepseekv3",
+      "parallel": "tp1ep4pp2",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 452.45,
+      "perf_alloc_gib": 113.08,
+      "perf_peak_reserved_gib": 120.29,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 69.7837,
+        "last_stage": 113.076
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:12:49.457480+00:00",
+      "ended_at": "2026-04-24T07:13:53.912935+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 452.2,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 114.0,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 72948.29345703125,
+          "max_reserved_mb": 76760.0
+        },
+        "1": {
+          "max_allocated_mb": 72948.51123046875,
+          "max_reserved_mb": 76704.0
+        },
+        "2": {
+          "max_allocated_mb": 72948.10595703125,
+          "max_reserved_mb": 76768.0
+        },
+        "3": {
+          "max_allocated_mb": 72948.10595703125,
+          "max_reserved_mb": 76768.0
+        },
+        "4": {
+          "max_allocated_mb": 116736.46484375,
+          "max_reserved_mb": 121460.0
+        },
+        "5": {
+          "max_allocated_mb": 116736.46484375,
+          "max_reserved_mb": 121460.0
+        },
+        "6": {
+          "max_allocated_mb": 116737.9228515625,
+          "max_reserved_mb": 121350.0
+        },
+        "7": {
+          "max_allocated_mb": 116736.916015625,
+          "max_reserved_mb": 121350.0
+        }
+      },
+      "rel_err_pct": 0.06,
+      "alloc_err_pct": -0.81,
+      "memory_source_case": "deepseekv3_l4_tp1_ep4_pp2_dp4_mbc4_cef",
+      "memory_group_name": "deepseekv3_l4_tp1_ep4_pp2_dp4_mbcX_cef",
+      "real_reserved_gib": 118.61
+    },
+    {
+      "case": "llama3_70b_l12_tp1_pp2_dp4_mbc8_cef",
+      "model": "llama3-70b",
+      "parallel": "tp1pp2",
+      "layer_num": 12,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 1441.2,
+      "perf_alloc_gib": 66.44,
+      "perf_peak_reserved_gib": 70.68,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 66.4383,
+        "last_stage": 62.8398
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:13:54.036576+00:00",
+      "ended_at": "2026-04-24T07:14:36.141202+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 1476.8,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 66.55,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 68149.19873046875,
+          "max_reserved_mb": 70730.0
+        },
+        "1": {
+          "max_allocated_mb": 68147.32275390625,
+          "max_reserved_mb": 71592.0
+        },
+        "2": {
+          "max_allocated_mb": 68146.29248046875,
+          "max_reserved_mb": 72586.0
+        },
+        "3": {
+          "max_allocated_mb": 68146.29248046875,
+          "max_reserved_mb": 70896.0
+        },
+        "4": {
+          "max_allocated_mb": 64479.4794921875,
+          "max_reserved_mb": 65762.0
+        },
+        "5": {
+          "max_allocated_mb": 64478.5498046875,
+          "max_reserved_mb": 65430.0
+        },
+        "6": {
+          "max_allocated_mb": 64478.6904296875,
+          "max_reserved_mb": 64938.0
+        },
+        "7": {
+          "max_allocated_mb": 64478.5498046875,
+          "max_reserved_mb": 64990.0
+        }
+      },
+      "rel_err_pct": -2.41,
+      "alloc_err_pct": -0.17,
+      "memory_source_case": "llama3_70b_l12_tp1_pp2_dp4_mbc4_cef",
+      "memory_group_name": "llama3_70b_l12_tp1_pp2_dp4_mbcX_cef",
+      "real_reserved_gib": 70.88
+    },
+    {
+      "case": "llama3_70b_tp2_pp1_dp4_l12_mbc8_cef",
+      "model": "llama3-70b",
+      "parallel": "tp2pp1",
+      "layer_num": 12,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 1309.8,
+      "perf_alloc_gib": 60.51,
+      "perf_peak_reserved_gib": 64.38,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 60.5134
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:14:36.265254+00:00",
+      "ended_at": "2026-04-24T07:15:18.212158+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 1387.0,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 60.68,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 63914.0
+        },
+        "1": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 63914.0
+        },
+        "2": {
+          "max_allocated_mb": 62136.40185546875,
+          "max_reserved_mb": 63560.0
+        },
+        "3": {
+          "max_allocated_mb": 62136.40185546875,
+          "max_reserved_mb": 63560.0
+        },
+        "4": {
+          "max_allocated_mb": 62136.27685546875,
+          "max_reserved_mb": 63776.0
+        },
+        "5": {
+          "max_allocated_mb": 62136.27685546875,
+          "max_reserved_mb": 63776.0
+        },
+        "6": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 64026.0
+        },
+        "7": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 64026.0
+        }
+      },
+      "rel_err_pct": -5.57,
+      "alloc_err_pct": -0.28,
+      "memory_source_case": "llama3_70b_tp2_pp1_dp4_l12_mbc4_cef",
+      "memory_group_name": "llama3_70b_tp2_pp1_dp4_l12_mbcX_cef",
+      "real_reserved_gib": 62.53
+    },
+    {
+      "case": "llama3_70b_l12_tp4_pp1_dp2_mbc8_cef",
+      "model": "llama3-70b",
+      "parallel": "tp4pp1",
+      "layer_num": 12,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 747.66,
+      "perf_alloc_gib": 38.94,
+      "perf_peak_reserved_gib": 41.43,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 38.9422
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:15:18.337362+00:00",
+      "ended_at": "2026-04-24T07:15:57.129067+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 765.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 39.07,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41076.0
+        },
+        "1": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41048.0
+        },
+        "2": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41048.0
+        },
+        "3": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41048.0
+        },
+        "4": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41080.0
+        },
+        "5": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41140.0
+        },
+        "6": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41080.0
+        },
+        "7": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41140.0
+        }
+      },
+      "rel_err_pct": -2.34,
+      "alloc_err_pct": -0.33,
+      "memory_source_case": "llama3_70b_l12_tp4_pp1_dp2_mbc4_cef",
+      "memory_group_name": "llama3_70b_l12_tp4_pp1_dp2_mbcX_cef",
+      "real_reserved_gib": 40.18
+    },
+    {
+      "case": "llama3_70b_l12_tp8_pp1_dp1_mbc8_cef",
+      "model": "llama3-70b",
+      "parallel": "tp8pp1",
+      "layer_num": 12,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 493.39,
+      "perf_alloc_gib": 28.17,
+      "perf_peak_reserved_gib": 29.96,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 28.1663
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:15:57.268435+00:00",
+      "ended_at": "2026-04-24T07:16:34.796084+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 556.7,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 28.29,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "1": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "2": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "3": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "4": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "5": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "6": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "7": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        }
+      },
+      "rel_err_pct": -11.37,
+      "alloc_err_pct": -0.42,
+      "memory_source_case": "llama3_70b_l12_tp8_pp1_dp1_mbc4_cef",
+      "memory_group_name": "llama3_70b_l12_tp8_pp1_dp1_mbcX_cef",
+      "real_reserved_gib": 29.12
+    },
+    {
+      "case": "deepseekv2_tp1_ep8_pp1_dp8_l4_mbc8_cef",
+      "model": "deepseekv2",
+      "parallel": "tp1ep8pp1",
+      "layer_num": 4,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 630.64,
+      "perf_alloc_gib": 45.4,
+      "perf_peak_reserved_gib": 48.3,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 45.4024
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:16:35.106399+00:00",
+      "ended_at": "2026-04-24T07:17:35.576108+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 676.2,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 45.63,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 46726.216796875,
+          "max_reserved_mb": 49942.0
+        },
+        "1": {
+          "max_allocated_mb": 46726.216796875,
+          "max_reserved_mb": 49942.0
+        },
+        "2": {
+          "max_allocated_mb": 46727.47412109375,
+          "max_reserved_mb": 49846.0
+        },
+        "3": {
+          "max_allocated_mb": 46730.00146484375,
+          "max_reserved_mb": 49818.0
+        },
+        "4": {
+          "max_allocated_mb": 46724.99560546875,
+          "max_reserved_mb": 49962.0
+        },
+        "5": {
+          "max_allocated_mb": 46727.80859375,
+          "max_reserved_mb": 49816.0
+        },
+        "6": {
+          "max_allocated_mb": 46726.216796875,
+          "max_reserved_mb": 49942.0
+        },
+        "7": {
+          "max_allocated_mb": 46726.8759765625,
+          "max_reserved_mb": 49942.0
+        }
+      },
+      "rel_err_pct": -6.74,
+      "alloc_err_pct": -0.5,
+      "memory_source_case": "deepseekv2_tp1_ep8_pp1_dp8_l4_mbc4_cef",
+      "memory_group_name": "deepseekv2_tp1_ep8_pp1_dp8_l4_mbcX_cef",
+      "real_reserved_gib": 48.79
+    },
+    {
+      "case": "deepseekv2_tp1_ep4_pp2_dp4_l4_mbc8_cef",
+      "model": "deepseekv2",
+      "parallel": "tp1ep4pp2",
+      "layer_num": 4,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 435.14,
+      "perf_alloc_gib": 44.37,
+      "perf_peak_reserved_gib": 47.21,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 30.7624,
+        "last_stage": 44.3749
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:17:35.697241+00:00",
+      "ended_at": "2026-04-24T07:18:41.004442+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 492.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 44.7,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 32342.72216796875,
+          "max_reserved_mb": 34646.0
+        },
+        "1": {
+          "max_allocated_mb": 32343.42919921875,
+          "max_reserved_mb": 34648.0
+        },
+        "2": {
+          "max_allocated_mb": 32342.27685546875,
+          "max_reserved_mb": 34762.0
+        },
+        "3": {
+          "max_allocated_mb": 32342.68310546875,
+          "max_reserved_mb": 34694.0
+        },
+        "4": {
+          "max_allocated_mb": 45774.5693359375,
+          "max_reserved_mb": 48176.0
+        },
+        "5": {
+          "max_allocated_mb": 45774.5693359375,
+          "max_reserved_mb": 48176.0
+        },
+        "6": {
+          "max_allocated_mb": 45774.3212890625,
+          "max_reserved_mb": 48094.0
+        },
+        "7": {
+          "max_allocated_mb": 45775.80126953125,
+          "max_reserved_mb": 48152.0
+        }
+      },
+      "rel_err_pct": -11.66,
+      "alloc_err_pct": -0.74,
+      "memory_source_case": "deepseekv2_tp1_ep4_pp2_dp4_l4_mbc4_cef",
+      "memory_group_name": "deepseekv2_tp1_ep4_pp2_dp4_l4_mbcX_cef",
+      "real_reserved_gib": 47.05
+    },
+    {
+      "case": "deepseekv3_l4_tp1_ep8_pp1_dp8_mbc8_cef",
+      "model": "deepseekv3",
+      "parallel": "tp1ep8pp1",
+      "layer_num": 4,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 1054.5,
+      "perf_alloc_gib": 103.52,
+      "perf_peak_reserved_gib": 110.12,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 103.5153
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:18:41.215170+00:00",
+      "ended_at": "2026-04-24T07:19:45.127825+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 1101.7,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 104.3,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 106801.1953125,
+          "max_reserved_mb": 112712.0
+        },
+        "1": {
+          "max_allocated_mb": 106800.8193359375,
+          "max_reserved_mb": 112768.0
+        },
+        "2": {
+          "max_allocated_mb": 106803.63720703125,
+          "max_reserved_mb": 112630.0
+        },
+        "3": {
+          "max_allocated_mb": 106803.8046875,
+          "max_reserved_mb": 112518.0
+        },
+        "4": {
+          "max_allocated_mb": 106801.52783203125,
+          "max_reserved_mb": 112726.0
+        },
+        "5": {
+          "max_allocated_mb": 106801.38916015625,
+          "max_reserved_mb": 112766.0
+        },
+        "6": {
+          "max_allocated_mb": 106800.81787109375,
+          "max_reserved_mb": 112824.0
+        },
+        "7": {
+          "max_allocated_mb": 106800.81982421875,
+          "max_reserved_mb": 112824.0
+        }
+      },
+      "rel_err_pct": -4.28,
+      "alloc_err_pct": -0.75,
+      "memory_source_case": "deepseekv3_l4_tp1_ep8_pp1_dp8_mbc4_cef",
+      "memory_group_name": "deepseekv3_l4_tp1_ep8_pp1_dp8_mbcX_cef",
+      "real_reserved_gib": 110.18
+    },
+    {
+      "case": "deepseekv3_l4_tp1_ep4_pp2_dp4_mbc8_cef",
+      "model": "deepseekv3",
+      "parallel": "tp1ep4pp2",
+      "layer_num": 4,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 761.96,
+      "perf_alloc_gib": 113.08,
+      "perf_peak_reserved_gib": 120.29,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 69.7837,
+        "last_stage": 113.076
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:19:45.248042+00:00",
+      "ended_at": "2026-04-24T07:20:51.689873+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 771.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 114.0,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 72948.29345703125,
+          "max_reserved_mb": 76760.0
+        },
+        "1": {
+          "max_allocated_mb": 72948.51123046875,
+          "max_reserved_mb": 76704.0
+        },
+        "2": {
+          "max_allocated_mb": 72948.10595703125,
+          "max_reserved_mb": 76768.0
+        },
+        "3": {
+          "max_allocated_mb": 72948.10595703125,
+          "max_reserved_mb": 76768.0
+        },
+        "4": {
+          "max_allocated_mb": 116736.46484375,
+          "max_reserved_mb": 121460.0
+        },
+        "5": {
+          "max_allocated_mb": 116736.46484375,
+          "max_reserved_mb": 121460.0
+        },
+        "6": {
+          "max_allocated_mb": 116737.9228515625,
+          "max_reserved_mb": 121350.0
+        },
+        "7": {
+          "max_allocated_mb": 116736.916015625,
+          "max_reserved_mb": 121350.0
+        }
+      },
+      "rel_err_pct": -1.25,
+      "alloc_err_pct": -0.81,
+      "memory_source_case": "deepseekv3_l4_tp1_ep4_pp2_dp4_mbc4_cef",
+      "memory_group_name": "deepseekv3_l4_tp1_ep4_pp2_dp4_mbcX_cef",
+      "real_reserved_gib": 118.61
+    },
+    {
+      "case": "llama3_70b_l12_tp1_pp2_dp4_mbc32_cef",
+      "model": "llama3-70b",
+      "parallel": "tp1pp2",
+      "layer_num": 12,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 5115.7,
+      "perf_alloc_gib": 66.44,
+      "perf_peak_reserved_gib": 70.68,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 66.4383,
+        "last_stage": 62.8398
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:20:51.821710+00:00",
+      "ended_at": "2026-04-24T07:21:48.047133+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 5436.5,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 66.55,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 68149.19873046875,
+          "max_reserved_mb": 70730.0
+        },
+        "1": {
+          "max_allocated_mb": 68147.32275390625,
+          "max_reserved_mb": 71592.0
+        },
+        "2": {
+          "max_allocated_mb": 68146.29248046875,
+          "max_reserved_mb": 72586.0
+        },
+        "3": {
+          "max_allocated_mb": 68146.29248046875,
+          "max_reserved_mb": 70896.0
+        },
+        "4": {
+          "max_allocated_mb": 64479.4794921875,
+          "max_reserved_mb": 65762.0
+        },
+        "5": {
+          "max_allocated_mb": 64478.5498046875,
+          "max_reserved_mb": 65430.0
+        },
+        "6": {
+          "max_allocated_mb": 64478.6904296875,
+          "max_reserved_mb": 64938.0
+        },
+        "7": {
+          "max_allocated_mb": 64478.5498046875,
+          "max_reserved_mb": 64990.0
+        }
+      },
+      "rel_err_pct": -5.9,
+      "alloc_err_pct": -0.17,
+      "memory_source_case": "llama3_70b_l12_tp1_pp2_dp4_mbc4_cef",
+      "memory_group_name": "llama3_70b_l12_tp1_pp2_dp4_mbcX_cef",
+      "real_reserved_gib": 70.88
+    },
+    {
+      "case": "llama3_70b_tp2_pp1_dp4_l12_mbc32_cef",
+      "model": "llama3-70b",
+      "parallel": "tp2pp1",
+      "layer_num": 12,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 4975.9,
+      "perf_alloc_gib": 60.51,
+      "perf_peak_reserved_gib": 64.38,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 60.5134
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:21:48.170256+00:00",
+      "ended_at": "2026-04-24T07:22:40.663255+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 5376.5,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 60.68,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 63914.0
+        },
+        "1": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 63914.0
+        },
+        "2": {
+          "max_allocated_mb": 62136.40185546875,
+          "max_reserved_mb": 63560.0
+        },
+        "3": {
+          "max_allocated_mb": 62136.40185546875,
+          "max_reserved_mb": 63560.0
+        },
+        "4": {
+          "max_allocated_mb": 62136.27685546875,
+          "max_reserved_mb": 63776.0
+        },
+        "5": {
+          "max_allocated_mb": 62136.27685546875,
+          "max_reserved_mb": 63776.0
+        },
+        "6": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 64026.0
+        },
+        "7": {
+          "max_allocated_mb": 62136.25341796875,
+          "max_reserved_mb": 64026.0
+        }
+      },
+      "rel_err_pct": -7.45,
+      "alloc_err_pct": -0.28,
+      "memory_source_case": "llama3_70b_tp2_pp1_dp4_l12_mbc4_cef",
+      "memory_group_name": "llama3_70b_tp2_pp1_dp4_l12_mbcX_cef",
+      "real_reserved_gib": 62.53
+    },
+    {
+      "case": "llama3_70b_l12_tp4_pp1_dp2_mbc32_cef",
+      "model": "llama3-70b",
+      "parallel": "tp4pp1",
+      "layer_num": 12,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 2862.2,
+      "perf_alloc_gib": 38.94,
+      "perf_peak_reserved_gib": 41.43,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 38.9422
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:22:40.971257+00:00",
+      "ended_at": "2026-04-24T07:23:26.429431+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 2964.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 39.07,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41076.0
+        },
+        "1": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41048.0
+        },
+        "2": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41048.0
+        },
+        "3": {
+          "max_allocated_mb": 40009.77294921875,
+          "max_reserved_mb": 41048.0
+        },
+        "4": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41080.0
+        },
+        "5": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41140.0
+        },
+        "6": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41080.0
+        },
+        "7": {
+          "max_allocated_mb": 40009.74169921875,
+          "max_reserved_mb": 41140.0
+        }
+      },
+      "rel_err_pct": -3.45,
+      "alloc_err_pct": -0.33,
+      "memory_source_case": "llama3_70b_l12_tp4_pp1_dp2_mbc4_cef",
+      "memory_group_name": "llama3_70b_l12_tp4_pp1_dp2_mbcX_cef",
+      "real_reserved_gib": 40.18
+    },
+    {
+      "case": "llama3_70b_l12_tp8_pp1_dp1_mbc32_cef",
+      "model": "llama3-70b",
+      "parallel": "tp8pp1",
+      "layer_num": 12,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 1919.4,
+      "perf_alloc_gib": 28.17,
+      "perf_peak_reserved_gib": 29.96,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 28.1663
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:23:26.553094+00:00",
+      "ended_at": "2026-04-24T07:24:07.381245+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 2073.7,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 28.29,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "1": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "2": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "3": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "4": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "5": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "6": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        },
+        "7": {
+          "max_allocated_mb": 28965.36474609375,
+          "max_reserved_mb": 29816.0
+        }
+      },
+      "rel_err_pct": -7.44,
+      "alloc_err_pct": -0.42,
+      "memory_source_case": "llama3_70b_l12_tp8_pp1_dp1_mbc4_cef",
+      "memory_group_name": "llama3_70b_l12_tp8_pp1_dp1_mbcX_cef",
+      "real_reserved_gib": 29.12
+    },
+    {
+      "case": "deepseekv2_tp1_ep8_pp1_dp8_l4_mbc32_cef",
+      "model": "deepseekv2",
+      "parallel": "tp1ep8pp1",
+      "layer_num": 4,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 2352.9,
+      "perf_alloc_gib": 45.4,
+      "perf_peak_reserved_gib": 48.3,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 45.4024
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:24:07.501151+00:00",
+      "ended_at": "2026-04-24T07:25:13.460676+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 2721.3,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 45.63,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 46726.216796875,
+          "max_reserved_mb": 49942.0
+        },
+        "1": {
+          "max_allocated_mb": 46726.216796875,
+          "max_reserved_mb": 49942.0
+        },
+        "2": {
+          "max_allocated_mb": 46727.47412109375,
+          "max_reserved_mb": 49846.0
+        },
+        "3": {
+          "max_allocated_mb": 46730.00146484375,
+          "max_reserved_mb": 49818.0
+        },
+        "4": {
+          "max_allocated_mb": 46724.99560546875,
+          "max_reserved_mb": 49962.0
+        },
+        "5": {
+          "max_allocated_mb": 46727.80859375,
+          "max_reserved_mb": 49816.0
+        },
+        "6": {
+          "max_allocated_mb": 46726.216796875,
+          "max_reserved_mb": 49942.0
+        },
+        "7": {
+          "max_allocated_mb": 46726.8759765625,
+          "max_reserved_mb": 49942.0
+        }
+      },
+      "rel_err_pct": -13.54,
+      "alloc_err_pct": -0.5,
+      "memory_source_case": "deepseekv2_tp1_ep8_pp1_dp8_l4_mbc4_cef",
+      "memory_group_name": "deepseekv2_tp1_ep8_pp1_dp8_l4_mbcX_cef",
+      "real_reserved_gib": 48.79
+    },
+    {
+      "case": "deepseekv2_tp1_ep4_pp2_dp4_l4_mbc32_cef",
+      "model": "deepseekv2",
+      "parallel": "tp1ep4pp2",
+      "layer_num": 4,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 1534.5,
+      "perf_alloc_gib": 44.37,
+      "perf_peak_reserved_gib": 47.21,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 30.7624,
+        "last_stage": 44.3749
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:25:13.582368+00:00",
+      "ended_at": "2026-04-24T07:26:20.925792+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 1727.7,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 44.7,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 32342.72216796875,
+          "max_reserved_mb": 34646.0
+        },
+        "1": {
+          "max_allocated_mb": 32343.42919921875,
+          "max_reserved_mb": 34648.0
+        },
+        "2": {
+          "max_allocated_mb": 32342.27685546875,
+          "max_reserved_mb": 34762.0
+        },
+        "3": {
+          "max_allocated_mb": 32342.68310546875,
+          "max_reserved_mb": 34694.0
+        },
+        "4": {
+          "max_allocated_mb": 45774.5693359375,
+          "max_reserved_mb": 48176.0
+        },
+        "5": {
+          "max_allocated_mb": 45774.5693359375,
+          "max_reserved_mb": 48176.0
+        },
+        "6": {
+          "max_allocated_mb": 45774.3212890625,
+          "max_reserved_mb": 48094.0
+        },
+        "7": {
+          "max_allocated_mb": 45775.80126953125,
+          "max_reserved_mb": 48152.0
+        }
+      },
+      "rel_err_pct": -11.18,
+      "alloc_err_pct": -0.74,
+      "memory_source_case": "deepseekv2_tp1_ep4_pp2_dp4_l4_mbc4_cef",
+      "memory_group_name": "deepseekv2_tp1_ep4_pp2_dp4_l4_mbcX_cef",
+      "real_reserved_gib": 47.05
+    },
+    {
+      "case": "deepseekv3_l4_tp1_ep8_pp1_dp8_mbc32_cef",
+      "model": "deepseekv3",
+      "parallel": "tp1ep8pp1",
+      "layer_num": 4,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 3872.2,
+      "perf_alloc_gib": 103.52,
+      "perf_peak_reserved_gib": 110.12,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 103.5153
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:26:21.149120+00:00",
+      "ended_at": "2026-04-24T07:27:34.250018+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 4141.2,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 104.3,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 106801.1953125,
+          "max_reserved_mb": 112712.0
+        },
+        "1": {
+          "max_allocated_mb": 106800.8193359375,
+          "max_reserved_mb": 112768.0
+        },
+        "2": {
+          "max_allocated_mb": 106803.63720703125,
+          "max_reserved_mb": 112630.0
+        },
+        "3": {
+          "max_allocated_mb": 106803.8046875,
+          "max_reserved_mb": 112518.0
+        },
+        "4": {
+          "max_allocated_mb": 106801.52783203125,
+          "max_reserved_mb": 112726.0
+        },
+        "5": {
+          "max_allocated_mb": 106801.38916015625,
+          "max_reserved_mb": 112766.0
+        },
+        "6": {
+          "max_allocated_mb": 106800.81787109375,
+          "max_reserved_mb": 112824.0
+        },
+        "7": {
+          "max_allocated_mb": 106800.81982421875,
+          "max_reserved_mb": 112824.0
+        }
+      },
+      "rel_err_pct": -6.5,
+      "alloc_err_pct": -0.75,
+      "memory_source_case": "deepseekv3_l4_tp1_ep8_pp1_dp8_mbc4_cef",
+      "memory_group_name": "deepseekv3_l4_tp1_ep8_pp1_dp8_mbcX_cef",
+      "real_reserved_gib": 110.18
+    },
+    {
+      "case": "deepseekv3_l4_tp1_ep4_pp2_dp4_mbc32_cef",
+      "model": "deepseekv3",
+      "parallel": "tp1ep4pp2",
+      "layer_num": 4,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 2619.0,
+      "perf_alloc_gib": 113.08,
+      "perf_peak_reserved_gib": 120.29,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 69.7837,
+        "last_stage": 113.076
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:27:34.359963+00:00",
+      "ended_at": "2026-04-24T07:28:46.005234+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 2718.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 114.0,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 72948.29345703125,
+          "max_reserved_mb": 76760.0
+        },
+        "1": {
+          "max_allocated_mb": 72948.51123046875,
+          "max_reserved_mb": 76704.0
+        },
+        "2": {
+          "max_allocated_mb": 72948.10595703125,
+          "max_reserved_mb": 76768.0
+        },
+        "3": {
+          "max_allocated_mb": 72948.10595703125,
+          "max_reserved_mb": 76768.0
+        },
+        "4": {
+          "max_allocated_mb": 116736.46484375,
+          "max_reserved_mb": 121460.0
+        },
+        "5": {
+          "max_allocated_mb": 116736.46484375,
+          "max_reserved_mb": 121460.0
+        },
+        "6": {
+          "max_allocated_mb": 116737.9228515625,
+          "max_reserved_mb": 121350.0
+        },
+        "7": {
+          "max_allocated_mb": 116736.916015625,
+          "max_reserved_mb": 121350.0
+        }
+      },
+      "rel_err_pct": -3.66,
+      "alloc_err_pct": -0.81,
+      "memory_source_case": "deepseekv3_l4_tp1_ep4_pp2_dp4_mbc4_cef",
+      "memory_group_name": "deepseekv3_l4_tp1_ep4_pp2_dp4_mbcX_cef",
+      "real_reserved_gib": 118.61
+    },
+    {
+      "case": "llama3_405b_l4_tp1_pp2_dp4_mbc4_cef",
+      "model": "llama3-405b",
+      "parallel": "tp1pp2",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 1072.7,
+      "perf_alloc_gib": 86.88,
+      "perf_peak_reserved_gib": 92.43,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 86.4302,
+        "last_stage": 86.8835
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:28:46.232069+00:00",
+      "ended_at": "2026-04-24T07:29:28.154057+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 1074.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 87.08,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 88688.75732421875,
+          "max_reserved_mb": 93782.0
+        },
+        "1": {
+          "max_allocated_mb": 88688.81982421875,
+          "max_reserved_mb": 93838.0
+        },
+        "2": {
+          "max_allocated_mb": 88688.88232421875,
+          "max_reserved_mb": 94474.0
+        },
+        "3": {
+          "max_allocated_mb": 88688.75732421875,
+          "max_reserved_mb": 93290.0
+        },
+        "4": {
+          "max_allocated_mb": 89173.09375,
+          "max_reserved_mb": 90282.0
+        },
+        "5": {
+          "max_allocated_mb": 89172.2431640625,
+          "max_reserved_mb": 89788.0
+        },
+        "6": {
+          "max_allocated_mb": 89173.3994140625,
+          "max_reserved_mb": 90706.0
+        },
+        "7": {
+          "max_allocated_mb": 89173.3525390625,
+          "max_reserved_mb": 90596.0
+        }
+      },
+      "rel_err_pct": -0.18,
+      "alloc_err_pct": -0.23,
+      "memory_source_case": "llama3_405b_l4_tp1_pp2_dp4_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp1_pp2_dp4_mbcX_cef",
+      "real_reserved_gib": 92.26
+    },
+    {
+      "case": "llama3_405b_l4_tp2_pp1_dp4_mbc4_cef",
+      "model": "llama3-405b",
+      "parallel": "tp2pp1",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 860.73,
+      "perf_alloc_gib": 81.31,
+      "perf_peak_reserved_gib": 86.5,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 81.3128
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:29:28.264453+00:00",
+      "ended_at": "2026-04-24T07:30:06.079985+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 907.3,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 81.59,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86704.0
+        },
+        "1": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86704.0
+        },
+        "2": {
+          "max_allocated_mb": 83549.85009765625,
+          "max_reserved_mb": 86384.0
+        },
+        "3": {
+          "max_allocated_mb": 83549.85009765625,
+          "max_reserved_mb": 86384.0
+        },
+        "4": {
+          "max_allocated_mb": 83549.677734375,
+          "max_reserved_mb": 86384.0
+        },
+        "5": {
+          "max_allocated_mb": 83549.677734375,
+          "max_reserved_mb": 86384.0
+        },
+        "6": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86734.0
+        },
+        "7": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86734.0
+        }
+      },
+      "rel_err_pct": -5.13,
+      "alloc_err_pct": -0.34,
+      "memory_source_case": "llama3_405b_l4_tp2_pp1_dp4_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp2_pp1_dp4_mbcX_cef",
+      "real_reserved_gib": 84.7
+    },
+    {
+      "case": "llama3_405b_l4_tp4_pp1_dp2_mbc4_cef",
+      "model": "llama3-405b",
+      "parallel": "tp4pp1",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 452.92,
+      "perf_alloc_gib": 52.68,
+      "perf_peak_reserved_gib": 56.04,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 52.6813
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:30:06.184817+00:00",
+      "ended_at": "2026-04-24T07:30:44.232006+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 476.0,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 52.89,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "1": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "2": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "3": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "4": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        },
+        "5": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        },
+        "6": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        },
+        "7": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        }
+      },
+      "rel_err_pct": -4.85,
+      "alloc_err_pct": -0.4,
+      "memory_source_case": "llama3_405b_l4_tp4_pp1_dp2_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp4_pp1_dp2_mbcX_cef",
+      "real_reserved_gib": 54.65
+    },
+    {
+      "case": "llama3_405b_l4_tp8_pp1_dp1_mbc4_cef",
+      "model": "llama3-405b",
+      "parallel": "tp8pp1",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 255.83,
+      "perf_alloc_gib": 38.38,
+      "perf_peak_reserved_gib": 40.83,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 38.3838
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:30:44.522267+00:00",
+      "ended_at": "2026-04-24T07:31:19.117381+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 258.8,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 38.57,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "1": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "2": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "3": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "4": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "5": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "6": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "7": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        }
+      },
+      "rel_err_pct": -1.15,
+      "alloc_err_pct": -0.49,
+      "memory_source_case": "llama3_405b_l4_tp8_pp1_dp1_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp8_pp1_dp1_mbcX_cef",
+      "real_reserved_gib": 39.83
+    },
+    {
+      "case": "llama3_405b_l4_tp1_pp2_dp4_mbc8_cef",
+      "model": "llama3-405b",
+      "parallel": "tp1pp2",
+      "layer_num": 4,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 1870.8,
+      "perf_alloc_gib": 86.88,
+      "perf_peak_reserved_gib": 92.43,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 86.4302,
+        "last_stage": 86.8835
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:31:19.229886+00:00",
+      "ended_at": "2026-04-24T07:32:02.016432+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 1935.4,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 87.08,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 88688.75732421875,
+          "max_reserved_mb": 93782.0
+        },
+        "1": {
+          "max_allocated_mb": 88688.81982421875,
+          "max_reserved_mb": 93838.0
+        },
+        "2": {
+          "max_allocated_mb": 88688.88232421875,
+          "max_reserved_mb": 94474.0
+        },
+        "3": {
+          "max_allocated_mb": 88688.75732421875,
+          "max_reserved_mb": 93290.0
+        },
+        "4": {
+          "max_allocated_mb": 89173.09375,
+          "max_reserved_mb": 90282.0
+        },
+        "5": {
+          "max_allocated_mb": 89172.2431640625,
+          "max_reserved_mb": 89788.0
+        },
+        "6": {
+          "max_allocated_mb": 89173.3994140625,
+          "max_reserved_mb": 90706.0
+        },
+        "7": {
+          "max_allocated_mb": 89173.3525390625,
+          "max_reserved_mb": 90596.0
+        }
+      },
+      "rel_err_pct": -3.34,
+      "alloc_err_pct": -0.23,
+      "memory_source_case": "llama3_405b_l4_tp1_pp2_dp4_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp1_pp2_dp4_mbcX_cef",
+      "real_reserved_gib": 92.26
+    },
+    {
+      "case": "llama3_405b_l4_tp2_pp1_dp4_mbc8_cef",
+      "model": "llama3-405b",
+      "parallel": "tp2pp1",
+      "layer_num": 4,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 1600.4,
+      "perf_alloc_gib": 81.31,
+      "perf_peak_reserved_gib": 86.5,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 81.3128
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:32:02.124454+00:00",
+      "ended_at": "2026-04-24T07:32:44.380449+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 1716.8,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 81.59,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86704.0
+        },
+        "1": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86704.0
+        },
+        "2": {
+          "max_allocated_mb": 83549.85009765625,
+          "max_reserved_mb": 86384.0
+        },
+        "3": {
+          "max_allocated_mb": 83549.85009765625,
+          "max_reserved_mb": 86384.0
+        },
+        "4": {
+          "max_allocated_mb": 83549.677734375,
+          "max_reserved_mb": 86384.0
+        },
+        "5": {
+          "max_allocated_mb": 83549.677734375,
+          "max_reserved_mb": 86384.0
+        },
+        "6": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86734.0
+        },
+        "7": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86734.0
+        }
+      },
+      "rel_err_pct": -6.78,
+      "alloc_err_pct": -0.34,
+      "memory_source_case": "llama3_405b_l4_tp2_pp1_dp4_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp2_pp1_dp4_mbcX_cef",
+      "real_reserved_gib": 84.7
+    },
+    {
+      "case": "llama3_405b_l4_tp4_pp1_dp2_mbc8_cef",
+      "model": "llama3-405b",
+      "parallel": "tp4pp1",
+      "layer_num": 4,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 846.87,
+      "perf_alloc_gib": 52.68,
+      "perf_peak_reserved_gib": 56.04,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 52.6813
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:32:44.659661+00:00",
+      "ended_at": "2026-04-24T07:33:23.574270+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 899.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 52.89,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "1": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "2": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "3": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "4": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        },
+        "5": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        },
+        "6": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        },
+        "7": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        }
+      },
+      "rel_err_pct": -5.86,
+      "alloc_err_pct": -0.4,
+      "memory_source_case": "llama3_405b_l4_tp4_pp1_dp2_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp4_pp1_dp2_mbcX_cef",
+      "real_reserved_gib": 54.65
+    },
+    {
+      "case": "llama3_405b_l4_tp8_pp1_dp1_mbc8_cef",
+      "model": "llama3-405b",
+      "parallel": "tp8pp1",
+      "layer_num": 4,
+      "mbc": 8,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 486.81,
+      "perf_alloc_gib": 38.38,
+      "perf_peak_reserved_gib": 40.83,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 38.3838
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:33:23.683538+00:00",
+      "ended_at": "2026-04-24T07:33:59.283441+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 488.1,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 38.57,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "1": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "2": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "3": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "4": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "5": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "6": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "7": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        }
+      },
+      "rel_err_pct": -0.26,
+      "alloc_err_pct": -0.49,
+      "memory_source_case": "llama3_405b_l4_tp8_pp1_dp1_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp8_pp1_dp1_mbcX_cef",
+      "real_reserved_gib": 39.83
+    },
+    {
+      "case": "llama3_405b_l4_tp1_pp2_dp4_mbc32_cef",
+      "model": "llama3-405b",
+      "parallel": "tp1pp2",
+      "layer_num": 4,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 6659.3,
+      "perf_alloc_gib": 86.88,
+      "perf_peak_reserved_gib": 92.43,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 86.4302,
+        "last_stage": 86.8835
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:33:59.576132+00:00",
+      "ended_at": "2026-04-24T07:34:56.746241+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 7046.4,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 87.08,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 88688.75732421875,
+          "max_reserved_mb": 93782.0
+        },
+        "1": {
+          "max_allocated_mb": 88688.81982421875,
+          "max_reserved_mb": 93838.0
+        },
+        "2": {
+          "max_allocated_mb": 88688.88232421875,
+          "max_reserved_mb": 94474.0
+        },
+        "3": {
+          "max_allocated_mb": 88688.75732421875,
+          "max_reserved_mb": 93290.0
+        },
+        "4": {
+          "max_allocated_mb": 89173.09375,
+          "max_reserved_mb": 90282.0
+        },
+        "5": {
+          "max_allocated_mb": 89172.2431640625,
+          "max_reserved_mb": 89788.0
+        },
+        "6": {
+          "max_allocated_mb": 89173.3994140625,
+          "max_reserved_mb": 90706.0
+        },
+        "7": {
+          "max_allocated_mb": 89173.3525390625,
+          "max_reserved_mb": 90596.0
+        }
+      },
+      "rel_err_pct": -5.49,
+      "alloc_err_pct": -0.23,
+      "memory_source_case": "llama3_405b_l4_tp1_pp2_dp4_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp1_pp2_dp4_mbcX_cef",
+      "real_reserved_gib": 92.26
+    },
+    {
+      "case": "llama3_405b_l4_tp2_pp1_dp4_mbc32_cef",
+      "model": "llama3-405b",
+      "parallel": "tp2pp1",
+      "layer_num": 4,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 6038.7,
+      "perf_alloc_gib": 81.31,
+      "perf_peak_reserved_gib": 86.5,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 81.3128
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:34:56.921939+00:00",
+      "ended_at": "2026-04-24T07:35:53.635308+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 6604.1,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 81.59,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86704.0
+        },
+        "1": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86704.0
+        },
+        "2": {
+          "max_allocated_mb": 83549.85009765625,
+          "max_reserved_mb": 86384.0
+        },
+        "3": {
+          "max_allocated_mb": 83549.85009765625,
+          "max_reserved_mb": 86384.0
+        },
+        "4": {
+          "max_allocated_mb": 83549.677734375,
+          "max_reserved_mb": 86384.0
+        },
+        "5": {
+          "max_allocated_mb": 83549.677734375,
+          "max_reserved_mb": 86384.0
+        },
+        "6": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86734.0
+        },
+        "7": {
+          "max_allocated_mb": 83549.63232421875,
+          "max_reserved_mb": 86734.0
+        }
+      },
+      "rel_err_pct": -8.56,
+      "alloc_err_pct": -0.34,
+      "memory_source_case": "llama3_405b_l4_tp2_pp1_dp4_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp2_pp1_dp4_mbcX_cef",
+      "real_reserved_gib": 84.7
+    },
+    {
+      "case": "llama3_405b_l4_tp4_pp1_dp2_mbc32_cef",
+      "model": "llama3-405b",
+      "parallel": "tp4pp1",
+      "layer_num": 4,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 3210.6,
+      "perf_alloc_gib": 52.68,
+      "perf_peak_reserved_gib": 56.04,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 52.6813
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:35:53.888255+00:00",
+      "ended_at": "2026-04-24T07:36:41.026522+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 3455.4,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 52.89,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "1": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "2": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "3": {
+          "max_allocated_mb": 54158.11279296875,
+          "max_reserved_mb": 55966.0
+        },
+        "4": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        },
+        "5": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        },
+        "6": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        },
+        "7": {
+          "max_allocated_mb": 54158.01904296875,
+          "max_reserved_mb": 55966.0
+        }
+      },
+      "rel_err_pct": -7.08,
+      "alloc_err_pct": -0.4,
+      "memory_source_case": "llama3_405b_l4_tp4_pp1_dp2_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp4_pp1_dp2_mbcX_cef",
+      "real_reserved_gib": 54.65
+    },
+    {
+      "case": "llama3_405b_l4_tp8_pp1_dp1_mbc32_cef",
+      "model": "llama3-405b",
+      "parallel": "tp8pp1",
+      "layer_num": 4,
+      "mbc": 32,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "status": "ok",
+      "perf_ms": 1872.6,
+      "perf_alloc_gib": 38.38,
+      "perf_peak_reserved_gib": 40.83,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 38.3838
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "started_at": "2026-04-24T07:36:41.139118+00:00",
+      "ended_at": "2026-04-24T07:37:21.673759+00:00",
+      "returncode": 0,
+      "precheck_processes": [],
+      "real_ms": 1901.8,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 38.57,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "1": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "2": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "3": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "4": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "5": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "6": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        },
+        "7": {
+          "max_allocated_mb": 39499.84521484375,
+          "max_reserved_mb": 40788.0
+        }
+      },
+      "rel_err_pct": -1.54,
+      "alloc_err_pct": -0.49,
+      "memory_source_case": "llama3_405b_l4_tp8_pp1_dp1_mbc4_cef",
+      "memory_group_name": "llama3_405b_l4_tp8_pp1_dp1_mbcX_cef",
+      "real_reserved_gib": 39.83
+    },
+    {
+      "case": "llama3_70b_l12_tp2_cp4_pp1_dp1_seq32768_mbc4_cef",
+      "model": "llama3-70b",
+      "parallel": "tp2cp4pp1",
+      "layer_num": 12,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "cp_size": 4,
+      "status": "ok",
+      "real_ms": 1758.0,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 68.43,
+      "real_reserved_gib": 70.33,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 70070.48486328125,
+          "max_reserved_mb": 71928.0
+        },
+        "1": {
+          "max_allocated_mb": 70070.48486328125,
+          "max_reserved_mb": 71928.0
+        },
+        "2": {
+          "max_allocated_mb": 70070.56298828125,
+          "max_reserved_mb": 71792.0
+        },
+        "3": {
+          "max_allocated_mb": 70070.56298828125,
+          "max_reserved_mb": 71792.0
+        },
+        "4": {
+          "max_allocated_mb": 70070.50830078125,
+          "max_reserved_mb": 71798.0
+        },
+        "5": {
+          "max_allocated_mb": 70070.50830078125,
+          "max_reserved_mb": 71798.0
+        },
+        "6": {
+          "max_allocated_mb": 70070.48486328125,
+          "max_reserved_mb": 72020.0
+        },
+        "7": {
+          "max_allocated_mb": 70070.48486328125,
+          "max_reserved_mb": 72020.0
+        }
+      },
+      "perf_ms": 1595.0,
+      "perf_alloc_gib": 68.16,
+      "perf_peak_reserved_gib": 72.51,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 68.1619
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "rel_err_pct": -9.27,
+      "alloc_err_pct": -0.39
+    },
+    {
+      "case": "llama3_70b_l12_tp1_cp8_pp1_dp1_seq32768_mbc4_cef",
+      "model": "llama3-70b",
+      "parallel": "tp1cp8pp1",
+      "layer_num": 12,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "cp_size": 8,
+      "status": "ok",
+      "real_ms": 1768.1,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 104.51,
+      "real_reserved_gib": 111.94,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 107014.15283203125,
+          "max_reserved_mb": 112310.0
+        },
+        "1": {
+          "max_allocated_mb": 107015.15283203125,
+          "max_reserved_mb": 111466.0
+        },
+        "2": {
+          "max_allocated_mb": 107015.27001953125,
+          "max_reserved_mb": 111094.0
+        },
+        "3": {
+          "max_allocated_mb": 107015.16845703125,
+          "max_reserved_mb": 111232.0
+        },
+        "4": {
+          "max_allocated_mb": 107017.11376953125,
+          "max_reserved_mb": 110008.0
+        },
+        "5": {
+          "max_allocated_mb": 107015.66650390625,
+          "max_reserved_mb": 110988.0
+        },
+        "6": {
+          "max_allocated_mb": 107015.15283203125,
+          "max_reserved_mb": 111242.0
+        },
+        "7": {
+          "max_allocated_mb": 107016.11767578125,
+          "max_reserved_mb": 114626.0
+        }
+      },
+      "perf_ms": 1627.2,
+      "perf_alloc_gib": 104.43,
+      "perf_peak_reserved_gib": 111.1,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 104.4331
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "rel_err_pct": -7.97,
+      "alloc_err_pct": -0.08
+    },
+    {
+      "case": "llama3_405b_l4_tp2_cp4_pp1_dp1_seq32768_mbc4_cef",
+      "model": "llama3-405b",
+      "parallel": "tp2cp4pp1",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "cp_size": 4,
+      "status": "ok",
+      "real_ms": 1984.7,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 87.03,
+      "real_reserved_gib": 91.15,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 89113.73876953125,
+          "max_reserved_mb": 92344.0
+        },
+        "1": {
+          "max_allocated_mb": 89113.73876953125,
+          "max_reserved_mb": 92344.0
+        },
+        "2": {
+          "max_allocated_mb": 89113.80126953125,
+          "max_reserved_mb": 93340.0
+        },
+        "3": {
+          "max_allocated_mb": 89113.80126953125,
+          "max_reserved_mb": 93340.0
+        },
+        "4": {
+          "max_allocated_mb": 89113.75439453125,
+          "max_reserved_mb": 93114.0
+        },
+        "5": {
+          "max_allocated_mb": 89113.75439453125,
+          "max_reserved_mb": 93114.0
+        },
+        "6": {
+          "max_allocated_mb": 89113.73876953125,
+          "max_reserved_mb": 91972.0
+        },
+        "7": {
+          "max_allocated_mb": 89113.73876953125,
+          "max_reserved_mb": 91972.0
+        }
+      },
+      "perf_ms": 1814.3,
+      "perf_alloc_gib": 86.55,
+      "perf_peak_reserved_gib": 92.08,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 86.554
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "rel_err_pct": -8.59,
+      "alloc_err_pct": -0.55
+    },
+    {
+      "case": "llama3_405b_l4_tp1_cp8_pp1_dp1_seq32768_mbc4_cef",
+      "model": "llama3-405b",
+      "parallel": "tp1cp8pp1",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "cp_size": 8,
+      "status": "ok",
+      "real_ms": 2003.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 139.22,
+      "real_reserved_gib": 152.14,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 142557.47705078125,
+          "max_reserved_mb": 155790.0
+        },
+        "1": {
+          "max_allocated_mb": 142557.48828125,
+          "max_reserved_mb": 148704.0
+        },
+        "2": {
+          "max_allocated_mb": 142557.48876953125,
+          "max_reserved_mb": 148554.0
+        },
+        "3": {
+          "max_allocated_mb": 142556.55908203125,
+          "max_reserved_mb": 149256.0
+        },
+        "4": {
+          "max_allocated_mb": 142557.48828125,
+          "max_reserved_mb": 148454.0
+        },
+        "5": {
+          "max_allocated_mb": 142557.52001953125,
+          "max_reserved_mb": 148426.0
+        },
+        "6": {
+          "max_allocated_mb": 142556.48876953125,
+          "max_reserved_mb": 149640.0
+        },
+        "7": {
+          "max_allocated_mb": 142557.38330078125,
+          "max_reserved_mb": 155790.0
+        }
+      },
+      "perf_ms": 1896.2,
+      "perf_alloc_gib": 139.13,
+      "perf_peak_reserved_gib": 148.01,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 139.128
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "rel_err_pct": -5.36,
+      "alloc_err_pct": -0.06
+    },
+    {
+      "case": "llama3_70b_l12_tp2_cp4_pp1_dp1_seq131072_mbc4_cef",
+      "model": "llama3-70b",
+      "parallel": "tp2cp4pp1",
+      "layer_num": 12,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "cp_size": 4,
+      "status": "ok",
+      "real_ms": 11315.7,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 112.67,
+      "real_reserved_gib": 121.4,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 115371.86767578125,
+          "max_reserved_mb": 123822.0
+        },
+        "1": {
+          "max_allocated_mb": 115371.86767578125,
+          "max_reserved_mb": 123822.0
+        },
+        "2": {
+          "max_allocated_mb": 115371.97607421875,
+          "max_reserved_mb": 124310.0
+        },
+        "3": {
+          "max_allocated_mb": 115371.97607421875,
+          "max_reserved_mb": 124310.0
+        },
+        "4": {
+          "max_allocated_mb": 115371.87548828125,
+          "max_reserved_mb": 123524.0
+        },
+        "5": {
+          "max_allocated_mb": 115371.87548828125,
+          "max_reserved_mb": 123524.0
+        },
+        "6": {
+          "max_allocated_mb": 115371.86767578125,
+          "max_reserved_mb": 120682.0
+        },
+        "7": {
+          "max_allocated_mb": 115371.86767578125,
+          "max_reserved_mb": 120682.0
+        }
+      },
+      "perf_ms": 10670.4,
+      "perf_alloc_gib": 111.8,
+      "perf_peak_reserved_gib": 118.94,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 111.8025
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "rel_err_pct": -5.7,
+      "alloc_err_pct": -0.77
+    },
+    {
+      "case": "llama3_70b_l12_tp1_cp8_pp1_dp1_seq131072_mbc4_cef",
+      "model": "llama3-70b",
+      "parallel": "tp1cp8pp1",
+      "layer_num": 12,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "cp_size": 8,
+      "status": "ok",
+      "real_ms": 11301.9,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 147.99,
+      "real_reserved_gib": 159.65,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 151538.41845703125,
+          "max_reserved_mb": 162584.0
+        },
+        "1": {
+          "max_allocated_mb": 151538.41845703125,
+          "max_reserved_mb": 162432.0
+        },
+        "2": {
+          "max_allocated_mb": 151538.4560546875,
+          "max_reserved_mb": 162624.0
+        },
+        "3": {
+          "max_allocated_mb": 151538.44970703125,
+          "max_reserved_mb": 162880.0
+        },
+        "4": {
+          "max_allocated_mb": 151539.39892578125,
+          "max_reserved_mb": 162624.0
+        },
+        "5": {
+          "max_allocated_mb": 151538.95556640625,
+          "max_reserved_mb": 162624.0
+        },
+        "6": {
+          "max_allocated_mb": 151538.41845703125,
+          "max_reserved_mb": 163328.0
+        },
+        "7": {
+          "max_allocated_mb": 151538.41845703125,
+          "max_reserved_mb": 163480.0
+        }
+      },
+      "perf_ms": 10515.7,
+      "perf_alloc_gib": 147.89,
+      "perf_peak_reserved_gib": 157.33,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 147.8862
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "rel_err_pct": -6.96,
+      "alloc_err_pct": -0.07
+    },
+    {
+      "case": "llama3_405b_l4_tp2_cp4_pp1_dp1_seq131072_mbc4_cef",
+      "model": "llama3-405b",
+      "parallel": "tp2cp4pp1",
+      "layer_num": 4,
+      "mbc": 4,
+      "pp_comm_async": false,
+      "vp_size": 1,
+      "system_rel": "configs/system/b200_bf16_ceperm.json",
+      "kind": "non-vpp",
+      "cp_size": 4,
+      "status": "ok",
+      "real_ms": 10577.6,
+      "timing_rank": 7,
+      "steady_iterations": [
+        2,
+        3
+      ],
+      "real_alloc_gib": 118.13,
+      "real_reserved_gib": 127.5,
+      "peak_memory_by_rank_mb": {
+        "0": {
+          "max_allocated_mb": 120962.37158203125,
+          "max_reserved_mb": 129804.0
+        },
+        "1": {
+          "max_allocated_mb": 120962.37158203125,
+          "max_reserved_mb": 129804.0
+        },
+        "2": {
+          "max_allocated_mb": 120962.51123046875,
+          "max_reserved_mb": 130562.0
+        },
+        "3": {
+          "max_allocated_mb": 120962.51123046875,
+          "max_reserved_mb": 130562.0
+        },
+        "4": {
+          "max_allocated_mb": 120962.38720703125,
+          "max_reserved_mb": 128386.0
+        },
+        "5": {
+          "max_allocated_mb": 120962.38720703125,
+          "max_reserved_mb": 128386.0
+        },
+        "6": {
+          "max_allocated_mb": 120962.37158203125,
+          "max_reserved_mb": 129932.0
+        },
+        "7": {
+          "max_allocated_mb": 120962.37158203125,
+          "max_reserved_mb": 129932.0
+        }
+      },
+      "perf_ms": 10043.5,
+      "perf_alloc_gib": 116.5,
+      "perf_peak_reserved_gib": 123.94,
+      "peak_alloc_by_stage_gib": {
+        "first_stage": 116.5012
+      },
+      "miss_count": 0,
+      "miss_ops": [],
+      "rel_err_pct": -5.05,
+      "alloc_err_pct": -1.38
+    }
+  ]
+}

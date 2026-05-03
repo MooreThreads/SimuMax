@@ -1,17 +1,36 @@
 import os
 import json
-from simu_tools.efficency_test.utils import get_system_name
+try:
+    from simu_tools.efficency_test.utils import get_efficiency_save_root, get_system_runtime_info
+except ModuleNotFoundError:
+    from utils import get_efficiency_save_root, get_system_runtime_info
 
-system, device, MAX_TFLOPS = get_system_name()
-gemm_save_root =  f'{system}_gemm_efficency/gemm_efficency.json'
-groupgemm_save_root =  f'{system}_grouped_gemm_efficency/grouped_gemm_efficency.json'
-fa_save_root =  f'{system}_fa_efficency/fa_efficency_test.json'
+runtime_info = get_system_runtime_info()
+system = runtime_info["system"]
+device = runtime_info["device"]
+MAX_TFLOPS = runtime_info["max_tflops"]
+NUM_PER_NODE = runtime_info["num_per_node"]
+MEM_GBS = runtime_info["mem_gbs"]
+gemm_save_root = os.path.join(get_efficiency_save_root(system, 'gemm_efficiency'), 'gemm_efficiency.json')
+groupgemm_save_root = os.path.join(get_efficiency_save_root(system, 'grouped_gemm_efficiency'), 'grouped_gemm_efficiency.json')
+fa_save_root = os.path.join(get_efficiency_save_root(system, 'fa_efficiency'), 'fa_efficiency_test.json')
 
-gemm_ops = json.load(open(gemm_save_root, 'r'))
-groupgemm_ops = json.load(open(groupgemm_save_root, 'r'))
-fa_ops = json.load(open(fa_save_root, 'r'))
+if os.path.exists(gemm_save_root):
+    gemm_ops = json.load(open(gemm_save_root, 'r'))
+else:
+    gemm_ops = {}
+    
+if os.path.exists(groupgemm_save_root):
+    groupgemm_ops = json.load(open(groupgemm_save_root, 'r'))
+else:
+    groupgemm_ops = {}
+    
+if os.path.exists(fa_save_root):
+    fa_ops = json.load(open(fa_save_root, 'r'))
+else:
+    fa_ops = {}
 
-sys_name = os.environ.get('SYS_NAME', 'A100_pcie')
+sys_name = os.environ.get('SYS_NAME', 's5000_bf16_mtlink_default')
 intra_with_pcie = int(os.environ.get('PICE_INTRA_LINK', '0'))
 FC8 = bool(int(os.environ.get('FC8_MODE', '0')))
 
@@ -51,29 +70,35 @@ networks = {
             "processor_usage": 0.0,
             "bandwidth": {
                 "efficient_factor": 0.5,
-                "gbps": 50,
+                "gbps": 392,
                 "latency_us": 35,
+                "fixed_latency": 200
             },
             "op": {
                 "all_reduce": {
                     "scale": 2,
                     "offset": -1,
+                    "efficient_factor": 0.53
                 },
                 "all_gather": {
                     "scale": 1,
                     "offset": -1,
+                    "efficient_factor": 0.5022
                 },
                 "reduce_scatter": {
                     "scale": 1,
                     "offset": -1,
+                    "efficient_factor": 0.525
                 },
                 "p2p": {
                     "scale": 1,
                     "offset": 0,
+                    "efficient_factor": 0.5
                 },
                 "all2all": {
                     "scale": 1,
                     "offset": -1,
+                    "efficient_factor": 0.3979591836734694
                 }
             }
         },
@@ -87,15 +112,21 @@ networks = {
             "op": {
                 "all_reduce": {
                     "scale": 2,
-                    "offset": -1
+                    "offset": -1,
+                    "efficient_factor": 0.8810,
+                    "latency_us": 22.46
                 },
                 "all_gather": {
                     "scale": 1,
-                    "offset": -1
+                    "offset": -1,
+                    "efficient_factor": 0.8997,
+                    "latency_us": 39.85
                 },
                 "reduce_scatter": {
                     "scale": 1,
-                    "offset": -1
+                    "offset": -1,
+                    "efficient_factor": 0.8824,
+                    "latency_us": 26.68
                 },
                 "p2p": {
                     "scale": 1,
@@ -104,6 +135,7 @@ networks = {
                 "all2all": {
                     "scale": 1,
                     "offset": -1,
+                    "efficient_factor": 0.125
                 }
             }
         }
@@ -268,10 +300,10 @@ pcie_networks = {
 
 system_template = {
     "sys_name": sys_name,
-    "num_per_node": 8,
+    "num_per_node": NUM_PER_NODE,
     "accelerator": {
-        "backend": "cuda",
-        "mem_gbs": 80,
+        "backend": device,
+        "mem_gbs": MEM_GBS,
         "op" : {
 
         },

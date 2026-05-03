@@ -1,0 +1,21 @@
+{
+    "model_type":"moe",
+    "model_name":"moe-8T",
+    "attention_type": "mha",
+    "layer_num": 128,
+    "hidden_size": 24576,
+    "head_num": 128,
+    "kv_head_num": 128,
+    "topk":2,
+
+    "head_size": 192,
+    "expert_num": 16,
+    
+    "intermediate_size": 98304,
+
+    "moe_ffn_hidden_size": 49152,
+    "moe_shared_expert_intermediate_size": 49152,
+
+    "vocab_size": 163840,
+    "use_swiglu": true
+}

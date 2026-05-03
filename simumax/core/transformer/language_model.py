@@ -7,6 +7,7 @@ from simumax.core.base_struct import MetaModule, InputOutputInfo, PathDebugConte
 from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig, AttentionRecomputeConfig, MLPRecomputeConfig, SIMU_DEBUG, ENABLE_SIMU_GRAPH
 from simumax.core.transformer.dense_module import Embedding, Attention, MLAAttention, LayerNorm, LinearCol, MLP, ParallelCE
 from simumax.core.transformer.moe_module import ExpertMLP
+from simumax.core.utils import format_scope_microbatch_tag
 
 @dataclass
 class PeakPoint:
@@ -118,6 +119,7 @@ class LLMBlock(MetaModule):
             if self.strategy.recompute_granularity == "full_block"
             else "submodule"
         )
+        self.enable_block_recompute_schedule = self.enable_recompute
         # enable_norm_recompute = self.enable_recompute and any(
         #     x in self.strategy.recompute_granularity for x in ["full_block"]
         # )
@@ -195,6 +197,10 @@ class LLMBlock(MetaModule):
         return out
     
     def prefill(self, args, call_stk='', com_buff=None):
+        if not self.status_ready:
+            self.set_first_last_recompute_status()
+            self.set_leaf_full_name(self.full_name)
+            self.status_ready = True
         self.call_stk = f"{call_stk}{self.call_stk}{self.layer_idx}"
         for layer in self.children_ordered_module:
             self.layers.append(layer)
@@ -272,6 +278,7 @@ class LLMModel(MetaModule):
                     enable_fp8 = False,
                 )
             self.parallel_ce = ParallelCE(strategy=self.strategy, system=self.system, specific_name='_VocabParallelCrossEntropy')
+            # TODO(sherry): add loss reduce cost
         
     def __post_init__(self):
         super().__post_init__()
@@ -402,7 +409,6 @@ class LLMModel(MetaModule):
         i = len(leaf_modules)-1
         prepare_recompute_ready = False
         while i >=0:
-            is_last_module = (i == len(leaf_modules) -1)
             m = leaf_modules[i]
             assert m.is_leaf_module, f"{m.current_full_module_path} is not a leaf module"
             if (enable_recompute and m.enable_recompute and # global recompute enabled and module recompute enabled 
@@ -421,10 +427,8 @@ class LLMModel(MetaModule):
                 wait_recompute_nodes = []
                 prepare_recompute_ready = False
             else:
-                act_info = m.get_act_info()                
-                cur_peak_mem = global_cache_mem + (m.all_input_element_num() if is_last_module else act_info.bwd_peak_mem_no_cache)
-                # cur_peak_mem = global_cache_mem + m.all_input_element_num() if is_last_module else act_info.bwd_peak_mem_no_cache
-                
+                act_info = m.get_act_info()
+                cur_peak_mem = global_cache_mem + act_info.bwd_peak_mem_no_cache
                 peak_point.update_peak(f"{m.full_name}: {m.current_full_module_path}", cur_peak_mem, "backward")
                 
                 global_cache_mem -= act_info.cache_for_bwd_mem    
@@ -592,8 +596,12 @@ class LLMModel(MetaModule):
             
 
     def prefill(self, args, call_stk='', com_buff=None):
+        if not self.status_ready:
+            self.set_first_last_recompute_status()
+            self.set_leaf_full_name(self.full_name)
+            self.status_ready = True
         # self.call_stk = f"{call_stk}{self.call_stk}"
-        self.call_stk = f"rank{args.rank}-microbatch{args.microbatch}{call_stk}{self.call_stk}"
+        self.call_stk = f"rank{args.rank}-{format_scope_microbatch_tag(args)}{call_stk}{self.call_stk}"
         for layer in self.children_ordered_module:
             self.layers.append(layer)
             layer.prefill(args, self.call_stk, com_buff=com_buff)

@@ -3,6 +3,33 @@
 import json
 import os, subprocess
 
+
+def get_chunk_idx(args):
+    """Return per-model chunk index when present."""
+    return getattr(args, "chunk_idx", None)
+
+
+def format_scope_microbatch_tag(args, include_chunk=False):
+    """Format a trace/scope-friendly microbatch tag.
+
+    In VPP we expose the Megatron-like data microbatch id as ``microbatch``
+    and keep uniqueness by appending ``chunk`` when requested.
+    """
+    tag = f"microbatch{args.microbatch}"
+    chunk_idx = get_chunk_idx(args)
+    if include_chunk and chunk_idx is not None:
+        tag += f"-chunk{chunk_idx}"
+    return tag
+
+
+def format_model_info_microbatch_tag(args):
+    """Format a model-info/debug tag with optional chunk identity."""
+    tag = f"microbatch:{args.microbatch}"
+    chunk_idx = get_chunk_idx(args)
+    if chunk_idx is not None:
+        tag += f"-chunk:{chunk_idx}"
+    return tag
+
 def wrap_name(src):
     return f"_orig_{src}"
 
@@ -163,26 +190,57 @@ def path_convert_to_str(path: list) -> str:
         path_name = " -> ".join(path)
     return path_name
 
+def get_pp_stage_representative_rank(pp_rank, strategy):
+    """Pick the representative dense rank for one PP stage.
+
+    The representative rank keeps `tp=0`, `cp=0`, and `dp=0`, and varies only
+    along the pipeline dimension.
+    """
+
+    return pp_rank * strategy.tp_size * strategy.cp_size * strategy.dp_size
+
+
+def get_pp_p2p_comm_size(strategy, hidden_size, dtype_size):
+    hidden_states_size = (
+        strategy.micro_batch_size
+        * strategy.seq_len
+        * hidden_size
+    )
+    pp_comm_size = hidden_states_size * dtype_size / strategy.cp_size
+    if strategy.enable_sequence_parallel:
+        pp_comm_size = pp_comm_size / strategy.tp_size
+    return pp_comm_size
+
+
 def get_rank_group(global_rank, strategy):
-    ## world_size = tp*pp*dp
+    ## dense order: tp-cp-dp-pp
+    ## moe order remains ep-etp-edp-pp
 
     tp_rank = global_rank % strategy.tp_size
-    pp_rank = (global_rank // strategy.tp_size) % strategy.pp_size
-    dp_rank = (global_rank // (strategy.tp_size * strategy.pp_size))
-    ep_rank = dp_rank % strategy.ep_size
-    edp_rank = dp_rank // strategy.ep_size
-    tp_group_id = f"pp:{pp_rank}-dp:{dp_rank}"
-    pp_group_id = f"tp:{tp_rank}-dp:{dp_rank}"
+    cp_rank = (global_rank // strategy.tp_size) % strategy.cp_size
+    dp_rank = (global_rank // (strategy.tp_size * strategy.cp_size)) % strategy.dp_size
+    dp_cp_rank = (global_rank // strategy.tp_size) % (strategy.cp_size * strategy.dp_size)
+    pp_rank = (global_rank // (strategy.tp_size * strategy.cp_size * strategy.dp_size))
+    ep_rank = global_rank % strategy.ep_size
+    edp_rank = global_rank // strategy.ep_size % strategy.edp_size
+    tp_group_id = f"pp:{pp_rank}-cp:{cp_rank}-dp:{dp_rank}"
+    pp_group_id = f"tp:{tp_rank}-cp:{cp_rank}-dp:{dp_rank}"
     dp_group_id = f"tp:{tp_rank}-pp:{pp_rank}"
+    dp_cp_group_id = f"tp:{tp_rank}-pp:{pp_rank}"
+    cp_group_id = f"tp:{tp_rank}-pp:{pp_rank}-dp:{dp_rank}"
     ep_group_id = f"tp:{tp_rank}-pp:{pp_rank}-edp:{edp_rank}"
     edp_group_id = f"tp:{tp_rank}-pp:{pp_rank}-ep:{ep_rank}"
     dic = {
         "tp_group_id": tp_group_id,
         "tp_rank": tp_rank,
+        "cp_group_id": cp_group_id,
+        "cp_rank": cp_rank,
         "pp_group_id": pp_group_id,
         "pp_rank": pp_rank,
         "dp_group_id": dp_group_id,
         "dp_rank": dp_rank,
+        "dp_cp_group_id": dp_cp_group_id,
+        "dp_cp_rank": dp_cp_rank,
         "ep_group_id": ep_group_id,
         "ep_rank": ep_rank,
         "edp_group_id": edp_group_id,

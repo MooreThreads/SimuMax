@@ -7,13 +7,14 @@ from functools import partial
 from contextlib import nullcontext
 import inspect
 
-from typing import Union
+from typing import Optional, Union
 
 from megatron.training import get_args
 from megatron.training import print_rank_0
 from megatron.training import get_timers
 from megatron.training import get_tokenizer
 from megatron.core import mpu
+from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.utils import get_blend_from_list
@@ -38,7 +39,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 
 stimer = StragglerDetector()
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+def model_provider(
+    pre_process: bool = True,
+    post_process: bool = True,
+    vp_stage: Optional[int] = None,
+) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -116,7 +121,8 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
                 position_embedding_type=args.position_embedding_type,
                 rotary_percent=args.rotary_percent,
-                rotary_base=args.rotary_base
+                rotary_base=args.rotary_base,
+                vp_stage=vp_stage,
             )
 
     return model
@@ -126,7 +132,9 @@ def get_batch(data_iterator):
     """Generate a batch."""
 
     # TODO: this is pretty hacky, find a better way
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
+    if (not parallel_state.is_pipeline_first_stage(ignore_virtual=True)) and (
+        not parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+    ):
         return None, None, None, None, None
 
     # get batches based on the TP rank you are on
@@ -153,10 +161,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """
     args = get_args()
 
-    losses = output_tensor.float()
+    losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
-    total_tokens = loss_mask.sum()
-    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+    loss = torch.sum(losses * loss_mask)
 
     if args.context_parallel_size > 1:
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
@@ -164,20 +171,17 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     # Check individual rank losses are not NaN prior to DP all-reduce.
     if args.check_for_nan_in_loss_and_grad:
         global_rank = torch.distributed.get_rank()
-        assert not loss[0].isnan(), (
+        assert not loss.isnan(), (
             f'Rank {global_rank}: found NaN in local forward loss calculation. '
             f'Device: {torch.cuda.current_device()}, node: {os.uname()[1]}'
         )
 
-    # Reduce loss for logging.
-    reporting_loss = loss.clone().detach()
-    if not int(os.getenv("NO_LOSS_REDUCE", 0)): #TODO:(huang.huang) will influence the loss reported Now!
-        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
+    local_num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    reporting_loss = torch.cat([loss.clone().detach().view(1), local_num_tokens.view(1)])
     return (
-        loss[0] * args.context_parallel_size,
+        loss * args.context_parallel_size,
         local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
+        {'lm loss': reporting_loss},
     )
 
 

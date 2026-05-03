@@ -6,6 +6,8 @@ PATCH_HOME=${PATCH_HOME:-"./"}
 MEGATRON_HOME=${MEGATRON_HOME:-"./"}
 EXAMPLE=${EXAMPLE:-"test"}
 HOSTFILE=${HOSTFILE:-"./hostfile"}
+CP_SIZE=${CP_SIZE:-1}
+CP_COMM_TYPE=${CP_COMM_TYPE:-a2a}
 TP_SIZE=${TP_SIZE:-1}
 PP_SIZE=${PP_SIZE:-1}
 MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
@@ -16,6 +18,10 @@ TEST_TYPE=${TEST_TYPE:-"test"}
 NUM_LAYERS=${NUM_LAYERS:-1}
 DTYPE=${DTYPE:-"bf16"}
 OUTPUT_DIR=${OUTPUT_DIR:-"./output_${MODEL_TYPE}"}
+VP_SIZE=${VP_SIZE:-1}
+EXTRA_ARGS=${EXTRA_ARGS:-""}
+SEQ_LEN=${SEQ_LEN:-4096}
+MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-$SEQ_LEN}
 set +u
 
 if [ "${TEST_TYPE}" == "profile" ]; then
@@ -23,8 +29,8 @@ if [ "${TEST_TYPE}" == "profile" ]; then
     rm -rf ${PROFILER_SAVE_PATH}
     echo "Profiler save path: ${PROFILER_SAVE_PATH}"
 
-    TRAIN_ITERS=6
-    WARMUP_ITERS=1
+    TRAIN_ITERS=${TRAIN_ITERS:-6}
+    WARMUP_ITERS=${WARMUP_ITERS:-1}
     PROFILE_ARGS=(
         --profile
         --profile-step-start 4
@@ -34,14 +40,31 @@ if [ "${TEST_TYPE}" == "profile" ]; then
     )
 else
     PROFILE_ARGS=()
-    TRAIN_ITERS=10
-    WARMUP_ITERS=5
+    TRAIN_ITERS=${TRAIN_ITERS:-10}
+    WARMUP_ITERS=${WARMUP_ITERS:-5}
     echo "Train iters: ${TRAIN_ITERS}, Warmup iters: ${WARMUP_ITERS}"
 fi
 export OMP_NUM_THREADS=4
 export CUDA_VISIBLE_DEVICES='0,1,2,3,4,5,6,7'
 export ACCELERATOR_BACKEND="cuda"
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+if [ -x "/usr/local/cuda-13.1/bin/ptxas" ]; then
+    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.1}
+    export TRITON_PTXAS_PATH=${TRITON_PTXAS_PATH:-/usr/local/cuda-13.1/bin/ptxas}
+    export PATH="/usr/local/cuda-13.1/bin:${PATH}"
+elif [ -x "/usr/local/cuda/bin/ptxas" ]; then
+    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+    export TRITON_PTXAS_PATH=${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}
+    export PATH="/usr/local/cuda/bin:${PATH}"
+fi
+
+# Triton's gcc launcher build does not automatically include CUDA headers.
+# Keep cuda.h discoverable for TE Triton CE and other launcher-side kernels.
+if [ -n "${CUDA_HOME:-}" ] && [ -d "${CUDA_HOME}/include" ]; then
+    export CPATH="${CUDA_HOME}/include${CPATH:+:${CPATH}}"
+    export C_INCLUDE_PATH="${CUDA_HOME}/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}"
+    export CPLUS_INCLUDE_PATH="${CUDA_HOME}/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+fi
 
 export PYTHONPATH=${MEGATRON_HOME}:${PATCH_HOME}:$PYTHONPATH
 # export NO_LOSS_REDUCE=1
@@ -60,11 +83,20 @@ mkdir -p $TB_PATH
 
 
 
-export NODE_ADDR=$(ip a|grep inet|grep -v 127.0.0.1|grep -v inet6|awk '{print $2;}'|tr -d "addr:"|head -n1 | cut -d '/' -f1)
+if command -v ip >/dev/null 2>&1; then
+    export NODE_ADDR=$(ip a|grep inet|grep -v 127.0.0.1|grep -v inet6|awk '{print $2;}'|tr -d "addr:"|head -n1 | cut -d '/' -f1)
+else
+    export NODE_ADDR=$(hostname -I | awk '{print $1}')
+fi
 export GPUS_PER_NODE=8
 export NUM_NODES=$(cat $HOSTFILE | wc -l)
 export MASTER_ADDR=$(head -n1 $HOSTFILE | awk '{print $1;}')
-export NODE_RANK=$(awk '{ranks[$1]=(FNR-1);}END{print ranks["'$NODE_ADDR'"];}' $HOSTFILE)
+if [ "$NUM_NODES" -eq 1 ] && { [ "$MASTER_ADDR" = "127.0.0.1" ] || [ "$MASTER_ADDR" = "localhost" ]; }; then
+    export NODE_ADDR=${MASTER_ADDR}
+    export NODE_RANK=0
+else
+    export NODE_RANK=$(awk '{ranks[$1]=(FNR-1);}END{print ranks["'$NODE_ADDR'"];}' $HOSTFILE)
+fi
 export MASTER_PORT=14388
 
 
@@ -125,8 +157,8 @@ MODEL_ARGS=(
     --num-attention-heads ${head_num} 
     --group-query-attention 
     --num-query-groups ${num_query_groups}
-    --seq-length 4096 
-    --max-position-embeddings 4096 
+    --seq-length ${SEQ_LEN}
+    --max-position-embeddings ${MAX_POSITION_EMBEDDINGS}
     --norm-epsilon 1e-5 
     --attention-dropout 0.0 
     --hidden-dropout 0.0 
@@ -205,6 +237,19 @@ MODEL_PARALLEL_ARGS=(
     # --decoder-last-pipeline-num-layers 14
 )
 
+if [ "$CP_SIZE" -gt 1 ]; then
+    MODEL_PARALLEL_ARGS+=(
+        --context-parallel-size $CP_SIZE
+        --cp-comm-type $CP_COMM_TYPE
+    )
+fi
+
+if [ "$VP_SIZE" -gt 1 ]; then
+    MODEL_PARALLEL_ARGS+=(
+        --num-layers-per-virtual-pipeline-stage $(( NUM_LAYERS / PP_SIZE / VP_SIZE ))
+    )
+fi
+
 MIXED_PRECISION_ARGS=(
     --bf16 
     --attention-softmax-in-fp32 
@@ -215,6 +260,7 @@ MIXED_PRECISION_ARGS=(
 DATA_ARGS=(
     --tokenizer-type NullTokenizer 
     --split 1
+    --no-create-attention-mask-in-dataloader
 )
 
 
@@ -253,7 +299,8 @@ cmd="torchrun ${DISTRIBUTED_ARGS[@]} ./pretrain_gpt.py \
         ${DATA_ARGS[@]} \
         ${EVAL_AND_LOGGING_ARGS[@]} \
         ${TRANSFORMER_ENGINE_ARGS[@]} \
-        ${PROFILE_ARGS[@]}
+        ${PROFILE_ARGS[@]} \
+        ${EXTRA_ARGS}
     "
 echo $cmd
 eval $cmd

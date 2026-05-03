@@ -3,8 +3,10 @@ from typing import Dict, List, Any, Optional, Set
 import ast
 import json
 import math
-import graphviz
-from graphviz import Digraph
+try:
+    from graphviz import Digraph
+except ImportError:  # graph visualization is optional for perf/config paths.
+    Digraph = None
 from simumax.core.tensor import FakeTensor
 from simumax.core.config import set_capture_graph_only
 
@@ -268,6 +270,11 @@ def export_onnx_style_graph(model, input_tensor: FakeTensor,
     return graph_builder.graph
 
 def visualize_with_graphviz(json_path, output_path="computational_graph"):
+    if Digraph is None:
+        raise ImportError(
+            "visualize_with_graphviz requires the optional 'graphviz' Python package"
+        )
+
     def get_mem(size):
         if size < 1024:
             return f"{size} B"
@@ -343,4 +350,3 @@ def visualize_with_graphviz(json_path, output_path="computational_graph"):
     print(f"Graphviz图已保存到: {output_path}.png")
     
     return dot
-

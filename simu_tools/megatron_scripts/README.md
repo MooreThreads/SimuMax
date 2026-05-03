@@ -5,7 +5,11 @@
 
 
 # Introduction
-SimuMax provides a set of benchmark performance testing scripts based on Megatron-LM and Transformer-Engine, which can be used to conduct single-node performance tests for llama and deepseek models on NVIDIA devices. These tests are used to calibrate performance results with SimuMax simulations.
+This directory is the shared benchmark entrypoint for SimuMax. It provides Megatron-LM based benchmark scripts for reference NVIDIA workflows and calibration examples.
+
+If you need the retained B200 real-benchmark reproduction baseline, use:
+
+- [docs/b200/b200_real_repro_guide.md](../../docs/b200/b200_real_repro_guide.md)
 
 # Benchmark Performance Testing
 ## llama3
