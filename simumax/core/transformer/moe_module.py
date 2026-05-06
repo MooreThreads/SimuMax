@@ -1,5 +1,6 @@
 """basic moe transformer module"""
 import math
+from copy import deepcopy
 from simumax.core.base_struct import (
     MetaModule,
     TensorSize,
@@ -11,14 +12,14 @@ from simumax.core.base_struct import (all_gather, reduce_scatter, all_reduce, al
                            COM_BUFF)
 from simumax.core.config import StrategyConfig, SystemConfig, ModelConfig, MLPRecomputeConfig
 import simumax.core.transformer.simu_ops as simu_ops
-from simumax.core.transformer.dense_module import Swiglu, Gelu, MLP, Float8Quantizer, LinearCol, LinearRow
-from simumax.core.utils import get_rank_group
+from simumax.core.transformer.dense_module import Swiglu, Gelu, MLP, Float8Quantizer, LinearCol, LinearRow, LinearBase
+from simumax.core.utils import format_model_info_microbatch_tag, get_rank_group
 from simumax.core.transformer.function import AddFunction
 Input = InputOutputInfo
 #region ------------------ Atomic module ------------------
-class Router(MetaModule):
+class Router(LinearBase):
     """
-    Megatron alltoall-sep impl (fwd)
+    Megatron alltoall impl (fwd)
     1.apply jitter
     2.linear gating
     3.rounting:
@@ -38,50 +39,49 @@ class Router(MetaModule):
         moe_dispatcher_policy: str,
         has_cached_inputs: bool,
         enable_recompute: bool,
+        is_last_recompute: bool,
+        use_variance_tail_model: bool,
         strategy: StrategyConfig,
         system: SystemConfig,
     ) -> None:
-        super().__init__(strategy, system)
+        super().__init__(hidden_size, expert_num, strategy, system)
         self.layer_idx = layer_idx
         self.expert_num = expert_num
         self.local_expert_num = expert_num // self.strategy.ep_size
         self.topk = topk
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
+        self.is_last_recompute = is_last_recompute
+        self.use_variance_tail_model = self.use_variance_tail_model or use_variance_tail_model
+        if self.is_last_recompute and self.enable_recompute:
+            self.set_variance_node(True)
         self.hidden_size = hidden_size
         self.moe_dispatcher_policy = moe_dispatcher_policy
         # TODO: consider z-loss、aux-loss etc.
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
-        model_info = f"microbatch:{args.microbatch}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
+        model_info = f"{format_model_info_microbatch_tag(args)}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
         
         self.layers.append(AtomModel(fwd_cost=self._cost_info.fwd_compute_time,
                                  bwd_cost=self._cost_info.bwd_grad_act_time+self._cost_info.bwd_grad_w_time,))
-        # routing get full logits
-        if self.moe_dispatcher_policy == "all2all-seq" and self.strategy.tp_size > 1:
-            comm_size = (
-                self.local_logits_size
-                * self.strategy.tp_size
-                * self.dtype_to_element_size[self.strategy.dtype]
-            )
-            cost = self.system.compute_net_op_time(
-                "all_gather",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-            )   
-            self.layers.append(all_gather(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
-                                         rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))#'comm all_gather input/ bwd:rs'
-            state.comm_order += 1
-
-
         for layer in self.layers:
             layer.prefill(args, self.call_stk, com_buff)
-
+    
+    @property
+    def micro_input_tensor(self):
+        assert self.input_info is not None, "Please set input info"
+        # [B, S, H]
+        batch_size = self.input_info.tensors[0].size(0)
+        seq_len = self.input_info.tensors[0].size(1)
+        if self.strategy.enable_sequence_parallel:
+            # collect the full sequence data by all-gather, the seq_size is seq_len * tp_size 
+            seq_len *= self.strategy.tp_size
+        hidden_size = self.input_info.tensors[0].size(2)
+        return TensorSize(shape = [batch_size, seq_len, hidden_size], dtype=self.input_info.tensors[0].dtype)
+    
     @property
     def local_logits_size(self):
         assert self.input_info is not None, "Please set input info"
@@ -108,32 +108,7 @@ class Router(MetaModule):
         assert self.hidden_size == self.input_info.tensors[0].size(2)
 
     def _comp_leaf_intra_net_info(self):
-        """
-        all_gather on seq dim to get full logits(fwd:ag bwd:rs)
-        """
-        # routing get full logits
-        if self.moe_dispatcher_policy == "all2all-seq" and self.strategy.tp_size > 1:
-            comm_size = (
-                self.local_logits_size
-                * self.strategy.tp_size
-                * self.dtype_to_element_size[self.strategy.dtype]
-            )
-            # fwd
-            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all_gather",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-                comm_stage="Router_FWD_TP"
-            )
-            # bwd
-            self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
-                "reduce_scatter",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-                comm_stage="Router_BWD_TP"
-            )
+        """Router does not model extra TP full-logit gather in the all2all path."""
 
     def _comp_leaf_act_info_impl(self):
         """
@@ -155,11 +130,9 @@ class Router(MetaModule):
         self._act_info.fwd_peak_mem_no_cache = (
             input_size + output_size + gating_weight_size
         )
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = (
             input_size + output_size + gating_weight_size
         )
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
         """
@@ -168,20 +141,17 @@ class Router(MetaModule):
         weight_numel = self.hidden_size * self.expert_num
         self._model_info.weight_numel = weight_numel
         self._model_info.dense_weight_bytes = weight_numel * self.element_size
-        self._model_info.dense_grad_bytes = (
-            self._model_info.dense_weight_bytes
-            if not self.strategy.use_fp32_accum_grad
-            else self.dtype_to_element_size["fp32"] * weight_numel
-        )
+        self._model_info.dense_grad_bytes = weight_numel * self.main_grad_element_size
         self._model_info.dense_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
+        optimizer_group_size = self.strategy.dp_size * self.strategy.cp_size
         if self.strategy.zero_state >= 1:
-            self._model_info.dense_state_bytes /= self.strategy.edp_size
+            self._model_info.dense_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
-            self._model_info.dense_grad_bytes /= self.strategy.edp_size
+            self._model_info.dense_grad_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 3:
-            self._model_info.dense_weight_bytes /= self.strategy.edp_size
+            self._model_info.dense_weight_bytes /= optimizer_group_size
 
     def _comp_leaf_flops_info(self):
         # Count Gating
@@ -244,12 +214,11 @@ class Router(MetaModule):
 class Permutation(MetaModule):
     """
     Permutation Impl
-    1.all2all on tp group(fwd: alltoall, bwd: all2all) for old policy(all2all-seq)
-    2.permute1([S, M] -> [E, C, M] or unbalance [(E1T1, E1T2, ..., E2T1, ...)])
-    3.all2all on ep group
-    4.permutate2: when local_expert_num > 1,
+    1.permute1([S, M] -> [E, C, M] or unbalance [(E1T1, E1T2, ..., E2T1, ...)])
+    2.all2all on ep group
+    3.permutate2: when local_expert_num > 1,
       arranged according to the batch that the expert needs to process
-    5.all_gather feat-dim on tp group or token-dim etp group (fwd: all gather, bwd: reduce_scatter)
+    4.all_gather feat-dim on tp group or token-dim etp group (fwd: all gather, bwd: reduce_scatter)
     """
 
     def __init__(
@@ -279,37 +248,27 @@ class Permutation(MetaModule):
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
-        model_info = f"microbatch:{args.microbatch}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
+        model_info = f"{format_model_info_microbatch_tag(args)}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
         
 
     
-        if self.moe_dispatcher_policy == "all2all-seq" and self.strategy.tp_size > 1:
-            comm_size = (
-                self.input_act_size * self.dtype_to_element_size[self.strategy.dtype]
-            )
-            cost = self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-            )   
-            self.layers.append(all2all(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
-                                         rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))
-            state.comm_order += 1
-        
         #permutate1 for ep all2all
         permutate1_mem_accessed = (
             self.input_act_size + self.permuted_act_size
         ) * self.dtype_to_element_size[self.strategy.dtype]
-        mem_time = self.system.compute_mem_access_time(
+        fwd_mem_time = self.system.compute_mem_access_time(
+            "permute_fwd",
             permutate1_mem_accessed
         )
-        fwd_compute_time = self.system.compute_end2end_time(0, mem_time)
+        bwd_mem_time = self.system.compute_mem_access_time(
+            "permute_bwd",
+            permutate1_mem_accessed
+        )
+        fwd_compute_time = self.system.compute_end2end_time(0, fwd_mem_time)
         bwd_grad_w_accessed_mem = 0
-        bwd_grad_act_accessed_mem = mem_time
+        bwd_grad_act_accessed_mem = bwd_mem_time
         bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
         self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
@@ -330,7 +289,7 @@ class Permutation(MetaModule):
             )   
             self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}", 
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))      
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank,))      
             state.comm_order += 1
         if self.strategy.etp_size > 1:
             comm_size = (
@@ -346,19 +305,24 @@ class Permutation(MetaModule):
             ) 
             self.layers.append(all_gather(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank,))
             state.comm_order += 1
 
         #permutate2 after ep all2all and tp
         permutate2_mem_accessed = (
             self.permuted_act_size + self.permuted_act_size
         ) * self.dtype_to_element_size[self.strategy.dtype]
-        mem_time = self.system.compute_mem_access_time(
+        fwd_mem_time = self.system.compute_mem_access_time(
+            "permute_fwd",
             permutate2_mem_accessed
         )
-        fwd_compute_time = self.system.compute_end2end_time(0, mem_time)
+        bwd_mem_time = self.system.compute_mem_access_time(
+            "permute_bwd",
+            permutate2_mem_accessed
+        )
+        fwd_compute_time = self.system.compute_end2end_time(0, fwd_mem_time)
         bwd_grad_w_accessed_mem = 0
-        bwd_grad_act_accessed_mem = mem_time
+        bwd_grad_act_accessed_mem = bwd_mem_time
         bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
         self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
@@ -417,26 +381,6 @@ class Permutation(MetaModule):
         return output_info
 
     def _comp_leaf_intra_net_info(self):
-        if self.moe_dispatcher_policy == "all2all-seq" and self.strategy.tp_size > 1:
-            comm_size = (
-                self.input_act_size * self.dtype_to_element_size[self.strategy.dtype]
-            )
-            # fwd
-            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-                comm_stage="Dispatch_FWD_EP"
-            )
-            # bwd
-            self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-                comm_stage="Dispatch_BWD_EP"
-            )
         if self.strategy.ep_size > 1:
             comm_size = (
                 self.permuted_act_size * self.dtype_to_element_size[self.strategy.dtype]
@@ -467,14 +411,14 @@ class Permutation(MetaModule):
                     prob_comm_size,
                     comm_num=self.strategy.ep_size,
                     net=self.strategy.ep_net,
-                    comm_stage="Permutation_FWD_EP_PROB"
+                    comm_stage="Dispatch_PROB_FWD_EP"
                 )
                 self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
                     "all2all",
                     prob_comm_size,
                     comm_num=self.strategy.ep_size,
                     net=self.strategy.ep_net,
-                    comm_stage="Permutation_BWD_EP_PROB"
+                    comm_stage="Dispatch_PROB_BWD_EP"
                 )
             # HACK(sherry)
 
@@ -507,9 +451,7 @@ class Permutation(MetaModule):
         probs_mem = self.input_info.tensors[1].numel() * 8
         self._act_info.activation_mem_cache = probs_mem
         self._act_info.fwd_peak_mem_no_cache = 0
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = 0
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
         self._model_info.dense_weight_bytes = 0
@@ -551,11 +493,38 @@ class Permutation(MetaModule):
         )
 
     def _comp_cost_info(self):
-        self._comp_cost_info_impl(
-            fwd_op="permute_fwd",
-            bwd_grad_act_op="permute_bwd",
-            bwd_grad_w_op="default",
-            enable_recompute=self.enable_recompute,
+        # Keep perf-side parent cost aligned with the simulator trace.
+        # `Permutation` executes two memory-bound layout kernels (`permute1`,
+        # `permute2`) as separate leaf ops. Since the memory model includes a
+        # fixed launch latency, collapsing them into one aggregated mem-access
+        # estimate systematically underestimates the stage time.
+        permutate1_mem_accessed = (
+            self.input_act_size + self.permuted_act_size
+        ) * self.dtype_to_element_size[self.strategy.dtype]
+        permutate2_mem_accessed = (
+            self.permuted_act_size + self.permuted_act_size
+        ) * self.dtype_to_element_size[self.strategy.dtype]
+
+        def split_stage_time(op_name, mem_chunks):
+            return sum(
+                self.compute_end2end_time(
+                    compute_time=0,
+                    mem_time=self.system.compute_mem_access_time(op_name, mem_bytes),
+                )
+                for mem_bytes in mem_chunks
+            )
+
+        self._cost_info.fwd_compute_time = split_stage_time(
+            "permute_fwd",
+            [permutate1_mem_accessed, permutate2_mem_accessed],
+        )
+        self._cost_info.bwd_grad_act_time = split_stage_time(
+            "permute_bwd",
+            [permutate1_mem_accessed, permutate2_mem_accessed],
+        )
+        self._cost_info.bwd_grad_w_time = 0
+        self._cost_info.recompute_compute_time = (
+            self._cost_info.fwd_time if self.enable_recompute else 0
         )
 
 
@@ -570,7 +539,6 @@ class UnPermutation(MetaModule):
           - 通过argsort的sorted_indices反向unpermutate,然后根据probs进行combine，但是drop的没有残差连接
         - padding and drop：
           - 通过final_indices(token indices, [E, C])和scatter_add实现恢复和combine weight
-    5.all2all on tp group for old policy(all2all-seq)
     """
 
     def __init__(
@@ -598,38 +566,28 @@ class UnPermutation(MetaModule):
 
     def prefill(self, args, call_stk='', com_buff=None):
         self.call_stk = call_stk + self.call_stk
-        model_info = f"microbatch:{args.microbatch}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
+        model_info = f"{format_model_info_microbatch_tag(args)}-layer:{self.layer_idx}-name:{self.__class__.__name__}"
         state = args.thread_state
         rank_info = get_rank_group(args.rank, self.strategy)
         
 
     
-        if self.moe_dispatcher_policy == "all2all-seq" and self.strategy.tp_size > 1:
-            comm_size = (
-                self.act_size_after_combined
-                * self.dtype_to_element_size[self.strategy.dtype]
-            )
-            cost = self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-            )   
-            self.layers.append(all2all(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
-                                         rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))
-            state.comm_order += 1
-        
         #unpermutate1 before tp and ep all2all
-        unpermutate1_mem_accessed = (
+        unpermutate1_mem_accessed = ( # none-fused: contiguous memory(drop_and_pad) or sort_chunks_by_idxs
             2 * self.act_size_before_combined
         ) * self.dtype_to_element_size[self.strategy.dtype]
-        mem_time = self.system.compute_mem_access_time(
+
+        fwd_mem_time = self.system.compute_mem_access_time(
+            "permute_fwd",
             unpermutate1_mem_accessed
         )
-        fwd_compute_time = self.system.compute_end2end_time(0, mem_time)
+        bwd_mem_time = self.system.compute_mem_access_time(
+            "permute_bwd",
+            unpermutate1_mem_accessed
+        )
+        fwd_compute_time = self.system.compute_end2end_time(0, fwd_mem_time)
         bwd_grad_w_accessed_mem = 0
-        bwd_grad_act_accessed_mem = mem_time
+        bwd_grad_act_accessed_mem = bwd_mem_time
         bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
         self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
@@ -650,7 +608,7 @@ class UnPermutation(MetaModule):
             ) 
             self.layers.append(reduce_scatter(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
                                          rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank,))
             state.comm_order += 1
 
 
@@ -667,35 +625,24 @@ class UnPermutation(MetaModule):
             )   
             self.layers.append(all2all(f"{state.comm_order}-{model_info}-ep_group:{rank_info['ep_group_id']}", 
                                          rank_info['ep_rank'], self.strategy.ep_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))      
-            state.comm_order += 1
-
-        if self.moe_dispatcher_policy == "all2all-seq" and self.strategy.tp_size > 1:
-            comm_size = (
-                self.act_size_after_combined
-                * self.dtype_to_element_size[self.strategy.dtype]
-            )
-            cost = self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-            )  
-            self.layers.append(all2all(f"{state.comm_order}-{model_info}-tp_group:{rank_info['tp_group_id']}", 
-                                         rank_info['tp_rank'], self.strategy.tp_size, com_buff=com_buff,
-                                         fwd_cost=cost, bwd_cost=cost))
+                                         fwd_cost=cost, bwd_cost=cost, global_rank=args.rank,))      
             state.comm_order += 1
 
         #permutate2 and combine
         unpermutate2_and_combine_mem_accessed = (
             self.act_size_before_combined + self.act_size_after_combined
         ) * self.dtype_to_element_size[self.strategy.dtype]
-        mem_time = self.system.compute_mem_access_time(
+        fwd_mem_time = self.system.compute_mem_access_time(
+            "permute_fwd",
             unpermutate2_and_combine_mem_accessed
         )
-        fwd_compute_time = self.system.compute_end2end_time(0, mem_time)
+        bwd_mem_time = self.system.compute_mem_access_time(
+            "permute_bwd",
+            unpermutate2_and_combine_mem_accessed
+        )
+        fwd_compute_time = self.system.compute_end2end_time(0, fwd_mem_time)
         bwd_grad_w_accessed_mem = 0
-        bwd_grad_act_accessed_mem = mem_time
+        bwd_grad_act_accessed_mem = bwd_mem_time
         bwd_grad_act_time = self.system.compute_end2end_time(0, bwd_grad_act_accessed_mem)
         bwd_grad_w_time = self.system.compute_end2end_time(0, bwd_grad_w_accessed_mem)
         self.layers.append(AtomModel(fwd_cost=fwd_compute_time,
@@ -747,14 +694,14 @@ class UnPermutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.etp_size,
                 net=self.strategy.etp_net,
-                comm_stage="UnPermutation_FWD_ETP"
+                comm_stage="Combine_FWD_ETP"
             )
-            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
+            self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
                 "all_gather",
                 comm_size,
                 comm_num=self.strategy.etp_size,
                 net=self.strategy.etp_net,
-                comm_stage="UnPermutation_BWD_ETP"
+                comm_stage="Combine_BWD_ETP"
             )
 
         # all2all on ep group
@@ -769,7 +716,7 @@ class UnPermutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
-                comm_stage="UnPermutation_FWD_EP"
+                comm_stage="Combine_FWD_EP"
             )
             # bwd
             self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
@@ -777,29 +724,7 @@ class UnPermutation(MetaModule):
                 comm_size,
                 comm_num=self.strategy.ep_size,
                 net=self.strategy.ep_net,
-                comm_stage="UnPermutation_BWD_EP"
-            )
-        # all2all on tp group
-        if self.moe_dispatcher_policy == "all2all-seq" and self.strategy.tp_size > 1:
-            comm_size = (
-                self.act_size_after_combined
-                * self.dtype_to_element_size[self.strategy.dtype]
-            )
-            # fwd
-            self._cost_info.fwd_net_time += self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-                comm_stage="UnPermutation_FWD_TP"
-            )
-            # bwd
-            self._cost_info.bwd_grad_act_net_time += self.system.compute_net_op_time(
-                "all2all",
-                comm_size,
-                comm_num=self.strategy.tp_size,
-                net=self.strategy.tp_net,
-                comm_stage="UnPermutation_BWD_TP"
+                comm_stage="Combine_BWD_EP"
             )
         if self.enable_recompute:
             self._cost_info.recompute_net_time = self._cost_info.fwd_net_time
@@ -821,8 +746,6 @@ class UnPermutation(MetaModule):
             self._act_info.fwd_peak_mem_no_cache = self.act_size_before_combined * self.element_size + self.act_size_after_combined * self.element_size
             self._act_info.bwd_peak_mem_no_cache = self.act_size_before_combined * self.element_size + self.act_size_after_combined * self.element_size
         # HACK(sherry)
-        self._act_info.fwd_peak_prev_cache_mem = 0
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
         self._model_info.dense_weight_bytes = 0
@@ -873,11 +796,39 @@ class UnPermutation(MetaModule):
         # pylint: enable=invalid-name
 
     def _comp_cost_info(self):
-        self._comp_cost_info_impl(
-            fwd_op="permute_fwd",
-            bwd_grad_act_op="permute_bwd",
-            bwd_grad_w_op="default",
-            enable_recompute=self.enable_recompute,
+        # Keep perf-side parent cost aligned with the simulator trace.
+        # `UnPermutation` executes two layout kernels (`unpermute1`,
+        # `unpermutate2_and_combine`) as separate leaf ops. Summing the two
+        # kernel times matches simulator timing better than aggregating the
+        # total bytes into one memory-bound estimate, because the bandwidth
+        # model includes a fixed launch latency per kernel.
+        unpermutate1_mem_accessed = (
+            2 * self.act_size_before_combined
+        ) * self.dtype_to_element_size[self.strategy.dtype]
+        unpermutate2_and_combine_mem_accessed = (
+            self.act_size_before_combined + self.act_size_after_combined
+        ) * self.dtype_to_element_size[self.strategy.dtype]
+
+        def split_stage_time(op_name, mem_chunks):
+            return sum(
+                self.compute_end2end_time(
+                    compute_time=0,
+                    mem_time=self.system.compute_mem_access_time(op_name, mem_bytes),
+                )
+                for mem_bytes in mem_chunks
+            )
+
+        self._cost_info.fwd_compute_time = split_stage_time(
+            "permute_fwd",
+            [unpermutate1_mem_accessed, unpermutate2_and_combine_mem_accessed],
+        )
+        self._cost_info.bwd_grad_act_time = split_stage_time(
+            "permute_bwd",
+            [unpermutate1_mem_accessed, unpermutate2_and_combine_mem_accessed],
+        )
+        self._cost_info.bwd_grad_w_time = 0
+        self._cost_info.recompute_compute_time = (
+            self._cost_info.fwd_time if self.enable_recompute else 0
         )
 
 
@@ -896,7 +847,8 @@ class GroupLinearCol(GroupLinearBase):
         mode:str,
         strategy: StrategyConfig,
         system: SystemConfig,
-        is_last_recompute: bool = False
+        is_last_recompute: bool = False,
+        use_variance_tail_model: bool = False,
     ) -> None:
         super().__init__(local_expert_num, input_size, output_size, strategy, system)
         assert mode in ['parallel', 'serial']
@@ -909,6 +861,7 @@ class GroupLinearCol(GroupLinearBase):
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
         self.is_last_recompute = is_last_recompute
+        self.use_variance_tail_model = self.use_variance_tail_model or use_variance_tail_model
         
         if self.is_last_recompute and self.enable_recompute:
             self.set_variance_node(True)
@@ -1023,28 +976,25 @@ class GroupLinearCol(GroupLinearBase):
         input_size = self.micro_hidden_state_size * self.a_element_size # fp8
         output_size = self.micro_output_grad_size * self.element_size   # bf16
         self._act_info.fwd_peak_mem_no_cache = input_size + output_size + (0 if self.strategy.use_accm_weight else weight_size)
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = input_size + output_size + (grad_size if self.strategy.fp8 else 0) + (input_size if self.offload_inputs else 0)
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.local_expert_num * self.input_size * self.output_size
         self._model_info.moe_weight_numel = weight_numel * self.strategy.ep_size * self.strategy.etp_size # Statistics the parameters of all etp ranks and ep ranks
         self._model_info.moe_weight_bytes = weight_numel * self.w_element_size # fp8
-        self._model_info.moe_grad_bytes = (
-            self._model_info.moe_weight_bytes
-            if not self.strategy.use_fp32_accum_grad
-            else self.dtype_to_element_size["fp32"] * weight_numel
-        )
+        self._model_info.moe_grad_bytes = weight_numel * self.main_grad_element_size
         self._model_info.moe_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
+        
+        optimizer_group_size = self.strategy.edp_size
         if self.strategy.zero_state >= 1:
-            self._model_info.moe_state_bytes /= self.strategy.edp_size
+            self._model_info.moe_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
-            self._model_info.moe_grad_bytes /= self.strategy.edp_size
+            self._model_info.moe_grad_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 3:
-            self._model_info.moe_weight_bytes /= self.strategy.edp_size
+            self._model_info.moe_weight_bytes /= optimizer_group_size
+        self._record_te_dummy_wgrad_shape(grouped_linear=True)
 
     def _comp_leaf_flops_info(self):
         token_num = self.input_info.tensors[0].size(0)
@@ -1121,7 +1071,8 @@ class GroupLinearRow(GroupLinearBase):
         mode:str,
         strategy: StrategyConfig,
         system: SystemConfig,
-        is_last_recompute: bool = False
+        is_last_recompute: bool = False,
+        use_variance_tail_model: bool = False,
     ) -> None:
         super().__init__(local_expert_num, input_size, output_size, strategy, system)
         assert mode in ['parallel', 'serial']
@@ -1134,6 +1085,7 @@ class GroupLinearRow(GroupLinearBase):
         self.has_cached_inputs = has_cached_inputs
         self.enable_recompute = enable_recompute
         self.is_last_recompute = is_last_recompute
+        self.use_variance_tail_model = self.use_variance_tail_model or use_variance_tail_model
         if self.is_last_recompute and self.enable_recompute:
             self.set_variance_node(True)
         if self.strategy.fp8:
@@ -1255,28 +1207,25 @@ class GroupLinearRow(GroupLinearBase):
         input_size = self.micro_hidden_state_size * self.a_element_size # fp8
         output_size = self.micro_output_grad_size * self.element_size # bf16
         self._act_info.fwd_peak_mem_no_cache = input_size + output_size + (0 if self.strategy.use_accm_weight else weight_size)
-        self._act_info.fwd_peak_prev_cache_mem = 0
         self._act_info.bwd_peak_mem_no_cache = input_size + output_size +  (grad_size if self.strategy.fp8 else 0)
-        self._act_info.bwd_peak_prev_cache_mem = 0
 
     def _comp_leaf_model_info_impl(self):
         weight_numel = self.input_size * self.output_size * self.local_expert_num
         self._model_info.moe_weight_numel = weight_numel * self.strategy.ep_size * self.strategy.etp_size # Statistics the parameters of all etp ranks and ep ranks
         self._model_info.moe_weight_bytes = weight_numel * self.w_element_size # fp8
-        self._model_info.moe_grad_bytes = (
-            self._model_info.moe_weight_bytes
-            if not self.strategy.use_fp32_accum_grad
-            else self.dtype_to_element_size["fp32"] * weight_numel
-        )
+        self._model_info.moe_grad_bytes = weight_numel * self.main_grad_element_size
         self._model_info.moe_state_bytes = (
             3 * self.dtype_to_element_size["fp32"] * weight_numel
         )
+        
+        optimizer_group_size = self.strategy.edp_size
         if self.strategy.zero_state >= 1:
-            self._model_info.moe_state_bytes /= self.strategy.edp_size
+            self._model_info.moe_state_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 2:
-            self._model_info.moe_grad_bytes /= self.strategy.edp_size
+            self._model_info.moe_grad_bytes /= optimizer_group_size
         if self.strategy.zero_state >= 3:
-            self._model_info.moe_weight_bytes /= self.strategy.edp_size
+            self._model_info.moe_weight_bytes /= optimizer_group_size
+        self._record_te_dummy_wgrad_shape(grouped_linear=True)
 
     def _comp_leaf_flops_info(self):
         token_num = self.input_info.tensors[0].size(0)
@@ -1350,7 +1299,8 @@ class QuantizedGroupLinearCol(MetaModule):
         mode:str,
         strategy: StrategyConfig,
         system: SystemConfig,
-        is_last_recompute: bool = False
+        is_last_recompute: bool = False,
+        use_variance_tail_model: bool = False,
         ):
         super().__init__(strategy, system)
         quantizer_recompute = False if strategy.cache_groupgemm_col_fp8_inputs else enable_recompute
@@ -1370,7 +1320,8 @@ class QuantizedGroupLinearCol(MetaModule):
             mode,
             strategy,
             system,
-            is_last_recompute
+            is_last_recompute,
+            use_variance_tail_model,
         )
     def forward(self, hidden_states, path_debug_context=None):
         hidden_states = self.quantizer(hidden_states, path_debug_context)
@@ -1391,7 +1342,8 @@ class QuantizedGroupLinearRow(MetaModule):
         strategy: StrategyConfig,
         system: SystemConfig,
         if_first_recompute: bool = False,
-        is_last_recompute: bool = False
+        is_last_recompute: bool = False,
+        use_variance_tail_model: bool = False,
     ):
         super().__init__(strategy, system)
         self.quantizer = Float8Quantizer(enable_recompute=enable_recompute, strategy=strategy, system=system)
@@ -1406,7 +1358,8 @@ class QuantizedGroupLinearRow(MetaModule):
                     mode,
                     strategy,
                     system,
-                    is_last_recompute
+                    is_last_recompute,
+                    use_variance_tail_model,
                 )
 
     def forward(self, hidden_states, path_debug_context=None):
@@ -1442,13 +1395,17 @@ class ExpertMLP(MetaModule):
             else ffn_hidden_size
         )
         self.mlp_recompute = mlp_recompute
+        megatron_moe = mlp_recompute.megatron_moe
+        megatron_moe_act = mlp_recompute.megatron_moe_act and not megatron_moe
         self.shared_expert = None
         if getattr(self.config, "moe_shared_expert_intermediate_size", None) is not None:
+            shared_expert_recompute = deepcopy(mlp_recompute)
+            shared_expert_recompute.megatron_layernorm = False
             self.shared_expert = MLP(
                     layer_idx=f"{layer_idx}-shareExpert",
                     config=self.config,
                     enable_recompute=enable_recompute, # for old version 
-                    mlp_recompute_conf=mlp_recompute,
+                    mlp_recompute_conf=shared_expert_recompute,
                     strategy=strategy,
                     system=system,
                     intermediate_size=self.config.moe_shared_expert_intermediate_size
@@ -1463,8 +1420,10 @@ class ExpertMLP(MetaModule):
                 expert_num=self.config.expert_num,
                 topk=self.topk,
                 moe_dispatcher_policy=self.strategy.moe_dispatcher_policy,
-                has_cached_inputs=False,
-                enable_recompute=mlp_recompute.router_recompute,
+                has_cached_inputs=mlp_recompute.megatron_layernorm,
+                enable_recompute=mlp_recompute.router_recompute or mlp_recompute.megatron_layernorm or megatron_moe,
+                is_last_recompute=mlp_recompute.megatron_layernorm,
+                use_variance_tail_model=mlp_recompute.megatron_layernorm,
                 strategy=strategy,
                 system=system,
             )
@@ -1477,7 +1436,7 @@ class ExpertMLP(MetaModule):
                 capacity=self.config.capacity,
                 moe_dispatcher_policy=self.strategy.moe_dispatcher_policy,
                 has_cached_inputs=False,
-                enable_recompute=mlp_recompute.permutation_recompute,
+                enable_recompute=mlp_recompute.permutation_recompute or megatron_moe,
                 strategy=strategy,
                 system=system,
             )
@@ -1488,7 +1447,7 @@ class ExpertMLP(MetaModule):
                 local_expert_num=self.local_expert_num,
                 use_bias=False,
                 has_cached_inputs=False,
-                enable_recompute=mlp_recompute.linear_recompute,
+                enable_recompute=mlp_recompute.linear_recompute or megatron_moe,
                 mode=self.config.group_linear_mode,
                 strategy=strategy,
                 system=system,
@@ -1507,7 +1466,7 @@ class ExpertMLP(MetaModule):
             self.expert_activation_layer = Swiglu(
                     is_fused=self.strategy.use_fused_swiglu,
                     has_cached_inputs=False,
-                    enable_recompute=mlp_recompute.linear_recompute,
+                    enable_recompute=mlp_recompute.linear_recompute or megatron_moe or megatron_moe_act,
                     strategy=strategy,
                     system=system,
                     is_weighted_silu= self.strategy.dispatch_probs
@@ -1515,7 +1474,7 @@ class ExpertMLP(MetaModule):
         else:
             self.expert_activation_layer =Gelu(
                     has_cached_inputs=False,
-                    enable_recompute=mlp_recompute.linear_recompute,
+                    enable_recompute=mlp_recompute.linear_recompute or megatron_moe or megatron_moe_act,
                     strategy=strategy,
                     system=system,
                 )
@@ -1524,9 +1483,10 @@ class ExpertMLP(MetaModule):
                 input_size=ffn_hidden_size,
                 output_size=self.config.hidden_size,
                 local_expert_num=self.local_expert_num,
-                has_cached_inputs=False,
-                enable_recompute=mlp_recompute.linear_recompute,
+                has_cached_inputs=megatron_moe_act,
+                enable_recompute=mlp_recompute.linear_recompute or megatron_moe or megatron_moe_act,
                 is_last_recompute = True,
+                use_variance_tail_model=megatron_moe_act,
                 mode=self.config.group_linear_mode,
                 use_bias=False,
                 strategy=strategy,
@@ -1539,17 +1499,26 @@ class ExpertMLP(MetaModule):
                 topk=self.topk,
                 moe_dispatcher_policy=self.strategy.moe_dispatcher_policy,
                 has_cached_inputs=False,
-                enable_recompute=mlp_recompute.permutation_recompute,
+                enable_recompute=mlp_recompute.permutation_recompute or megatron_moe,
                 strategy=strategy,
                 system=system,
             )
+        if (
+            self.strategy.recompute_granularity == "selective_recompute"
+            and mlp_recompute.megatron_layernorm
+        ):
+            self.router.is_breakpoints = True
+
         if self.unpermutation.enable_recompute and self.strategy.recompute_granularity == "selective_recompute":
             self.unpermutation.is_breakpoints = True
 
-        if not (mlp_recompute.router_recompute and
-                mlp_recompute.permutation_recompute and 
-                mlp_recompute.linear_recompute and
-                self.shared_expert.recompute_granularity == "full" if self.shared_expert else True):
+        full_moe_checkpoint = megatron_moe or (
+            mlp_recompute.router_recompute and
+            mlp_recompute.permutation_recompute and
+            mlp_recompute.linear_recompute and
+            (self.shared_expert.recompute_granularity == "full" if self.shared_expert else True)
+        )
+        if not full_moe_checkpoint:
             self.recompute_granularity = "submodule"
     
     def preprocess(self, input_info:InputOutputInfo):

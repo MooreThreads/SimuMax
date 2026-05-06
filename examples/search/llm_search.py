@@ -35,7 +35,7 @@ def search(model, system):
     set_megatron_config(perf_model) # Optinionally, just for align the configuration with the benchmark
 
     all_search_result = {}
-    perf_model.search_best_parallel_strategy_with_recompute(
+    perf_model.search_best_parallel_strategy(
         world_size=2048,
         gmi_error=6, # 6G memory reserved
         micro_batch_size=1,

@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import math
 import torch
 
 from simumax.utils import get_simu_model_config, RELEASE_MODELS
@@ -18,8 +19,11 @@ DEFAULT_MODEL_LIST = ["deepseekv2",
                   "mixtral-8x7b"]
 DEFAULT_MBS_LIST = [1, 2, 4]
 DEFAULT_SEQ_LEN_LIST = [4096]
+DEFAULT_CP_LIST = [1, 2, 4, 8]
 DEFAULT_TP_LIST = [1, 2, 4, 8]
 DEFAULT_EP_LIST = [1, 2, 4, 8, 16, 64]
+DEFAULT_DTYPE_LIST = ["bf16"]
+DEFAULT_EXTRA_VOCAB_SIZE_LIST = [102400, 102401]
 
 PARAM_FILE = os.environ.get("PARAM_FILE", None)
 GLOBAL_PARAMS = None
@@ -28,14 +32,14 @@ if PARAM_FILE:
         GLOBAL_PARAMS = json.load(open(PARAM_FILE))
     except Exception as e:
         print(e)
-    
+
 
 def get_test_seq_len_list():
     if GLOBAL_PARAMS is not None and "seq_len_list" in GLOBAL_PARAMS:
         return GLOBAL_PARAMS["seq_len_list"]
     else:
         return DEFAULT_SEQ_LEN_LIST
-    
+
 def get_test_mbs_list():
     if GLOBAL_PARAMS is not None and "mbs_list" in GLOBAL_PARAMS:
         return GLOBAL_PARAMS["mbs_list"]
@@ -54,6 +58,23 @@ def get_test_tp_list():
     else:
         return DEFAULT_TP_LIST
 
+def get_test_cp_list():
+    if GLOBAL_PARAMS is not None and "cp_list" in GLOBAL_PARAMS:
+        return GLOBAL_PARAMS["cp_list"]
+    else:
+        return DEFAULT_CP_LIST
+
+def get_dtype_list():
+    if GLOBAL_PARAMS is not None and "dtype" in GLOBAL_PARAMS:
+        return GLOBAL_PARAMS["dtype"]
+    else:
+        return DEFAULT_DTYPE_LIST
+
+def get_extra_vocab_size_list():
+    if GLOBAL_PARAMS is not None and "extra_vocab_size_list" in GLOBAL_PARAMS:
+        return GLOBAL_PARAMS["extra_vocab_size_list"]
+    else:
+        return DEFAULT_EXTRA_VOCAB_SIZE_LIST
 def get_all_test_model_configs():
     if GLOBAL_PARAMS is not None and "model_list" in GLOBAL_PARAMS:
         model_list =  GLOBAL_PARAMS["model_list"]
@@ -87,7 +108,7 @@ def get_torch_profiler(device, profile = False):
     profiler =  torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
+                torch.profiler.ProfilerActivity.MUSA if device=='musa' else torch.profiler.ProfilerActivity.CUDA,
             ],
             schedule=torch.profiler.schedule(wait=2, warmup=3, active=5, skip_first=2,repeat=100),
             on_trace_ready=trace_handler,
@@ -98,8 +119,8 @@ def get_torch_profiler(device, profile = False):
         )
     return profiler
 
-def sync_device(device=None):
-    torch.cuda.synchronize()
+def sync_device(device):
+    torch.musa.synchronize() if device=='musa' else torch.cuda.synchronize()
 
 def get_system_name():
     system = None
@@ -111,17 +132,72 @@ def get_system_name():
         device = 'cuda'
         if 'A100' in system:
             MAX_TFLOPS = 312
+            system_name = 'a100'
         elif 'H100' in system:
             MAX_TFLOPS = 1979
-    except Exception as e:
-        print(f"[ERROR] Info: {e}") 
-        exit()
-    
+            system_name = 'h100'
+        elif 'B200' in system:
+            MAX_TFLOPS = 2250
+            system_name = 'b200'
+        else:
+            raise ValueError("Unsupported device")
+    except:
+        pass
+
+    try:
+        system = torch.musa.get_device_name(0)
+        device = 'musa'
+        MAX_TFLOPS = None
+    except:
+        pass
+    # assert system is not None and device is not None and MAX_TFLOPS is not None, "Unsupported device"
     if os.environ.get('MAX_TFLOPS', None) is not None:
         MAX_TFLOPS = float(os.environ.get('MAX_TFLOPS'))
-    
-    assert MAX_TFLOPS is not None, f"MAX_TFLOPS is None, exit!"
-    assert device is not None, f"device is None, exit!"
-    
+
+    if system is None or device is None or MAX_TFLOPS is None:
+        raise RuntimeError(
+            "Unsupported device for efficiency measurement. "
+            "Detected system=%r, device=%r, MAX_TFLOPS=%r. "
+            "Use a supported accelerator or set MAX_TFLOPS explicitly for a detected CUDA/MUSA device."
+            % (system, device, MAX_TFLOPS)
+        )
+
     print(f'System: {system}, Device: {device}, Max TFLOPS: {MAX_TFLOPS}')
     return system, device, MAX_TFLOPS
+
+
+def get_efficiency_save_root(system_name: str, suffix: str) -> str:
+    root_dir = os.path.dirname(__file__)
+    cache_tag = os.environ.get("EFFICIENCY_CACHE_TAG", "").strip()
+    if cache_tag:
+        return os.path.join(root_dir, f"{system_name}_{cache_tag}_{suffix}")
+    return os.path.join(root_dir, f"{system_name}_{suffix}")
+
+
+def get_system_runtime_info():
+    system, device, max_tflops = get_system_name()
+
+    if device == "cuda":
+        device_count = torch.cuda.device_count()
+        props = torch.cuda.get_device_properties(0)
+    elif device == "musa":
+        device_count = torch.musa.device_count()
+        props = torch.musa.get_device_properties(0)
+    else:
+        raise RuntimeError(f"Unsupported runtime device {device!r}")
+
+    total_memory = getattr(props, "total_memory", None)
+    mem_gbs = None if total_memory is None else math.ceil(total_memory / (1024**3))
+
+    if os.environ.get("NUM_PER_NODE") is not None:
+        device_count = int(os.environ["NUM_PER_NODE"])
+    if os.environ.get("MEM_GBS") is not None:
+        mem_gbs = int(os.environ["MEM_GBS"])
+
+    return {
+        "system": system,
+        "device": device,
+        "max_tflops": max_tflops,
+        "num_per_node": device_count,
+        "mem_gbs": mem_gbs,
+    }

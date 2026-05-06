@@ -10,6 +10,7 @@
     "moe_ffn_hidden_size": 1408,
     "moe_shared_expert_intermediate_size": 2816,
     "layer_num": 28,
+    "dense_layers": 1,
     "expert_num": 64,
     "v_head_dim": 128,
     "qk_head_dim": 128,

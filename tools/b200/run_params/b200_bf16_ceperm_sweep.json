@@ -1,0 +1,26 @@
+{
+  "model_list": [
+    "llama3-70b",
+    "llama3-405b_padding_128",
+    "deepseekv2",
+    "deepseekv3"
+  ],
+  "mbs_list": [
+    1
+  ],
+  "seq_len_list": [
+    4096
+  ],
+  "tp_list": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "ep_list": [
+    1,
+    2,
+    4,
+    8
+  ]
+}

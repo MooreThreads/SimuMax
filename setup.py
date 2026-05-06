@@ -6,13 +6,13 @@ from distutils.core import setup
 CURRENT_DIR = os.path.dirname(__file__)
 
 def read(path):
-    with open(path, "r") as filep:
+    with open(path, "r", encoding="utf-8") as filep:
         return filep.read()
 
 def get_version(package_name):
     if os.getenv("TAG_NAME"):
         return os.getenv("TAG_NAME")
-    with open(os.path.join(CURRENT_DIR, package_name, "version.py")) as fp:
+    with open(os.path.join(CURRENT_DIR, package_name, "version.py"), encoding="utf-8") as fp:
         for line in fp:
             tokens = re.search(r'^\s*__version__\s*=\s*"(.+)"\s*$', line)
             if tokens:

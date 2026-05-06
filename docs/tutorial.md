@@ -1,158 +1,247 @@
+# Guided Tutorial
 
-# Guilded Tutorial
-## Simple Example
+SimuMax relies on three input files:
+
+- a **system** config
+- a **strategy** config
+- a **model** config
+
+See also:
+
+- [system.md](./system.md)
+- [strategy.md](./strategy.md)
+- [model.md](./model.md)
+
+Recommended first-time order:
+
+1. Run a shipped `perf` example.
+2. Try the minimal `PerfLLM` API.
+3. Copy the nearest existing `model`, `strategy`, and `system` configs.
+4. If needed, search feasible batch settings or parallel strategies.
+5. Only then move to machine measurement or simulator deep dives.
+
+## 1. Run perf with an existing config
+
+If you only want a quick smoke test or rough OOM feasibility, start here. You do not need to measure a new machine first.
+
+## 2. Minimal `PerfLLM` API
 
 ```python
-# Define the system、strategy、model config
-system_config_file = ...
-strategy_config_file = ...
-model_config_file = ...
-# Setup perf model and config
-perf_model = PerfLLM()
-perf_model.configure(
-    strategy_config=strategy_config_file, 
-    model_config=model_config_file, 
-    system_config=system_config_file
+from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.perf_llm import PerfLLM
+
+perf = PerfLLM()
+perf.configure(
+    strategy_config=StrategyConfig.init_from_config_file("configs/strategy/tp1_pp2_dp4_mbs1.json"),
+    model_config=ModelConfig.init_from_config_file("configs/models/llama3-8b.json"),
+    system_config=SystemConfig.init_from_config_file("configs/system/a100_pcie.json"),
 )
 
-# Run simulate
-perf_model.run_estimate()
-
-# Based simulate result, run memory analysis
-mem_result = perf_model.analysis_mem()
-
-# Based simulate result, run cost analysis
-cost_result = perf_model.analysis_cost()
+perf.run_estimate()
+mem_result = perf.analysis_mem()
+cost_result = perf.analysis_cost()
 ```
-In the above example, `system_config_file`, `strategy_config_file`, and `model_config_file` are paths to your configuration files.
 
-Please refer to [./system.md](./system.md) and [./strategy.md](./strategy.md) for more details on parameter configuration.
+`run_estimate()` builds the modeled training graph and prepares both cost and memory analysis.
 
-The run_estimate method simulates the training process and estimates the performance.
-
-The analysis_mem method analyzes the memory usage during the training process and returns a mem_result object. This object contains information about the memory usage of different parts of the model, such as the weight memory usage, gradient memory usage, and state memory usage.
-
-The analysis_cost method analyzes the cost of the training process and returns a cost_result object. This object contains information about the compute usage of the model, such as the forward pass flops, backward pass flops, and memory accessed during each pass.
-
-We also provide some examples of models. You can try the scripts in the examples directory. 
-Note that performance analysis depends heavily on the system config, so an accurate config is important. We only provide a demo, not an accurate config.
+## 3. Run a shipped example
 
 ```bash
-cd ./examples
+cd examples
 python perf_llama3_8b_tp1_pp2.py
-# The results are stored in the llama3_8b_a100_pcie_bf16 directory
 ```
 
-Here are explanations for each field in the `cost_result`:
-- `comm_result`: each batch's communication cost. Currently, we assume that the communication cost of each batch is the same, and we will adjust it later.
-- `compute_details`: each batch's compute cost details and whole training process's statistics.
-- `breakdown_result`:  a dictionary that contains the breakdown of the cost of the training process.
-- `chunk_time`: the time taken for each micro batch forward and backward pass.
-- `all_tokens_per_iter`: the number of tokens processed per iteration.
-- `duration_time_per_iter`: the time taken for each iteration.
-- `mfu_6nd_with_attn`: <b>It is the standard mfu, please refer to this value instead of "mfu"</b>. The 6ND MFU formula with attention which typically doesn't differ too much from `mfu`.
-- `mfu`:  simulated flops are used to calculate the MFU.
-    - `mfu` is not always same as `mfu_6nd_with_attn`, while it considers some extra op, such as a extra gemm in FA. 
-- `throughput_per_accelerator`: the throughput of each accelerator during the training process.
+If you run this from `examples/`, the script creates a result directory in the current working directory.
+Typical files include:
 
-And here are explanations for each field in the `mem_result`(if pp_size is 1, the result is the memory analysis result of the first stage, otherwise, it will return the memory analysis result of the first stage and the last stage respectively.):
-- `model_mem`: the memory usage of the model. including the weight memory usage, gradient memory usage, and state memory usage.
-- `fwd_activation_cache_per_micro_batch`: the memory usage of the activation cached for the backward during the forward pass for each micro batch.
-- `peak_activation_mem_in_1F1B`: the peak memory usage of the activation during the forward and backward pass.
-- `fwd_peak_allocated_mem`: the peak memory usage during the forward pass.
-- `bwd_peak_allocated_mem`: the peak memory usage during the backward pass.
-- `peak_mem`: the peak memory usage of the cache.
-- `peak_mem_with_reserved`: the peak memory usage of the cache with reserved memory.
-- `memory_reserved_ratio`: the ratio of the reserved memory to the total allocated memory.  
-- `peak_path`: the peak memory usage path.
-## Notes
-- Currently, all Linear models are forced to perform gradient accumulation fusion.
-## Features
-### Set pp layers of the first and last stage
-If the pipeline parallelism is used(pp_size > 1), the first and last stage can be set by the following variables in the strategy file(e.g. tp1_pp2_ep4_mbs1_mbc1.json). The layers of the middle stages are averaged based on the remaining layers.
-```json
-{
-    "seq_len": 4096,
-    "micro_batch_size": 1,
-    "world_size": 8,
-    "tp_size": 1,
-    "pp_size": 4,
-    "ep_size": 2,
-    ...
-    "num_layers_in_first_pipeline_stage": 9,
-    "num_layers_in_last_pipeline_stage": 11,
-}
-```
-In the above strategy file, the first stage contains 9 layers and the last stage contains 11 layers, if the layers of the model are 50, the layers of each pp stage are [9, 15, 15, 11].
+- core outputs:
+  - `compute_result.json`
+  - `mem_result.json`
+- helper files for understanding or reproduction:
+  - `base_info.json`
+  - `model_arch`
+  - `model_config.json`
+  - `strategy_config.json`
+  - `system_config.json`
+  - `net_info.json`
 
+Practical reading:
 
-###  Recompute
+- start with `compute_result.json` and `mem_result.json`
+- use the `*_config.json` files when you want to reproduce or compare the exact run
+- use `base_info.json` and `model_arch` when you want to inspect the modeled architecture
 
-Set the follwing variables in the strategy file(e.g. tp1_pp2_ep4_mbs1_mbc1_selective_recompute_fp8.json) to enable selective recompute and fp8 mixed-precision training. Note that the llama only support mlp_recompute and mlp_rms_recompute.
-- Full recompute  example:
-```json
-{
-    "seq_len": 4096,
-    "micro_batch_size": 1,
-    "world_size": 8,
-    "tp_size": 1,
-    "pp_size": 1,
-    "ep_size": 8,
-    ...
-    "recompute_granularity" : "full_block", // enable full recompute  
-    "recompute_layer_num": 1, // the number of recomputed layers, 1 means the first layer is enabled to full-recompute.
-}
-```
+## 4. Know when shipped configs are enough
 
-- Selective recompute example:
-```json
-{
-    "seq_len": 4096,
-    "micro_batch_size": 1,
-    "world_size": 8,
-    "tp_size": 1,
-    "pp_size": 1,
-    "ep_size": 8,
-    ...
-    "recompute_granularity" : "selective_recompute", // enable selective recompute  
-    "recompute_layer_num": 1, // the number of recomputed layers, 1 means the first layer is enabled to slelective recompute.
-    "attn_recompute":true, // enable recompute for attention
-    "mla_rms_recompute":true,   // enable recompute for rms before mla
-    "mlp_recompute":true, // enable recompute for mlp
-    "mlp_rms_recompute":true, // enable recompute for rms before mlp
-}
-```
+You can usually use shipped configs directly when:
 
-Then please refer to the chapter "Example" to start the esimulation. We also provide some examples of models. You can try the scripts in the this directory.
-Note that performance analysis depends heavily on the system config, so an accurate config is important. We only provide a demo, not an accurate config. 
-<!-- The full example of recompute and fp8 is there: [perf_deepseek_1node_tp1pp2ep4_selective_recompute_fp8.py](perf_deepseek_1node_tp1pp2ep4_selective_recompute_fp8.py), [perf_llama_1node_tp4pp2ep1_selective_recompute_fp8.py](perf_llama_1node_tp4pp2ep1_selective_recompute_fp8.py) -->
-```shell
-cd ./examples
-python perf_deepseekv2_layer4_ep4_pp2_selective_recompute.py # the result is saved in deepseek_v2_a100_pcie_bf16 directory
-python perf_llama3_70b_layer12_tp2_full_recompute.py  # the result is saved in deepseek_v2_a100_pcie_bf16 directory
-```
+- the target machine is close to a provided example machine
+- the model uses already-covered dominant operator shapes
+- the goal is quick exploration, not benchmark-grade timing
 
+You should measure your own machine or your own missing shapes when:
 
-## Strategy Search
-### search_best_parallel_strategy_with_recompute
-The `search_best_parallel_strategy_with_recompute` interface can search for the best parallel strategy with the given recompute search space. The full example is as follows:
+- the hardware is new
+- communication bandwidth/latency is unknown
+- the target model uses shapes not covered by the current system config
+- `system.miss_efficiency` is non-empty and you want to explain timing
+
+Practical rule:
+
+- for OOM feasibility, missing efficiency may still be acceptable
+- for `perf vs simulator` or `perf vs real` timing interpretation, fill missing efficiency first
+
+## 5. Add your own machine config
+
+The shared measurement workflow lives under:
+
+- [simu_tools/efficency_test/README.md](../simu_tools/efficency_test/README.md)
+
+This path covers:
+
+- operator-efficiency measurement
+- communication fitting
+- assembling a SimuMax-ready `system.json`
+
+The final useful output of that workflow is a new `system.json` that contains:
+
+- measured operator-efficiency entries
+- fitted communication values written back into `networks`
+
+If you only want smoke testing or OOM screening, do not start with this step. Reuse the nearest shipped system config first.
+
+## 6. Add your own model config
+
+Model config files live under:
+
+- [configs/models](../configs/models)
+
+See:
+
+- [model.md](./model.md)
+
+Recommended path:
+
+1. copy the nearest existing JSON under `configs/models/`
+2. change only the fields that are structurally different
+3. pair it with a known-good strategy and system config first
+
+## 7. Generate simulator trace and optional memory artifacts
+
+`simulate()` exports simulator-side artifacts that help explain timing and memory behavior:
+
 ```python
-perf_model = PerfLLM()
-perf_model.configure(
-    strategy_config=StrategyConfig.init_from_config_file(strategy_config_file),
-    model_config=ModelConfig.init_from_config_file(model_config_file),
-    system_config=SystemConfig.init_from_config_file(system_config_file),
-)
-perf_model.search_best_parallel_strategy_with_recompute(
-        world_size=2048,
-        gmi_error=6, # 6G memory reserved
-        micro_batch_size=1,
-        global_batch_size= 2048*8,
-        all_search_result=all_search_result,
-        tp_search_list=[1],
-        ep_search_list=[8, 16, 32, 64],
-        recompute_search_type=['no_recompute', 'full_block', 'selective_recompute'],
-        use_reserved_memory=False,
-        dump_path=f"search_{perf_model.model_config.model_name}_{perf_model.system.sys_name}"
-    )
+perf.simulate("tmp/llama3_8b_a100_trace")
 ```
+
+This always writes `tracing_logs.json`. Depending on the strategy and current
+memory-timeline path, you may also see:
+
+- `simu_memory_result.json`
+- `simu_memory_snapshot.json`
+- `simu_memory_viz_snapshot.pickle`
+
+For a simple public example that usually includes the memory artifacts,
+start from a shipped single-stage strategy such as
+`configs/strategy/tp2_pp1_dp4_mbs1.json`:
+
+```python
+from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.perf_llm import PerfLLM
+
+perf = PerfLLM()
+perf.configure(
+    strategy_config=StrategyConfig.init_from_config_file("configs/strategy/tp2_pp1_dp4_mbs1.json"),
+    model_config=ModelConfig.init_from_config_file("configs/models/llama3-8b.json"),
+    system_config=SystemConfig.init_from_config_file("configs/system/a100_pcie.json"),
+)
+perf.run_estimate()
+perf.simulate("tmp/llama3_8b_a100_trace")
+```
+
+This example uses `pp_size == 1`, so it will export the memory artifacts as
+well as `tracing_logs.json`. More generally, the current implementation exports
+memory artifacts when `pp_size == 1` or `pp_comm_async == false`.
+
+Use these when:
+
+- comparing simulator behavior against real traces
+- understanding where peak memory comes from
+- debugging pipeline / VPP / recompute lifetime issues
+
+## 8. Search batch settings or parallel strategies
+
+Start with the lighter search first:
+
+1. fix `global_batch_size`
+2. search feasible `micro_batch_size` / `micro_batch_num`
+3. only then search a small `tp/pp` space
+
+Public runnable example:
+
+- [examples/search_strategy_llama3_8b.py](../examples/search_strategy_llama3_8b.py)
+
+### Search feasible batch settings under a fixed global batch size
+
+```python
+from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
+from simumax.core.perf_llm import PerfLLM
+
+perf = PerfLLM()
+perf.configure(
+    strategy_config=StrategyConfig.init_from_config_file("configs/strategy/tp1_pp2_dp4_mbs1.json"),
+    model_config=ModelConfig.init_from_config_file("configs/models/llama3-8b.json"),
+    system_config=SystemConfig.init_from_config_file("configs/system/a100_pcie.json"),
+)
+
+perf.model_config.padded_vocab_size = True
+perf.model_config.make_vocab_size_divisible_by = 128
+perf.strategy.enable_recompute = False
+perf.strategy.recompute_granularity = None
+perf.strategy.recompute_layer_num = 0
+
+all_mbs, all_mbn, all_peak_mem, all_cost = perf.search_max_micro_batch_size_fixed_gbs(
+    pp_size=perf.strategy.pp_size,
+    dp_size=perf.strategy.dp_size,
+    global_batch_size=32,
+    gmi_error=10,
+    use_reserved_memory=True,
+    save_all=False,
+    verbose=False,
+)
+```
+
+This is the best first search for most users, because it only changes batching
+and keeps the parallel strategy fixed.
+
+### Search a small parallel-strategy space
+
+```python
+all_search_result = {}
+best_strategy = perf.search_best_parallel_strategy(
+    world_size=8,
+    gmi_error=10,
+    micro_batch_size=1,
+    global_batch_size=32,
+    all_search_result=all_search_result,
+    tp_search_list=[1, 2],
+    ep_search_list=[1],
+    pp_search_list=[2],
+    recompute_search_type=["no_recompute"],
+    use_reserved_memory=True,
+    dump_path=None,
+    verbose=False,
+)
+```
+
+`gmi_error` is a simple per-rank memory safety margin in GiB. Use it to leave
+room for NCCL buffers, allocator/runtime overhead, and other components that
+are not modeled explicitly in the strategy search. For a first search on a new
+machine, `10` is a reasonable conservative starting point.
+
+Recommended practice:
+
+- start from the nearest shipped strategy
+- keep `ep=1` for dense models
+- search a small legal space first
+- expand recompute or VPP only after the basic search is stable

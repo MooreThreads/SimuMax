@@ -2,7 +2,7 @@
 import os
 import time
 from dataclasses import dataclass, asdict, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from collections import OrderedDict
 import json
 import copy
@@ -16,7 +16,10 @@ capture_graph_only = False
 ENABLE_SIMU_GRAPH = int(os.environ.get("ENABLE_SIMU_GRAPH", "0"))
 SIMU_CHECK = int(os.environ.get("SIMU_CHECK", "0"))
 SIMU_DEBUG = int(os.environ.get('SIMU_DEBUG', '0'))
-if SIMU_CHECK:
+SIMU_TMP_PATH_OVERRIDE = os.environ.get("SIMUMAX_TMP_PATH", "").strip()
+if SIMU_TMP_PATH_OVERRIDE:
+    TMP_PATH = SIMU_TMP_PATH_OVERRIDE
+elif SIMU_CHECK:
     TMP_PATH = "tmp_check"
 else:
     TMP_PATH = "tmp" + time.strftime("_%Y%m%d_%H%M%S", time.localtime())
@@ -39,11 +42,11 @@ def get_capture_graph_only():
 
 class ParameterExtractor:
     def __init__(self, param_patterns: Dict[str, Any]):
-        # 定义参数模式及其默认值
+        # Parameter patterns and default values.
         self.param_patterns = param_patterns
     
     def extract_parameters(self, input_string):
-        """从字符串中提取所有参数，缺失的使用默认值"""
+        """Extract all configured parameters from input string."""
         parameters = {}
         
         for param_name, (pattern, default_value) in self.param_patterns.items():
@@ -52,14 +55,14 @@ class ParameterExtractor:
                 parameters[param_name] = int(match.group(1))
             elif default_value is not None:
                 parameters[param_name] = default_value
-                print(f"警告: 未找到参数 {param_name}, 使用默认值 {default_value}")
+                print(f"Warning: parameter {param_name} not found, use default {default_value}")
 
         return parameters
     
     def extract_single_parameter(self, input_string, param_name, default_value=None):
-        """提取单个参数"""
+        """Extract a single parameter by name."""
         if param_name not in self.param_patterns:
-            raise ValueError(f"未知参数: {param_name}")
+            raise ValueError(f"Unknown parameter: {param_name}")
         
         pattern, default = self.param_patterns[param_name]
         if default_value is not None:
@@ -69,7 +72,7 @@ class ParameterExtractor:
         if match:
             return int(match.group(1))
         else:
-            print(f"警告: 未找到参数 {param_name}, 使用默认值 {default}")
+            print(f"Warning: parameter {param_name} not found, use default {default}")
             return default
 @dataclass
 class Config:
@@ -82,6 +85,20 @@ class Config:
         Serializes this instance to a Python dictionary.
         Automatically includes properties and fields.
         """
+        def _normalize_jsonable(value):
+            if isinstance(value, dict):
+                return {
+                    key: _normalize_jsonable(val)
+                    for key, val in value.items()
+                }
+            if isinstance(value, list):
+                return [_normalize_jsonable(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(_normalize_jsonable(item) for item in value)
+            if isinstance(value, set):
+                return [_normalize_jsonable(item) for item in sorted(value)]
+            return value
+
         # Start with the regular dataclass fields
         output = asdict(self)
 
@@ -89,9 +106,9 @@ class Config:
         for attr_name in dir(self):
             attr_value = getattr(self.__class__, attr_name, None)
             if isinstance(attr_value, property):
-                output[attr_name] = getattr(self, attr_name)
+                output[attr_name] = _normalize_jsonable(getattr(self, attr_name))
 
-        return output
+        return _normalize_jsonable(output)
 
     def sanity_check(self) -> None:
         # Implement basic sanity checks here
@@ -150,8 +167,20 @@ class AttentionRecomputeConfig(Config):
 
     out_recompute:bool = False
 
+    megatron_layernorm: bool = False
+    megatron_mla_up_proj: bool = False
+
     def set_all_status(self, status:bool):
-        self.__dict__.update({k:status for k in self.__dict__.keys()})
+        self.input_layernorm_recompute = status
+        self.q_down_recompute = status
+        self.kv_down_recompute = status
+        self.q_up_recompute = status
+        self.kv_up_recompute = status
+        self.q_layernorm_recompute = status
+        self.kv_layernorm_recompute = status
+        self.rope_recompute = status
+        self.core_attn_recompute = status
+        self.out_recompute = status
 
     @property
     def is_recompute_all(self):
@@ -164,6 +193,11 @@ class MLPRecomputeConfig(Config):
     linear_recompute:bool = False # Noraml MLP and grouped MLP
     router_recompute:bool = False
     permutation_recompute:bool = False
+
+    megatron_layernorm: bool = False
+    megatron_mlp: bool = False
+    megatron_moe: bool = False
+    megatron_moe_act: bool = False
     
     @property
     def is_recompute_all(self):
@@ -186,9 +220,13 @@ class StrategyConfig(Config):
     # dist strategy
     world_size: Optional[int] = 8
     tp_size: int = 1
+    cp_size: int = 1
     pp_size: int = 1
     ep_size: int = 1
     etp_size: int = 1
+    cp_comm_type: str = "a2a"
+    cp_a2a_mode: str = "async_cp"
+    order_of_paralielism: str = "tp-cp-ep-dp-pp"
     moe_dispatcher_policy: str = "all2all"
     num_layers_in_first_pipeline_stage: Optional[int] = None
     num_layers_in_last_pipeline_stage: Optional[int] = None
@@ -207,6 +245,9 @@ class StrategyConfig(Config):
 
     enable_sequence_parallel: bool = True
     interleaving_size: int = 1
+    microbatch_group_size_per_vp_stage: Optional[int] = None
+    pp_comm_async: bool = True
+    enable_straggler_model: bool = True
     zero_state: int = 1
 
     attention_sparse_ratio: float = (
@@ -221,6 +262,8 @@ class StrategyConfig(Config):
     recompute_granularity: Optional[str] = None
     recompute_layer_num: int = 0
     recompute_variance: bool = False
+    megatron_recompute: bool = False
+    megatron_recompute_modules: Optional[List[str]] = None
 
     # fused kernel
     use_flash_sdp: bool = True
@@ -228,10 +271,22 @@ class StrategyConfig(Config):
     use_fused_norm: bool = True
     use_fused_swiglu: bool = True
     use_fused_grad_accumulation: bool = True
+    cross_entropy_loss_fusion: bool = False
+    overlap_grad_reduce: bool = True
+
+    # TE release audit:
+    # - regular linear starts using get_dummy_wgrad in release_v2.3
+    # - CP A2A attention starts saving pre-PostA2A O in release_v2.8
+    # - grouped linear starts using get_dummy_wgrad in release_v2.10
+    te_version: Optional[str] = None
+    te_dummy_wgrad_min_version: str = "2.3.0"
+    te_cp_a2a_save_pre_posta2a_min_version: str = "2.8.0"
+    te_grouped_linear_dummy_wgrad_min_version: str = "2.10.0"
 
     # network strategy
     # TODO: auto choose network strategy
     tp_net: Optional[str] = "auto"
+    cp_net: Optional[str] = "auto"
     pp_net: Optional[str] = "auto"
     dp_net: Optional[str] = "auto"
     ep_net: Optional[str] = "auto"
@@ -250,13 +305,25 @@ class StrategyConfig(Config):
             "sdp_only",
             "selective_recompute"
         ]
+    valid_megatron_recompute_modules = [
+        "core_attn",
+        "layernorm",
+        "mla_up_proj",
+        "moe_act",
+        "mlp",
+        "moe",
+    ]
+    valid_cp_a2a_modes = [
+        "async_cp",
+        "sync_cp",
+    ]
     
     @classmethod
     def init_from_format_strings(cls, strs):
         """
         Docstring for init_from_format_strings
         parse format like:
-        查找
+        find
         seq{self.seq_len}.mbs{self.micro_batch_size}.mbc{self.micro_batch_num}.gbs{self.global_batch_size} tp{self.tp_size}.ep{self.ep_size}.pp{self.pp_size}.dp{self.dp_size}.etp{self.etp_size}.edp{self.edp_size}, world_size:{self.world_size}
 
         :param cls: Description
@@ -268,8 +335,9 @@ class StrategyConfig(Config):
             'seq_len': (r'seq(\d+)', 4096),
             'micro_batch_size': (r'mbs(\d+)', 1),
             'micro_batch_num': (r'mbc(\d+)', 1),
-            'global_batch_size': (r'gbs(\d+)', 1),
+            'global_batch_size': (r'gbs(\d+)', 8),
             'tp_size': (r'tp(\d+)', 1),
+            'cp_size': (r'cp(\d+)', 1),
             'ep_size': (r'ep(\d+)', 1),
             'pp_size': (r'pp(\d+)', 1),
             'world_size': (r'world_size:(\d+)', 8)
@@ -283,7 +351,7 @@ class StrategyConfig(Config):
         
     @property
     def shard_size(self):
-        return self.pp_size * self.tp_size
+        return self.pp_size * self.tp_size * self.cp_size
 
     @property
     def dp_size(self):
@@ -301,34 +369,121 @@ class StrategyConfig(Config):
     
     @property
     def parallelism(self):
-        return f'seq{self.seq_len}.mbs{self.micro_batch_size}.mbc{self.micro_batch_num}.gbs{self.global_batch_size} tp{self.tp_size}.ep{self.ep_size}.pp{self.pp_size}.dp{self.dp_size}.etp{self.etp_size}.edp{self.edp_size}, world_size:{self.world_size}'
+        sp_tag = f'sp{self.tp_size}.' if self.enable_sequence_parallel else ''
+        return f'seq{self.seq_len}.mbs{self.micro_batch_size}.mbc{self.micro_batch_num}.gbs{self.global_batch_size} tp{self.tp_size}.{sp_tag}cp{self.cp_size}.ep{self.ep_size}.pp{self.pp_size}.dp{self.dp_size}.etp{self.etp_size}.edp{self.edp_size}, world_size:{self.world_size}'
+
+    @property
+    def megatron_recompute_module_set(self):
+        return set(self.megatron_recompute_modules or [])
+
+    @staticmethod
+    def _version_tuple(version: Optional[str]):
+        if not version:
+            return None
+        parts = re.findall(r"\d+", str(version))
+        if not parts:
+            return None
+        nums = [int(part) for part in parts[:3]]
+        while len(nums) < 3:
+            nums.append(0)
+        return tuple(nums)
+
+    @property
+    def te_dummy_wgrad_memory_enabled(self):
+        cur = self._version_tuple(self.te_version)
+        min_ver = self._version_tuple(self.te_dummy_wgrad_min_version)
+        if cur is None or min_ver is None:
+            return False
+        return cur >= min_ver
+
+    @property
+    def te_grouped_linear_dummy_wgrad_memory_enabled(self):
+        cur = self._version_tuple(self.te_version)
+        min_ver = self._version_tuple(self.te_grouped_linear_dummy_wgrad_min_version)
+        if cur is None or min_ver is None:
+            return False
+        return cur >= min_ver
+
+    @property
+    def te_cp_a2a_saves_pre_posta2a_output(self):
+        cur = self._version_tuple(self.te_version)
+        min_ver = self._version_tuple(self.te_cp_a2a_save_pre_posta2a_min_version)
+        if cur is None or min_ver is None:
+            return False
+        return cur >= min_ver
+
+    @property
+    def use_variance_tail_model(self):
+        return self.recompute_variance or (
+            self.is_megatron_selective_recompute
+            and bool(self.megatron_recompute_module_set & {"layernorm", "mla_up_proj", "moe_act"})
+        )
+
+    @property
+    def is_megatron_selective_recompute(self):
+        return (
+            self.enable_recompute
+            and self.recompute_layer_num > 0
+            and self.recompute_granularity == "selective_recompute"
+            and self.megatron_recompute
+            and bool(self.megatron_recompute_module_set)
+        )
     
     @property
     def is_recompute(self):
         is_full_recompute = self.recompute_layer_num > 0 and self.recompute_granularity == 'full_block'
+        is_partial_recompute = self.recompute_layer_num > 0 and self.recompute_granularity in ['attn_only', 'mlp_only', 'sdp_only']
         is_selective_recompute = self.recompute_layer_num > 0 and self.recompute_granularity == 'selective_recompute' and any([self.attn_recompute, self.mla_rms_recompute, self.mlp_recompute, self.mlp_rms_recompute])
-        return self.enable_recompute and (is_full_recompute or is_selective_recompute)
+        return self.enable_recompute and (
+            is_full_recompute
+            or is_partial_recompute
+            or is_selective_recompute
+            or self.is_megatron_selective_recompute
+        )
     
     @property
     def recompute_status(self):
         is_full_recompute = self.recompute_layer_num > 0 and self.recompute_granularity == 'full_block'
+        is_partial_recompute = self.recompute_layer_num > 0 and self.recompute_granularity in ['attn_only', 'mlp_only', 'sdp_only']
         is_selective_recompute = self.recompute_layer_num > 0 and self.recompute_granularity == 'selective_recompute' and any([self.attn_recompute, self.mla_rms_recompute, self.mlp_recompute, self.mlp_rms_recompute])
         if not self.is_recompute:
             return 'No Recompute'
         if is_full_recompute:
             return f"{self.recompute_granularity}, recompute_layer_num={self.recompute_layer_num}"
+        elif is_partial_recompute:
+            return f"{self.recompute_granularity}, recompute_layer_num={self.recompute_layer_num}"
+        elif self.is_megatron_selective_recompute:
+            modules = ",".join(sorted(self.megatron_recompute_module_set))
+            return (
+                f"{self.recompute_granularity}, recompute_layer_num={self.recompute_layer_num}, "
+                f"megatron_recompute=True, modules=[{modules}]"
+            )
         elif is_selective_recompute:
             return f'{self.recompute_granularity}, recompute_layer_num={self.recompute_layer_num}, attn={self.attn_recompute}, attn_rms={self.mla_rms_recompute}, mlp={self.mlp_recompute}, mlp_rms={self.mlp_rms_recompute}, recompute_variance={self.recompute_variance}'
         else:
             return 'Unknown Recompute Status'
     @property
     def net(self):
-        return f"pp_net={self.pp_net}, tp_net={self.tp_net}, dp_net={self.dp_net}, ep_net={self.ep_net}, etp_net={self.etp_net}"
+        return f"pp_net={self.pp_net}, tp_net={self.tp_net}, cp_net={self.cp_net}, dp_net={self.dp_net}, ep_net={self.ep_net}, etp_net={self.etp_net}"
     
     def parse_attention_recompute(self, layer_idx):
         if self.recompute_granularity is None or layer_idx >= self.recompute_layer_num:
             return AttentionRecomputeConfig()
         conf = AttentionRecomputeConfig()
+        if self.is_megatron_selective_recompute:
+            modules = self.megatron_recompute_module_set
+            conf.megatron_layernorm = "layernorm" in modules
+            conf.megatron_mla_up_proj = "mla_up_proj" in modules
+            conf.input_layernorm_recompute = conf.megatron_layernorm
+            conf.q_down_recompute = conf.megatron_layernorm
+            conf.kv_down_recompute = conf.megatron_layernorm
+            conf.q_up_recompute = conf.megatron_mla_up_proj
+            conf.kv_up_recompute = conf.megatron_mla_up_proj
+            conf.q_layernorm_recompute = conf.megatron_mla_up_proj
+            conf.kv_layernorm_recompute = conf.megatron_mla_up_proj
+            conf.rope_recompute = conf.megatron_mla_up_proj
+            conf.core_attn_recompute = conf.megatron_mla_up_proj
+            return conf
         if self.recompute_granularity == "full_block":
             conf.set_all_status(True)
         elif self.recompute_granularity == "attn_only":
@@ -342,7 +497,9 @@ class StrategyConfig(Config):
             conf.core_attn_recompute = True
             conf.out_recompute = True
         elif self.recompute_granularity == "sdp_only":
-            raise NotImplementedError("sdp_only is not implemented yet")
+            conf.core_attn_recompute = True
+        elif self.recompute_granularity == "mlp_only":
+            pass
 
         elif self.recompute_granularity == "selective_recompute":
             if self.mla_rms_recompute:
@@ -365,6 +522,23 @@ class StrategyConfig(Config):
     def parse_mlp_recompute(self, layer_idx):
         if self.recompute_granularity is None or layer_idx >= self.recompute_layer_num:
             return MLPRecomputeConfig()
+        if self.is_megatron_selective_recompute:
+            modules = self.megatron_recompute_module_set
+            megatron_moe = "moe" in modules
+            megatron_moe_act = "moe_act" in modules and not megatron_moe
+            megatron_mlp = "mlp" in modules
+            megatron_layernorm = "layernorm" in modules
+            return MLPRecomputeConfig(
+                pre_mlp_norm_recompute=megatron_layernorm,
+                shared_linear_recompute=False,
+                linear_recompute=False,
+                router_recompute=False,
+                permutation_recompute=False,
+                megatron_layernorm=megatron_layernorm,
+                megatron_mlp=megatron_mlp,
+                megatron_moe=megatron_moe,
+                megatron_moe_act=megatron_moe_act,
+            )
         
         if self.recompute_granularity == "full_block":
             pre_mlp_norm_recompute = True 
@@ -378,6 +552,12 @@ class StrategyConfig(Config):
             linear_recompute = False
             router_recompute = False
             permutation_recompute = False
+        elif self.recompute_granularity == "mlp_only":
+            pre_mlp_norm_recompute = True
+            shared_linear_recompute = True
+            linear_recompute = True
+            router_recompute = True
+            permutation_recompute = True
         elif self.recompute_granularity == "selective_recompute":
             pre_mlp_norm_recompute = self.mlp_rms_recompute # normalization before mlp, after attention
             if self.mlp_rms_recompute:
@@ -410,32 +590,90 @@ class StrategyConfig(Config):
         return res
 
     def sanity_check(self):
+        if self.order_of_paralielism != "tp-cp-ep-dp-pp":
+            raise ValueError(f"Invalid order_of_paralielism, we only support tp-cp-ep-dp-pp now, but got {self.order_of_paralielism}")
+        assert self.cp_a2a_mode in self.valid_cp_a2a_modes, (
+            f"cp_a2a_mode {self.cp_a2a_mode} must be in [{','.join(self.valid_cp_a2a_modes)}]"
+        )
         if self.cache_groupgemm_col_fp8_inputs:
             assert self.fp8, "cache_groupgemm_col_fp8_inputs requires fp8"
             
         if self.offload_groupgemm_col_inputs:
             assert self.recompute_granularity != 'full_block', "offload_groupgemm_col_inputs is not allowed when recompute_granularity = 'full_block'"
 
+        assert self.seq_len % self.cp_size == 0, f"seq_len must be divisible by cp_size, but seq_len = {self.seq_len}, cp_size = {self.cp_size}"
         assert (
             self.world_size % self.shard_size == 0
-        ), f"world_size must be divisible by pp_size * tp_size, but world_size = {self.world_size}, pp_size = {self.pp_size}, tp_size = {self.tp_size}"
-        assert self.zero_state in [0, 1], "zero_state must be in [0, 1]"
+        ), f"world_size must be divisible by pp_size * tp_size * cp_szie, but world_size = {self.world_size}, pp_size = {self.pp_size}, tp_size = {self.tp_size}, cp_size={self.cp_size}"
+        assert self.zero_state in [0, 1, 2, 3], "zero_state must be in [0, 1, 2, 3]"
         assert self.recompute_granularity is None or self.recompute_granularity in self.valid_recompute_granularity, f"recompute_granularity {self.recompute_granularity} must be in [{','.join(self.valid_recompute_granularity)}]"
         assert self.recompute_layer_num >= 0
+        if not self.megatron_recompute:
+            assert not self.megatron_recompute_module_set, (
+                "megatron_recompute_modules requires megatron_recompute=True"
+            )
+        else:
+            assert self.enable_recompute, "megatron_recompute requires enable_recompute=True"
+            assert self.recompute_granularity == "selective_recompute", (
+                "megatron_recompute requires recompute_granularity='selective_recompute'"
+            )
+            assert self.recompute_layer_num > 0, (
+                "megatron_recompute requires recompute_layer_num > 0"
+            )
+            invalid_modules = self.megatron_recompute_module_set.difference(
+                self.valid_megatron_recompute_modules
+            )
+            assert not invalid_modules, (
+                f"invalid megatron_recompute_modules: {sorted(invalid_modules)}"
+            )
+            assert self.megatron_recompute_module_set, (
+                "megatron_recompute requires non-empty megatron_recompute_modules"
+            )
+            assert "core_attn" not in self.megatron_recompute_module_set, (
+                "megatron_recompute core_attn is not supported in SimuMax yet"
+            )
+            assert not any(
+                [
+                    self.attn_recompute,
+                    self.mla_rms_recompute,
+                    self.mlp_recompute,
+                    self.mlp_rms_recompute,
+                    self.recompute_variance,
+                ]
+            ), (
+                "megatron_recompute is mutually exclusive with legacy selective flags "
+                "and recompute_variance"
+            )
         assert (
             self.world_size % (self.ep_size * self.etp_size * self.pp_size) == 0
         ), f"world_size must be divisible by ep_size * etp_size * pp_size, but world_size = {self.world_size}, ep_size = {self.ep_size}, etp_size = {self.etp_size}, pp_size = {self.pp_size}"
-        assert (
-            self.dp_size % self.ep_size == 0
-        ), f"dp_size {self.dp_size} is not divisible by ep_size {self.ep_size}"
-
         assert self.moe_dispatcher_policy in [
             "all2all",
             "all2all-seq",
-        ], "moe_dispatcher_policy must be in ['all2all', 'all2all-seq']"
-        if self.interleaving_size == 1:
+        ], "moe_dispatcher_policy must be 'all2all' (legacy alias 'all2all-seq' is accepted with warning)"
+        if self.moe_dispatcher_policy == "all2all-seq":
             warnings.warn(
-                "interleaving_size is not supported yet, the configuration will be ignored."
+                "moe_dispatcher_policy='all2all-seq' is no longer supported. "
+                "Falling back to 'all2all'."
+            )
+            self.moe_dispatcher_policy = "all2all"
+        assert self.interleaving_size >= 1, "interleaving_size must be >= 1"
+        if self.interleaving_size > 1:
+            assert self.pp_size > 1, "interleaving_size > 1 requires pp_size > 1"
+            assert self.pp_comm_async or self.pp_size > 2, (
+                "When interleaved schedule is used and p2p communication overlap is disabled, "
+                "pipeline-model-parallel size should be greater than 2 to avoid having multiple "
+                "p2p sends and recvs between same 2 ranks per communication batch"
+            )
+            if self.microbatch_group_size_per_vp_stage is None:
+                self.microbatch_group_size_per_vp_stage = self.pp_size
+            assert self.microbatch_group_size_per_vp_stage >= self.pp_size, (
+                "microbatch_group_size_per_vp_stage must be >= pp_size "
+                f"(got {self.microbatch_group_size_per_vp_stage} < {self.pp_size})"
+            )
+            warnings.warn(
+                "interleaving_size is enabled. VPP-aware timing/simulation paths are active; "
+                "validate target configs with smoke/probe cases when introducing new schedules."
             )
         if self.enable_dropout:
             warnings.warn(
@@ -443,10 +681,6 @@ class StrategyConfig(Config):
             )
         if self.enable_recompute:
             warnings.warn("Recompute is currently in experimental feature.")
-        if self.moe_dispatcher_policy == "all2all-seq":
-            assert (
-                self.etp_size == self.tp_size
-            ), "etp_size must be equal to tp_size when using all2all-seq"
         if self.zero_state in [2, 3]:
             warnings.warn(
                 "zero_state 2 and 3 are not supported yet, the configuration will be ignored."
@@ -463,7 +697,8 @@ class BandwidthConfig:
     gbps: int
     efficient_factor: int
     latency_us: int
-    fixed_latency:int = 0
+    fixed_latency: float = 0
+    fixed_latency_us_by_comm_num: Dict[str, float] = None
 
 
 @dataclass
@@ -495,6 +730,8 @@ class NetOpConfig:
     offset: float
     efficient_factor: float = None
     latency_us: float = None
+    fixed_latency_us: float = None
+    fixed_latency_us_by_comm_num: Dict[str, float] = None
     dp_fixed_bw: float = None
 
 
@@ -513,7 +750,7 @@ class SystemConfig(Config):
     num_per_node: int = 8
     accelerator: AcceleratorConfig = None
     networks: Dict[str, NetworkConfig] = None
-    real_comm_bw = {}
+    real_comm_bw: dict = field(default_factory=OrderedDict)
     FC8: bool = False
     intra_with_pcie: bool = False
     miss_efficiency: dict = field(default_factory=OrderedDict)
@@ -552,17 +789,18 @@ class SystemConfig(Config):
             intra_with_pcie = intra_with_pcie,
         )
     
-    def record_miss_efficiency(self, op_name:str, flops:int, shape_desc:str):
+    def record_miss_efficiency(self, op_name:str, flops:int, shape_desc:str, use_eff):
         if shape_desc:
             if op_name not in self.miss_efficiency:
                 self.miss_efficiency[op_name] = {}
             self.miss_efficiency[op_name][f'shape={shape_desc}'] = {
-                'flops': flops
+                'flops': flops,
+                'use_eff': use_eff
             }
-    def record_net_bw(self, op_name:str, net, comm_num, comm_stage:str, bw, eff_factor, latency):
+    def record_net_bw(self, op_name:str, net, comm_num, comm_stage:str, base_bw, real_bw, eff_factor, total_time, comm_size, latency):
         if op_name not in self.real_comm_bw:
             self.real_comm_bw[op_name] = {}
-        self.real_comm_bw[op_name][comm_stage.lower()] = {"net":net, "bw":f"{bw*eff_factor} GB/S", "eff_factor":eff_factor, "comm_num":comm_num, "latency": latency, "FC8":self.FC8} 
+        self.real_comm_bw[op_name][comm_stage.lower()] = {"net":net, "base_bw":base_bw, "real_bw":real_bw, "eff_factor":eff_factor, "comm_num":comm_num, "comm_size":comm_size, "total_time":total_time, "latency": latency, "FC8":self.FC8} 
 
     def record_hit_efficiency(self, op_name:str, flops:int, shape_desc:str, eff):
         if op_name not in self.hit_efficiency:
@@ -597,7 +835,7 @@ class SystemConfig(Config):
             )
             op = self.accelerator.op.get("default", None)
             assert op is not None, f"default not exist on {self.accelerator.op}"
-            self.record_miss_efficiency(op_name, flops, shape_desc)
+            self.record_miss_efficiency(op_name, flops, shape_desc, None)
 
         if ( op.accurate_efficient_factor is not None ) and \
         (op.accurate_efficient_factor.get(shape_desc, None) is not None):
@@ -608,7 +846,7 @@ class SystemConfig(Config):
                 print(f"=== \033[32m{op_name} input shape {shape_desc} use accurate compute efficient factor {efficient_factor}\033[0m, flops={flops}")
         else:
             efficient_factor = op.efficient_factor
-            self.record_miss_efficiency(op_name, flops, shape_desc)
+            self.record_miss_efficiency(op_name, flops, shape_desc, efficient_factor)
 
             if SIMU_DEBUG:
                 print(f"{op_name} input shape {shape_desc} use default compute efficient factor {efficient_factor}, flops={flops}")
@@ -654,16 +892,23 @@ class SystemConfig(Config):
                             io_time = time)
         return time
 
+    @staticmethod
+    def _lookup_comm_num_value(values: Dict[str, Any], comm_num: int, default=None):
+        if not values:
+            return default
+        for key in (str(comm_num), comm_num):
+            if key in values:
+                return values[key]
+        return default
+
     def compute_net_op_time(self, op_name: str, size: int, comm_num: int, net="", comm_stage="unkonw", strategy:StrategyConfig=None):
         """
         compute network operation time,
         return time in ms
         """
         # Using ring alg for now
-        assert op_name in kNetOp, f"{op_name} not exist on {self.kNetOp}"
+        assert op_name in kNetOp, f"{op_name} not exist on {kNetOp}"
         net_data = self.networks.get(net, None)
-
-        fixed_latency = net_data.bandwidth.fixed_latency
         assert net_data is not None, f"{net} not exist on {self.networks.keys()}, op_name={op_name}"
         op:NetOpConfig = net_data.op.get(op_name, None)  # 0: scale 1: offset 2: efficient_factor
         assert op is not None, f"{op_name} not exist on {net_data}"
@@ -676,8 +921,13 @@ class SystemConfig(Config):
         chunk_size = actual_size / comm_num
         actual_size += chunk_size * offset
 
-        # Specially adapted to the dp communication bandwidth of A100 pcie
-        if 'pcie' in net and comm_stage == 'dp' and op.dp_fixed_bw and op.dp_fixed_bw.get(str(comm_num), None):
+        # Specially adapted to the dense-dp-family communication bandwidth of
+        # A100 PCIe. `dp_cp` is Megatron's dense optimizer/data-parallel group
+        # with context parallel folded in, so it should reuse the same dense-DP
+        # bandwidth family here.
+        is_dense_dp_stage = comm_stage in {"dp", "dp_cp"}
+
+        if 'pcie' in net and is_dense_dp_stage and op.dp_fixed_bw and op.dp_fixed_bw.get(str(comm_num), None):
             dp_fixed_bw = op.dp_fixed_bw.get(str(comm_num))
             self.real_comm_bw[op_name + "_dp"] = {"net":net, "bw":f"{dp_fixed_bw} GB/S", "comm_num":comm_num, "latency": None} 
             return actual_size / (dp_fixed_bw * 1024**3)  * 1000
@@ -688,22 +938,74 @@ class SystemConfig(Config):
             bw *= (comm_num-1)/7
 
         # Inter Bandwidth decision
-        if net == "inter_node" and strategy is not None:
-            if comm_stage == "dp":
-                # EP1, each EDP group uses 8 IBs
-                # EP2, each EDP group uses 4 IBs, ...
-                bw /= min(8, strategy.tp_size)
-            elif comm_stage == "edp":
-                # TP1, each DP group uses 8 IBs
-                # TP2, each DP group uses 4 IBs, ...
-                bw /= min(8, strategy.ep_size*strategy.etp_size)
+        if net == "inter_node":
+            # 1. pp
+            if op_name == "p2p":
+                bw /= self.num_per_node
+                
+            # 2. ep & a2a cp
+            if op_name == "all2all":
+                if "ep" in comm_stage.lower():
+                    # Only consider the case where ep is an integer multiple of num_per_node
+                    # K machines cross ep, the total communication size = (k-1)/k *actual_size, 1 piece of data is sent to the self. 
+                    # At the same time, cross-machine a2a will use one network card, so the bw is the bw of the single network card
+                    
+                    # decision comm_size
+                    k = max(1, math.ceil(comm_num / self.num_per_node))
+                    actual_size = (k-1)/k * actual_size
+                    
+                    # decision bw
+                    bw /= self.num_per_node # bw of the single network card 
+                elif "cp" in comm_stage.lower(): 
+                    # Similar to ep all2all: when cp spans multiple nodes, only cross-node
+                    # traffic contributes to inter-node transfer and each group is limited by one NIC.
+                    k = max(1, math.ceil(comm_num / self.num_per_node))
+                    actual_size = (k - 1) / k * actual_size
+                    bw /= self.num_per_node
+            
+            # 3. tp+sp & ag cp & dp
+            if op_name in ["all_reduce", "all_gather", "reduce_scatter"]:
+                if strategy is not None: 
+                    if is_dense_dp_stage:
+                        # zero0: all_reduce 
+                        # zero1: reduce_scatter & all_gather
+                        # num_per_node = 8
+                        # TP1, each DP group uses all 8 IBs
+                        # TP2, each DP group uses 4 IBs, ...
+                        #
+                        # Distinguish two semantics:
+                        # - `dp_cp`: dense optimizer group with CP folded into
+                        #   the group itself, so per-node group multiplicity is
+                        #   still driven by TP only.
+                        # - `dp`: pure dense DP group. If CP is present, each
+                        #   `(tp, cp)` slice owns its own DP group, so the
+                        #   inter-node contention factor grows with `tp * cp`.
+                        dense_group_multiplicity = strategy.tp_size
+                        if comm_stage == "dp":
+                            dense_group_multiplicity *= strategy.cp_size
+                        bw /= min(self.num_per_node, dense_group_multiplicity)
+                    elif comm_stage == "edp":
+                        # Same as dp
+                        bw /= min(self.num_per_node, strategy.ep_size*strategy.etp_size)
                     
 
-        latency = op.latency_us if op.latency_us is not None else net_data.bandwidth.latency_us # Default latency
+        base_latency = op.latency_us if op.latency_us is not None else net_data.bandwidth.latency_us
+        fixed_latency = self._lookup_comm_num_value(
+            op.fixed_latency_us_by_comm_num,
+            comm_num,
+            op.fixed_latency_us,
+        )
+        if fixed_latency is None:
+            fixed_latency = self._lookup_comm_num_value(
+                net_data.bandwidth.fixed_latency_us_by_comm_num,
+                comm_num,
+                net_data.bandwidth.fixed_latency,
+            )
+        latency = base_latency
         if comm_num == 1:
             return 0
-        if op in ["all_reduce", "all_gather", "reduce_scatter", "all2all"]:
-            latency = net_data.bandwidth.latency_us * (comm_num + offset) * scale
+        if self.num_per_node == 8 and op_name in ["all_reduce", "all_gather", "reduce_scatter", "all2all"]:
+            latency = base_latency * (comm_num + offset) * scale
         time = (
             actual_size / (bw * 1024**3 * eff_factor) * 1e3
             + (latency+fixed_latency) / 1e3
@@ -711,7 +1013,7 @@ class SystemConfig(Config):
         if SIMU_DEBUG:
             if net == "high_intra_node" and op_name=="reduce_scatter":
                 print(f"op_name={op_name}, comm_num={comm_num}, net={net}, bw={bw*eff_factor} GB/S, latency={latency} us size={size}")
-        self.record_net_bw(op_name, net, comm_num, comm_stage, bw, eff_factor, latency)
+        self.record_net_bw(op_name, net, comm_num, comm_stage, net_data.bandwidth.gbps, bw*eff_factor, eff_factor, time*1e3, actual_size, latency)
         return time
 
     def compute_end2end_time(self, compute_time, mem_time):
@@ -791,7 +1093,8 @@ class ModelConfig(Config):
         Pad vocab size so it is divisible by model parallel size and
         still having GPU friendly size."""
         if self.padded_vocab_size:
-            self.orig_vocab_size = self.vocab_size
+            if self.orig_vocab_size is None:
+                self.orig_vocab_size = self.vocab_size
             multiple = self.make_vocab_size_divisible_by * tp_size
             after = int(math.ceil(self.orig_vocab_size / multiple) * multiple)
             if log:
@@ -801,7 +1104,11 @@ class ModelConfig(Config):
                     flush=True,
                 )
             self.vocab_size = after
-
+    
+    def set_vocab_size(self, vocab_size):
+        self.orig_vocab_size = vocab_size 
+        self.vocab_size = vocab_size
+        
     @property
     def param_numel(self):
         return (

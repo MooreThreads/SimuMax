@@ -6,3 +6,4 @@ pandas
 sympy
 tabulate
 graphviz
+streamlit

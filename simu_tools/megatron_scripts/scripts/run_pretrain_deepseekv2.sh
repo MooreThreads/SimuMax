@@ -7,6 +7,8 @@ MEGATRON_HOME=${MEGATRON_HOME:-"./"}
 EXAMPLE=${EXAMPLE:-"test"}
 HOSTFILE=${HOSTFILE:-"./hostfile"}
 DATA_DIR=${DATA_DIR:-"./"}
+CP_SIZE=${CP_SIZE:-1}
+CP_COMM_TYPE=${CP_COMM_TYPE:-a2a}
 TP_SIZE=${TP_SIZE:-1}
 PP_SIZE=${PP_SIZE:-1}
 EP_SIZE=${EP_SIZE:-1}
@@ -21,6 +23,10 @@ MODEL_TYPE=${MODEL_TYPE:-""}
 DTYPE=${DTYPE:-"bf16"}
 SCRIPT_FILE=${SCRIPT_FILE:-""}
 OUTPUT_DIR=${OUTPUT_DIR:-"./output_${MODEL_TYPE}"}
+VP_SIZE=${VP_SIZE:-1}
+EXTRA_ARGS=${EXTRA_ARGS:-""}
+SEQ_LEN=${SEQ_LEN:-4096}
+MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-$SEQ_LEN}
 set +u
 
 
@@ -37,17 +43,34 @@ if [ "${TEST_TYPE}" == "profile" ]; then
         --profile-step-end 6
         --use-pytorch-profiler
     )
-    TRAIN_ITERS=6
-    WARMUP_ITERS=1
+    TRAIN_ITERS=${TRAIN_ITERS:-6}
+    WARMUP_ITERS=${WARMUP_ITERS:-1}
 else
     PROFILE_ARGS=()
-    TRAIN_ITERS=10
-    WARMUP_ITERS=5
+    TRAIN_ITERS=${TRAIN_ITERS:-10}
+    WARMUP_ITERS=${WARMUP_ITERS:-5}
 fi
 
 export OMP_NUM_THREADS=4
 export CUDA_VISIBLE_DEVICES='0,1,2,3,4,5,6,7'
 export ACCELERATOR_BACKEND="cuda"
+if [ -x "/usr/local/cuda-13.1/bin/ptxas" ]; then
+    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda-13.1}
+    export TRITON_PTXAS_PATH=${TRITON_PTXAS_PATH:-/usr/local/cuda-13.1/bin/ptxas}
+    export PATH="/usr/local/cuda-13.1/bin:${PATH}"
+elif [ -x "/usr/local/cuda/bin/ptxas" ]; then
+    export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
+    export TRITON_PTXAS_PATH=${TRITON_PTXAS_PATH:-/usr/local/cuda/bin/ptxas}
+    export PATH="/usr/local/cuda/bin:${PATH}"
+fi
+
+# Triton's gcc launcher build does not automatically include CUDA headers.
+# Keep cuda.h discoverable for TE Triton CE and other launcher-side kernels.
+if [ -n "${CUDA_HOME:-}" ] && [ -d "${CUDA_HOME}/include" ]; then
+    export CPATH="${CUDA_HOME}/include${CPATH:+:${CPATH}}"
+    export C_INCLUDE_PATH="${CUDA_HOME}/include${C_INCLUDE_PATH:+:${C_INCLUDE_PATH}}"
+    export CPLUS_INCLUDE_PATH="${CUDA_HOME}/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+fi
 
 
 export MOE_ROUTER_GROUP_TOPK=${MOE_ROUTER_GROUP_TOPK:-3}
@@ -78,11 +101,20 @@ mkdir -p $TB_PATH
 # mkdir -p $WB_PATH
 
 
-export NODE_ADDR=$(ip a|grep inet|grep -v 127.0.0.1|grep -v inet6|awk '{print $2;}'|tr -d "addr:"|head -n1 | cut -d '/' -f1) # tail for cuda
+if command -v ip >/dev/null 2>&1; then
+    export NODE_ADDR=$(ip a|grep inet|grep -v 127.0.0.1|grep -v inet6|awk '{print $2;}'|tr -d "addr:"|head -n1 | cut -d '/' -f1) # tail for cuda
+else
+    export NODE_ADDR=$(hostname -I | awk '{print $1}')
+fi
 export GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 export NUM_NODES=$(cat $HOSTFILE | wc -l)
 export MASTER_ADDR=$(head -n1 $HOSTFILE | awk '{print $1;}')
-export NODE_RANK=$(awk -v node_addr="$NODE_ADDR" '{ranks[$1]=(FNR-1);} END {print ranks[node_addr];}' $HOSTFILE)
+if [ "$NUM_NODES" -eq 1 ] && { [ "$MASTER_ADDR" = "127.0.0.1" ] || [ "$MASTER_ADDR" = "localhost" ]; }; then
+    export NODE_ADDR=${MASTER_ADDR}
+    export NODE_RANK=0
+else
+    export NODE_RANK=$(awk -v node_addr="$NODE_ADDR" '{ranks[$1]=(FNR-1);} END {print ranks[node_addr];}' $HOSTFILE)
+fi
 export MASTER_PORT=${MASTER_PORT:-12356}
 
 LOG_DIR=${OUTPUT_DIR}/${DTYPE}_$EXAMPLE
@@ -143,8 +175,8 @@ MODEL_ARGS=(
     --num-layers ${NUM_LAYER}  # 60 ds 236b:ep8 pp16
     --hidden-size $HIDDEN_SIZE # dsv2 = 5120, v3=7168
     --num-attention-heads $HEAD_NUM  # dsv2/3=128, kimi-1T=64
-    --seq-length 4096
-    --max-position-embeddings 4096
+    --seq-length ${SEQ_LEN}
+    --max-position-embeddings ${MAX_POSITION_EMBEDDINGS}
     --norm-epsilon 1e-6
     --attention-dropout 0.0
     --hidden-dropout 0.0
@@ -246,6 +278,19 @@ MODEL_PARALLEL_ARGS=(
 	--pipeline-model-parallel-size $PP_SIZE
 )
 
+if [ "$CP_SIZE" -gt 1 ]; then
+    MODEL_PARALLEL_ARGS+=(
+        --context-parallel-size $CP_SIZE
+        --cp-comm-type $CP_COMM_TYPE
+    )
+fi
+
+if [ "$VP_SIZE" -gt 1 ]; then
+    MODEL_PARALLEL_ARGS+=(
+        --num-layers-per-virtual-pipeline-stage $(( NUM_LAYER / PP_SIZE / VP_SIZE ))
+    )
+fi
+
 MIXED_PRECISION_ARGS=(
     --bf16
     --attention-softmax-in-fp32
@@ -258,6 +303,7 @@ DATA_ARGS=(
     --tokenizer-type NullTokenizer
     # --tokenizer-model ${TOKENIZED_MODEL}
     --split 1
+    --no-create-attention-mask-in-dataloader
     #--dataloader-type mtepx  #default single
 )
 
@@ -298,7 +344,8 @@ cmd="torchrun ${DISTRIBUTED_ARGS[@]} ./pretrain_deepseekv2.py \
         ${MLA_ARGS[@]} \
         ${EVAL_AND_LOGGING_ARGS[@]} \
         ${TRANSFORMER_ENGINE_ARGS[@]} \
-        ${PROFILE_ARGS[@]}
+        ${PROFILE_ARGS[@]} \
+        ${EXTRA_ARGS}
     "
 
 USE_EPX=${USE_EPX:-0}

@@ -1,6 +1,6 @@
 {
     "model_type":"moe",
-    "model_name":"kimi",
+    "model_name":"kimi-1T",
     "attention_type": "mla",
     "hidden_size": 7168,
     "head_num": 64,

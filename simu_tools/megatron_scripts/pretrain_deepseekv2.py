@@ -169,10 +169,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """
     args = get_args()
 
-    losses = output_tensor.float()
+    losses = output_tensor.view(-1).float()
     loss_mask = loss_mask.view(-1).float()
-    total_tokens = loss_mask.sum()
-    loss = torch.cat([torch.sum(losses.view(-1) * loss_mask).view(1), total_tokens.view(1)])
+    loss = torch.sum(losses * loss_mask)
 
     if args.context_parallel_size > 1:
         torch.distributed.all_reduce(loss, group=mpu.get_context_parallel_group())
@@ -181,7 +180,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     rerun_state_machine = get_rerun_state_machine()
     if args.check_for_nan_in_loss_and_grad:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=loss,
             rejection_func=torch.isnan,
             message="found NaN in local forward loss calculation",
             tolerance=0.0,        # forward pass calculations are determinisic
@@ -190,23 +189,18 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     # Check for spiky loss
     if args.check_for_spiky_loss:
         rerun_state_machine.validate_result(
-            result=loss[0],
+            result=loss,
             rejection_func=partial(rerun_state_machine.is_spiky_loss, threshold=SPIKY_LOSS_PERC),
             message="Spiky loss",
             tolerance=0.0,        # forward pass calculations are determinisic
             fatal=False,
         )
-    # Reduce loss for logging.
-    reporting_loss = loss.clone().detach()
-    if not int(os.getenv("NO_LOSS_REDUCE", 0)): #TODO:(huang.huang) will influence the loss reported Now!
-        torch.distributed.all_reduce(reporting_loss, group=mpu.get_data_parallel_group())
-
-
-    local_num_tokens = loss[1].clone().detach().to(torch.int)
+    local_num_tokens = loss_mask.sum().clone().detach().to(torch.int)
+    reporting_loss = torch.cat([loss.clone().detach().view(1), local_num_tokens.view(1)])
     return (
-        loss[0] * args.context_parallel_size,
+        loss * args.context_parallel_size,
         local_num_tokens,
-        {'lm loss': (reporting_loss[0], reporting_loss[1])},
+        {'lm loss': reporting_loss},
     )
 
 

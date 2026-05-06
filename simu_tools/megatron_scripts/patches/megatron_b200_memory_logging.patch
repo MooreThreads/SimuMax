@@ -1,0 +1,52 @@
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 83626c6cb..6d883dd67 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -1341,6 +1341,13 @@ def training_log(
+     wandb_writer = get_wandb_writer()
+     one_logger = get_one_logger()
+     energy_monitor = get_energy_monitor()
++    report_memory_every_iter = os.getenv('MEGATRON_REPORT_MEMORY_EVERY_ITER', '').strip().lower() in (
++        '1',
++        'true',
++        'yes',
++        'on',
++    )
++    report_memory_min_iter = int(os.getenv('MEGATRON_REPORT_MEMORY_MIN_ITER', '1'))
+ 
+     # Advanced, skipped, and Nan iterations.
+     advanced_iters_key = 'advanced iterations'
+@@ -1580,9 +1587,12 @@ def training_log(
+         total_loss_dict[skipped_iters_key] = 0
+         total_loss_dict[nan_iters_key] = 0
+         print_rank_last(log_string)
+-        if report_memory_flag:
++        should_report_memory = (report_memory_flag and iteration >= report_memory_min_iter) or (
++            report_memory_every_iter and iteration >= report_memory_min_iter
++        )
++        if should_report_memory:
+             # Report memory after optimizer state has been initialized.
+-            if torch.distributed.get_rank() == 0:
++            if report_memory_flag and torch.distributed.get_rank() == 0:
+                 num_microbatches = get_num_microbatches()
+                 report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
+             report_memory(f'(after {iteration} iterations)')
+diff --git a/megatron/training/utils.py b/megatron/training/utils.py
+index a901b317e..5ce31ff46 100644
+--- a/megatron/training/utils.py
++++ b/megatron/training/utils.py
+@@ -268,7 +268,13 @@ def report_memory(name):
+     string += ' | max allocated: {}'.format(torch.cuda.max_memory_allocated() / mega_bytes)
+     string += ' | reserved: {}'.format(torch.cuda.memory_reserved() / mega_bytes)
+     string += ' | max reserved: {}'.format(torch.cuda.max_memory_reserved() / mega_bytes)
+-    if mpu.get_data_parallel_rank() == 0:
++    log_all_ranks = os.getenv('MEGATRON_LOG_MEMORY_ALL_RANKS', '').strip().lower() in (
++        '1',
++        'true',
++        'yes',
++        'on',
++    )
++    if log_all_ranks or mpu.get_data_parallel_rank() == 0:
+         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
+ 
+ 

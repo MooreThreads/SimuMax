@@ -5,8 +5,27 @@ import importlib.util
 spec = importlib.util.find_spec("simumax")
 root = os.path.dirname(spec.submodule_search_locations[0])
 
+def resolve_config_dir(config_dir):
+    """
+    Resolve config directory for both normal directories and symlink-pointer files.
+    On some Windows checkouts, git symlinks can become plain text files that store
+    a relative target path.
+    """
+    if os.path.isdir(config_dir):
+        return config_dir
+    if os.path.isfile(config_dir):
+        with open(config_dir, "r", encoding="utf-8") as f:
+            target = f.read().strip()
+        if target:
+            if not os.path.isabs(target):
+                target = os.path.normpath(os.path.join(os.path.dirname(config_dir), target))
+            if os.path.isdir(target):
+                return target
+    return config_dir
+
 def init_config_map(root):
     def get_config_files(config_dir):
+        config_dir = resolve_config_dir(config_dir)
         config_files = {}
         for root, dirs, files in os.walk(config_dir):
             for file in files:
@@ -24,7 +43,7 @@ def init_config_map(root):
     return models, strategy, systems
 
 RELEASE_MODELS, RELEASE_STRATEGY, RELEASE_SYSTEM = init_config_map(os.path.join(root, 'configs'))
-DEV_MODELS, DEV_STRATEGY, DEV_SYSTEM = init_config_map(os.path.join(root, 'develop/configs'))
+DEV_MODELS, DEV_STRATEGY, DEV_SYSTEM = init_config_map(os.path.join(root, 'develop', 'configs'))
 
 def get_config(key, version, r_maps:dict, d_maps:dict, m_type):
     if version == 'release':
