@@ -107,6 +107,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-fit", action="store_true")
     parser.add_argument("--skip-fixed-latency", action="store_true")
     parser.add_argument("--skip-ceperm", action="store_true")
+    parser.add_argument(
+        "--allow-partial-comm-fit",
+        action="store_true",
+        help="Allow writing a system config when only a subset of NCCL communication fits succeed.",
+    )
     return parser.parse_args()
 
 
@@ -131,6 +136,24 @@ def apply_ceperm_recommendations(system_path: Path, summary_path: Path) -> None:
         bw[key]["efficient_factor"] = float(recommended[key])
 
     system_path.write_text(json.dumps(system, indent=4), encoding="utf-8")
+
+
+def refresh_run_dir_final_artifact(
+    *,
+    summary_path: Path,
+    system_path: Path,
+    ceperm_summary_path: Path | None = None,
+) -> None:
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    final_system = Path(summary["final_system_json"])
+    shutil.copyfile(system_path, final_system)
+    if ceperm_summary_path is not None:
+        summary.setdefault("steps", {})["ceperm"] = {
+            "ok": True,
+            "summary_json": str(ceperm_summary_path),
+        }
+    summary["final_system_json"] = str(final_system)
+    dump_json(summary_path, summary)
 
 
 def apply_comm_generation(system_path: Path, args: argparse.Namespace) -> Path:
@@ -213,6 +236,15 @@ def apply_comm_generation(system_path: Path, args: argparse.Namespace) -> Path:
             fit_results[op_name] = fit
         summary["steps"]["fit"] = fit_results
         summary["steps"]["fit_failed_ops"] = failed
+        if failed and not args.allow_partial_comm_fit:
+            summary_path = run_dir / "summary.json"
+            dump_json(summary_path, summary)
+            failed_ops = ", ".join(sorted(failed))
+            raise RuntimeError(
+                f"communication fit failed for op(s): {failed_ops}. "
+                f"Summary written to {summary_path}. "
+                "Use --allow-partial-comm-fit only if you intentionally want a mixed old/new network config."
+            )
         update_system_network_from_fit(
             system_json_path=system_path,
             fit_result=fit_results,
@@ -392,6 +424,12 @@ def main() -> None:
         env["PYTHONPATH"] = f"{REPO_ROOT}:{env.get('PYTHONPATH', '')}"
         subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, check=True)
         apply_ceperm_recommendations(output_system, ceperm_output)
+        if comm_summary is not None:
+            refresh_run_dir_final_artifact(
+                summary_path=comm_summary,
+                system_path=output_system,
+                ceperm_summary_path=ceperm_output,
+            )
 
     print(output_system)
     if comm_summary is not None:
