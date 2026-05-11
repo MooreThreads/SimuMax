@@ -79,11 +79,16 @@ fi
 
 if [[ "${apply_fake_pp_patch}" == "1" ]]; then
   printf '\n== Applying fake-PP warmup patch ==\n'
-  if patch --dry-run -p1 -d "${megatron_home}" < "${patch_file}" >/dev/null 2>&1; then
+  fake_pp_marker="MEGATRON_FAKE_PP_SIZE_FOR_WARMUP"
+  fake_pp_target="${megatron_home}/megatron/core/pipeline_parallel/schedules.py"
+  if grep -q "${fake_pp_marker}" "${fake_pp_target}"; then
+    printf 'Already applied: %s\n' "${patch_file}"
+  elif patch --dry-run -p1 -d "${megatron_home}" < "${patch_file}" >/dev/null 2>&1; then
     patch --quiet -p1 -d "${megatron_home}" < "${patch_file}"
     printf 'Applied: %s\n' "${patch_file}"
   else
-    printf 'Patch already applied or not cleanly applicable: %s\n' "${patch_file}"
+    printf 'Patch is not cleanly applicable and marker was not found: %s\n' "${patch_file}" >&2
+    exit 1
   fi
 else
   printf '\n== Fake-PP patch ==\n'

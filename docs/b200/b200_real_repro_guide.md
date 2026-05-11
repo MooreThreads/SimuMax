@@ -245,6 +245,11 @@ Notes:
   - it regenerates compute efficiency with the public B200 shape sweep
   - it runs NCCL communication fitting and fixed-latency calibration by default
   - it then applies the B200 CE/permute supplement
+  - because the public B200 sweep includes DeepSeek/MLA FA shapes, the compute
+    efficiency step needs a compatible Megatron-LM checkout for Megatron
+    `TEDotProductAttention`; use the default
+    `simu_tools/megatron_scripts/Megatron-LM` location or pass
+    `--megatron-root`
   - by default the supplement is TE-only and refreshes `ce_fusion`,
     `permute_fwd`, and `permute_bwd`; use `--measure-nonfusion-ce` to also
     refresh Megatron nonfusion `ce`

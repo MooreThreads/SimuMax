@@ -79,7 +79,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--megatron-root",
         default="",
-        help="Megatron-LM checkout used only with --measure-nonfusion-ce.",
+        help=(
+            "Optional Megatron-LM checkout for compute-efficiency FA/MLA coverage. "
+            "Also used for Megatron nonfusion CE when --measure-nonfusion-ce is set."
+        ),
     )
     parser.add_argument("--device-bw-gbps", type=float, default=None, help="Nominal intra-node link bandwidth for communication efficient_factor fit. If unset, infer from GPU model.")
     parser.add_argument("--nccl-bin-dir", default="", help="Directory containing nccl-tests binaries; empty means use PATH.")
@@ -386,6 +389,7 @@ def main() -> None:
             ],
             compute_cache_mode=args.compute_cache_mode,
             compute_cache_tag=(args.compute_cache_tag or None),
+            megatron_root=(args.megatron_root or None),
             python_exe=args.python_exe,
         )
     else:

@@ -49,6 +49,13 @@ nonfusion `ce` value. Use `--skip-comm`, `--skip-fit`, or
 `--skip-fixed-latency` only when you intentionally want to reuse existing
 communication values.
 
+FlashAttention efficiency has one extra dependency boundary: TransformerEngine
+can cover regular attention shapes directly, but MLA shapes with different
+`qk_head_dim` and `v_head_dim` need Megatron's `TEDotProductAttention` wrapper.
+For B200 sweeps that include DeepSeek/MLA shapes, put a compatible
+Megatron-LM checkout at `simu_tools/megatron_scripts/Megatron-LM`, or pass it
+explicitly with `--megatron-root`.
+
 See the schema description in [docs/system.md](../../docs/system.md).
 
 ## Before you run anything
@@ -65,6 +72,7 @@ Pre-run checklist:
 - use a Python environment where SimuMax dependencies are already installed
 - make sure `torch` can see the target accelerator (`cuda` or `musa`)
 - make sure the runtime required by `transformer_engine`, `flash_attn`, and your accelerator backend is available
+- if the FA sweep includes MLA shapes, make sure a compatible Megatron-LM checkout is available
 - for communication fitting, also prepare `nccl-tests` or an equivalent backend tool
 
 ## Step 1: measure operator efficiency
