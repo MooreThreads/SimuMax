@@ -6,7 +6,6 @@ from collections import OrderedDict
 import torch
 import transformer_engine as te
 import transformer_engine_torch as tex
-from transformer_engine.pytorch.module.base import get_multi_stream_cublas_workspace
 from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
 from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
 try:
@@ -54,9 +53,9 @@ def run_te_grouped_gemm(A, B, out, m_splits, layout, grad,accumulate, use_split_
             A,
             B,
             out,
+            quantization_params=[None] * len(A),
             layout = layout,
             out_dtype = out[0].dtype,
-            workspaces=get_multi_stream_cublas_workspace(),
             m_splits=m_splits,
             D_dtype = None,
             use_bias=False,

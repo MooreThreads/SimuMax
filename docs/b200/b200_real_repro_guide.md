@@ -243,13 +243,17 @@ Notes:
 - `tools/b200/build_current_machine_system_config.py` is the public B200
   system-config generation helper:
   - it regenerates compute efficiency with the public B200 shape sweep
+  - it runs NCCL communication fitting and fixed-latency calibration by default
   - it then applies the B200 CE/permute supplement
+  - by default the supplement is TE-only and refreshes `ce_fusion`,
+    `permute_fwd`, and `permute_bwd`; use `--measure-nonfusion-ce` to also
+    refresh Megatron nonfusion `ce`
 
 Important:
-- the canonical `ceperm` config is not produced by one-click alone;
-- it should be understood as:
-  - one-click base config generation
-  - plus CE/permute efficiency supplementation
+- the canonical `ceperm` config is produced by the B200 helper as:
+  - one-click compute-efficiency generation
+  - plus NCCL communication fitting and fixed-latency calibration
+  - plus TE-only CE/permute efficiency supplementation by default
 
 ## 6. Memory Measurement Contract
 

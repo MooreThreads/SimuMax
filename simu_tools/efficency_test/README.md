@@ -23,8 +23,9 @@ For the retained public B200 path, there is also a dedicated wrapper:
 
 - `tools/b200/build_current_machine_system_config.py`
 
-That helper uses this efficiency directory and keeps the B200 shape sweep and
-CE/permute supplementation aligned.
+That helper uses this efficiency directory and keeps the B200 shape sweep,
+NCCL communication fitting, fixed-latency calibration, and CE/permute
+supplementation aligned.
 
 SimuMax timing quality depends on two inputs from the machine side:
 
@@ -39,6 +40,14 @@ Generating a SimuMax-ready `system.json` usually has two steps:
 
 1. Measure operator efficiency for the target shapes.
 2. Fit communication bandwidth / latency and write them into the system file.
+
+The B200 wrapper runs both steps by default, then applies the CE/permute
+supplement. The CE/permute supplement is TE-only by default: it refreshes
+`ce_fusion`, `permute_fwd`, and `permute_bwd` without requiring Megatron-LM.
+Use `--measure-nonfusion-ce` only when you also want to refresh Megatron's
+nonfusion `ce` value. Use `--skip-comm`, `--skip-fit`, or
+`--skip-fixed-latency` only when you intentionally want to reuse existing
+communication values.
 
 See the schema description in [docs/system.md](../../docs/system.md).
 
@@ -76,7 +85,7 @@ pip install -e .
 or:
 
 ```bash
-PYTHONPATH=/path/to/SimuMax_dev python test_gemm_efficiency.py
+PYTHONPATH=/path/to/SimuMax python test_gemm_efficiency.py
 ```
 
 The main scripts are:
