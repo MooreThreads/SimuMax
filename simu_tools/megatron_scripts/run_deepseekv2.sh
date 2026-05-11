@@ -33,7 +33,6 @@ set -u
   patch_home=""
   megatron_home="./Megatron-LM"
   example="tp${tp_size}_cp${cp_size}_pp${pp_size}_dp${dp_size}_mbs${micro_batch_size}_mbc${num_microbatches}_gbs${global_batch_size}_gpus${world_size}"
-  data_path=${data_path:-"/home/dist/yehua/llama2_dataset/llama_00_text_document"}
   hostfile=./hostfile
   log_file=${output_dir}/$example.log
   script_file=./scripts/run_pretrain_deepseekv2.sh

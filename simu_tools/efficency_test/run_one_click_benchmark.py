@@ -49,6 +49,14 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional suffix for compute cache namespace. In rebuild mode, if omitted, a timestamped tag is generated automatically.",
     )
+    parser.add_argument(
+        "--megatron-root",
+        default="",
+        help=(
+            "Optional Megatron-LM checkout for FA shapes that require Megatron TE "
+            "coverage, for example MLA where qk_head_dim != v_head_dim."
+        ),
+    )
     parser.add_argument("--device-bw-gbps", type=float, default=None, help="Nominal intra-node link bandwidth for efficient_factor fit. If unset, infer from GPU model.")
     parser.add_argument("--skip-compute", action="store_true")
     parser.add_argument("--skip-comm", action="store_true")
@@ -254,6 +262,7 @@ def main() -> None:
             ],
             compute_cache_mode=args.compute_cache_mode,
             compute_cache_tag=(compute_cache_tag or None),
+            megatron_root=(args.megatron_root or None),
             python_exe=args.python_exe,
         )
         summary["steps"]["compute"] = {

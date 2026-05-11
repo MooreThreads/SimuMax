@@ -234,6 +234,7 @@ TRAINING_ARGS=(
     --recompute-num-layers 0
     --distributed-backend nccl
     --multi-latent-attention
+    --enable-experimental
     --qk-layernorm
     --mock-data
 )

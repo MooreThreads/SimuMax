@@ -56,13 +56,26 @@ def run_compute_pipeline(
     scripts: list[str],
     compute_cache_mode: str = "supplement",
     compute_cache_tag: str | None = None,
+    megatron_root: Path | str | None = None,
     python_exe: str | None = None,
 ) -> Path:
     if python_exe is None:
         python_exe = sys.executable
 
     env = dict(os.environ)
-    env["PYTHONPATH"] = f"{repo_root}:{env.get('PYTHONPATH', '')}"
+    python_path_entries = [str(repo_root)]
+    if megatron_root:
+        megatron_path = Path(megatron_root)
+        if not megatron_path.is_absolute():
+            megatron_path = (repo_root / megatron_path).resolve()
+        if not megatron_path.exists():
+            raise FileNotFoundError(f"Megatron-LM checkout not found: {megatron_path}")
+        python_path_entries.append(str(megatron_path))
+        env["MEGATRON_HOME"] = str(megatron_path)
+        env["MEGATRON_HOME_OVERRIDE"] = str(megatron_path)
+        env["SIMUMAX_MEGATRON_ROOT"] = str(megatron_path)
+    python_path_entries.append(env.get("PYTHONPATH", ""))
+    env["PYTHONPATH"] = ":".join(entry for entry in python_path_entries if entry)
     env["MAX_TFLOPS"] = str(max_tflops)
     env["SYS_NAME"] = sys_name
     env["PICE_INTRA_LINK"] = str(pcie_intra_link)

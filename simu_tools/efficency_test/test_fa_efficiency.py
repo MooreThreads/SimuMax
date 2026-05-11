@@ -26,7 +26,7 @@ FA_EXISTING_KEYS = {"sdp_fwd": set(), "sdp_bwd": set()}
 def _append_megatron_paths():
     repo_root = Path(__file__).resolve().parents[2]
     candidates = []
-    for env_name in ("MEGATRON_HOME_OVERRIDE", "MEGATRON_HOME"):
+    for env_name in ("SIMUMAX_MEGATRON_ROOT", "MEGATRON_HOME_OVERRIDE", "MEGATRON_HOME"):
         env_path = os.environ.get(env_name)
         if env_path:
             candidates.append(Path(env_path))
@@ -587,7 +587,9 @@ def benchmark_flashattention(q, k, v, warmup=10, repeat=100, device='cuda'):
             )
         raise RuntimeError(
             "Megatron TE path is unavailable and raw TE cannot cover MLA shapes "
-            f"(qk_head_dim={q.shape[-1]}, v_head_dim={v.shape[-1]})."
+            f"(qk_head_dim={q.shape[-1]}, v_head_dim={v.shape[-1]}). "
+            "Install or point to a Megatron-LM checkout with --megatron-root, "
+            "MEGATRON_HOME, or SIMUMAX_MEGATRON_ROOT."
         )
     if CUDA_SDP_IMPL in {"raw_te", "te_raw"}:
         return benchmark_flashattention_raw_te(q, k, v, warmup=warmup, repeat=repeat, device=device)
