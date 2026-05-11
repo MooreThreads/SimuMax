@@ -4,15 +4,15 @@ SimuMax is a simulator and analytical model for large-scale LLM training. It mod
 
 ## Highlights
 
-- [New] v1.2 release notes:
+- v1.2 release notes:
   [docs/release_v1.2.md](docs/release_v1.2.md)
-- [New] B200 public benchmark materials include a formal v1.2 summary,
+- B200 public benchmark materials include a formal v1.2 summary,
   reproduction guide, CP A2A result chart, and public B200 system config.
-- [New] Long-context context-parallel (CP) coverage is included in the public
+- Long-context context-parallel (CP) coverage is included in the public
   B200 release results.
-- [New] Megatron-LM 0.14 selective recompute with `discard_output` semantics is
+- Megatron-LM 0.14 selective recompute with `discard_output` semantics is
   modeled through `megatron_recompute`.
-- [Preview] sync-VPP is available with a representative B200 preview check.
+- sync-VPP is available as Preview with a representative B200 preview check.
 - Supports dense and MoE models, including TP / PP / EP / CP / SP / ZeRO-1 /
   recompute / MLA.
 - Can be used in five core ways:

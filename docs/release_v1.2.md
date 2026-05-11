@@ -1,6 +1,8 @@
 # SimuMax v1.2 Release Notes
 
-Release status: `draft`
+Release status: `released`
+
+Release date: 2026-05-11
 
 ## Summary
 
