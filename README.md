@@ -188,12 +188,6 @@ Practical rule:
 
 ## Testing
 
-After cloning the repo, enable the local git hooks once:
-
-```bash
-bash git_hooks/install_hooks.sh
-```
-
 Typical local validation:
 
 ```bash
