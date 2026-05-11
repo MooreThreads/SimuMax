@@ -9,7 +9,6 @@ from simumax.core.config import ModelConfig, StrategyConfig, SystemConfig
 from simumax.core.perf_llm import PerfLLM
 import transformer_engine as te
 import transformer_engine_torch as tex
-from transformer_engine.pytorch.module.base import get_workspace
 from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
 from transformer_engine.pytorch.cpp_extensions import (
     general_gemm
@@ -143,7 +142,6 @@ def run_te_gemm(B: int, M: int, K: int, N: int, dtype, device, layout, accumulat
         general_gemm(
             B_matrix,
             A_matrix,
-            get_workspace(),
             out_dtype=out_dtype,
             quantization_params=None,
             out=output,
@@ -156,7 +154,6 @@ def run_te_gemm(B: int, M: int, K: int, N: int, dtype, device, layout, accumulat
         wgrad, grad_bias_, _, rs_out = ceg.general_gemm(
                     inputmat_total,
                     grad_output,
-                    get_workspace(),
                     layout="NT",
                     grad=True,
                     out_dtype=(

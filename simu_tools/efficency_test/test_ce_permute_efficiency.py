@@ -23,9 +23,7 @@ import torch.distributed as dist
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MEGATRON_ROOT = REPO_ROOT / "simu_tools/megatron_scripts/Megatron-LM"
-if str(MEGATRON_ROOT) not in sys.path:
-    sys.path.insert(0, str(MEGATRON_ROOT))
+DEFAULT_MEGATRON_ROOT = REPO_ROOT / "simu_tools/megatron_scripts/Megatron-LM"
 
 
 CUDA_ROOT_CANDIDATES = (
@@ -153,28 +151,61 @@ def time_cuda(fn) -> float:
     return float(start.elapsed_time(end))
 
 
-def init_dist_once():
-    if dist.is_initialized():
-        return
-    init_file = tempfile.NamedTemporaryFile(delete=True)
-    dist.init_process_group(
-        "nccl",
-        rank=0,
-        world_size=1,
-        init_method="file://" + init_file.name,
+def resolve_megatron_root(path_arg: str = "") -> Path:
+    candidates = []
+    if path_arg:
+        candidates.append(Path(path_arg))
+    for env_key in ("MEGATRON_HOME_OVERRIDE", "MEGATRON_HOME"):
+        if os.environ.get(env_key):
+            candidates.append(Path(os.environ[env_key]))
+    candidates.append(DEFAULT_MEGATRON_ROOT)
+
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if (candidate / "megatron").is_dir():
+            return candidate
+    raise FileNotFoundError(
+        "Megatron-LM was requested for nonfusion CE, but no valid checkout was found. "
+        "Pass --megatron-root or set MEGATRON_HOME_OVERRIDE/MEGATRON_HOME."
     )
-    from megatron.core import parallel_state
-
-    if not parallel_state.model_parallel_is_initialized():
-        parallel_state.initialize_model_parallel(tensor_model_parallel_size=1)
-    init_dist_once._init_file = init_file
 
 
-def benchmark_ce_case(case: dict, impl: str, warmup: int, repeats: int) -> dict:
-    from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
-    from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
+def ensure_megatron_path(path_arg: str = "") -> Path:
+    root = resolve_megatron_root(path_arg)
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    return root
 
-    init_dist_once()
+
+def init_dist_once(*, use_megatron: bool = False, megatron_root: str = ""):
+    if not dist.is_initialized():
+        init_file = tempfile.NamedTemporaryFile(delete=True)
+        dist.init_process_group(
+            "nccl",
+            rank=0,
+            world_size=1,
+            init_method="file://" + init_file.name,
+        )
+        init_dist_once._init_file = init_file
+
+    if use_megatron:
+        ensure_megatron_path(megatron_root)
+        from megatron.core import parallel_state
+
+        if not parallel_state.model_parallel_is_initialized():
+            parallel_state.initialize_model_parallel(tensor_model_parallel_size=1)
+
+
+def benchmark_ce_case(case: dict, impl: str, warmup: int, repeats: int, megatron_root: str = "") -> dict:
+    if impl == "nonfusion":
+        init_dist_once(use_megatron=True, megatron_root=megatron_root)
+        from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+    elif impl == "te_fusion":
+        init_dist_once(use_megatron=False)
+        from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
+    else:
+        raise ValueError(impl)
+
     torch.cuda.empty_cache()
     b, s, v = case["batch_size"], case["seq_len"], case["vocab_size"]
     base = torch.randn(s, b, v, device="cuda", dtype=torch.bfloat16)
@@ -299,6 +330,16 @@ def main():
     parser.add_argument("--output", default="simu_tools/efficency_test/one_click_outputs/b200_ce_permute_summary.json")
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--measure-nonfusion-ce",
+        action="store_true",
+        help="Also measure Megatron vocab_parallel_cross_entropy for accelerator.bandwidth.ce. Disabled by default.",
+    )
+    parser.add_argument(
+        "--megatron-root",
+        default="",
+        help="Megatron-LM checkout used only with --measure-nonfusion-ce.",
+    )
     args = parser.parse_args()
 
     cuda_root = apply_cuda_toolchain_env()
@@ -308,6 +349,7 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     ce_gbps, ce_latency = load_bandwidth(system_path, "ce")
+    ce_fusion_gbps, ce_fusion_latency = load_bandwidth(system_path, "ce_fusion")
     perm_fwd_gbps, perm_fwd_latency = load_bandwidth(system_path, "permute_fwd")
     perm_bwd_gbps, perm_bwd_latency = load_bandwidth(system_path, "permute_bwd")
 
@@ -326,10 +368,15 @@ def main():
     ]
 
     ce_rows = []
-    for impl in ("nonfusion", "te_fusion"):
+    ce_impls = ["te_fusion"]
+    if args.measure_nonfusion_ce:
+        ensure_megatron_path(args.megatron_root)
+        ce_impls.insert(0, "nonfusion")
+
+    for impl in ce_impls:
         for case in ce_cases:
             print(f"CE {impl} {case['name']}", flush=True)
-            ce_rows.append(benchmark_ce_case(case, impl, args.warmup, args.repeats))
+            ce_rows.append(benchmark_ce_case(case, impl, args.warmup, args.repeats, args.megatron_root))
             require_no_unknown_gpu_apps(f"after CE {impl} {case['name']}")
 
     permute_rows = []
@@ -340,46 +387,50 @@ def main():
 
     ce_nonfusion = [row for row in ce_rows if row["impl"] == "nonfusion"]
     ce_fusion = [row for row in ce_rows if row["impl"] == "te_fusion"]
-    recommended = {
-        "ce": weighted_efficiency(
+    recommended = {}
+    if ce_nonfusion:
+        recommended["ce"] = weighted_efficiency(
             ce_nonfusion,
             "total_ms_median",
             "total_bytes",
             ce_gbps,
             ce_latency,
             launches=2,
-        ),
-        "ce_fusion": weighted_efficiency(
+        )
+    if ce_fusion:
+        recommended["ce_fusion"] = weighted_efficiency(
             ce_fusion,
             "total_ms_median",
             "total_bytes",
-            ce_gbps,
-            ce_latency,
+            ce_fusion_gbps,
+            ce_fusion_latency,
             launches=2,
-        ),
-        "permute_fwd": weighted_efficiency(
-            permute_rows,
-            "fwd_ms_median",
-            "fwd_bytes",
-            perm_fwd_gbps,
-            perm_fwd_latency,
-            launches=4,
-        ),
-        "permute_bwd": weighted_efficiency(
-            permute_rows,
-            "bwd_ms_median",
-            "bwd_bytes",
-            perm_bwd_gbps,
-            perm_bwd_latency,
-            launches=4,
-        ),
-    }
+        )
+    recommended["permute_fwd"] = weighted_efficiency(
+        permute_rows,
+        "fwd_ms_median",
+        "fwd_bytes",
+        perm_fwd_gbps,
+        perm_fwd_latency,
+        launches=4,
+    )
+    recommended["permute_bwd"] = weighted_efficiency(
+        permute_rows,
+        "bwd_ms_median",
+        "bwd_bytes",
+        perm_bwd_gbps,
+        perm_bwd_latency,
+        launches=4,
+    )
 
     summary = {
         "system": str(system_path),
         "cuda_root": cuda_root,
+        "measure_nonfusion_ce": args.measure_nonfusion_ce,
+        "megatron_root": str(resolve_megatron_root(args.megatron_root)) if args.measure_nonfusion_ce else "",
         "bandwidth_reference": {
             "ce": {"gbps": ce_gbps, "latency_us": ce_latency},
+            "ce_fusion": {"gbps": ce_fusion_gbps, "latency_us": ce_fusion_latency},
             "permute_fwd": {"gbps": perm_fwd_gbps, "latency_us": perm_fwd_latency},
             "permute_bwd": {"gbps": perm_bwd_gbps, "latency_us": perm_bwd_latency},
         },

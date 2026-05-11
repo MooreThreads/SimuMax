@@ -327,6 +327,11 @@ system_template = {
                 "efficient_factor": 0.73,
                 "gbps": 1600,
                 "latency_us": 30
+            },
+            "ce_fusion":{
+                "efficient_factor": 0.73,
+                "gbps": 1600,
+                "latency_us": 30
             }
         },
         "mode": "roofline"

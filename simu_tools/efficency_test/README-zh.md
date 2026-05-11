@@ -24,6 +24,13 @@ SimuMax 的 timing 准确性主要依赖两类机器侧数据：
 - 真实 shape 下的算子效率
 - 目标拓扑下的通信带宽与 latency
 
+公开 B200 路径也提供了专用 wrapper：
+
+- `tools/b200/build_current_machine_system_config.py`
+
+这个 helper 默认会串起 B200 shape sweep、NCCL 通信拟合、
+fixed-latency 校准和 CE/permute 补充测试。
+
 如果只是做粗略 OOM 判断，已有 system 配置通常够用；如果要解释 `perf vs simulator` 或 `perf vs real` 的 timing，缺失 efficiency 应该优先补齐。
 
 ## 典型流程
@@ -32,6 +39,11 @@ SimuMax 的 timing 准确性主要依赖两类机器侧数据：
 
 1. 测试目标 shape 的算子效率
 2. 拟合通信带宽与 latency，并写回 system 文件
+
+B200 wrapper 默认会执行这两步，然后再写入 CE/permute 补充结果。CE/permute 补充测试默认是 TE-only：
+会刷新 `ce_fusion`、`permute_fwd` 和 `permute_bwd`，不要求 Megatron-LM。
+只有需要刷新 Megatron nonfusion `ce` 时，才加 `--measure-nonfusion-ce`。只有在明确要复用已有通信结果时，才建议加
+`--skip-comm`、`--skip-fit` 或 `--skip-fixed-latency`。
 
 system 文件字段说明见：
 
@@ -71,7 +83,7 @@ pip install -e .
 或者：
 
 ```bash
-PYTHONPATH=/path/to/SimuMax_dev python test_gemm_efficiency.py
+PYTHONPATH=/path/to/SimuMax python test_gemm_efficiency.py
 ```
 
 主要脚本包括：
